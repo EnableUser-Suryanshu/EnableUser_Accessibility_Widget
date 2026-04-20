@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 const btnCurrent = $("btn-scan-current");
 const btnMulti = $("btn-scan-multi");
+const btnInventory = $("btn-scan-inventory");
 const statusEl = $("status");
 const maxUrlsInput = $("opt-max-urls");
 const depthInput = $("opt-depth");
@@ -40,6 +41,7 @@ function setStatus(msg, isError = false) {
 function setBusy(busy) {
   btnCurrent.disabled = busy;
   btnMulti.disabled = busy;
+  if (btnInventory) btnInventory.disabled = busy;
 }
 
 function send(msg) {
@@ -95,5 +97,25 @@ btnMulti.addEventListener("click", async () => {
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scan failed.", true); return; }
   setStatus("Report opening in new tab…");
+  window.close();
+});
+
+btnInventory?.addEventListener("click", async () => {
+  setStatus(null);
+  const tab = await getActiveTab();
+  if (!tab || !/^https?:/.test(tab.url || "")) {
+    setStatus("Open an http(s) page first.", true);
+    return;
+  }
+  const granted = await ensureHostPermission(tab.url);
+  if (!granted) { setStatus("Permission denied.", true); return; }
+
+  const opts = readScanOptions();
+  setBusy(true);
+  setStatus(`Scoping crawl (up to ${opts.maxUrls} URLs, depth ${opts.crawlDepth}) — no axe, detecting content types only…`);
+  const res = await send({ type: "SCAN_INVENTORY", tabId: tab.id, options: opts });
+  setBusy(false);
+  if (!res?.ok) { setStatus(res?.error || "Scope failed.", true); return; }
+  setStatus("Scope document opening…");
   window.close();
 });

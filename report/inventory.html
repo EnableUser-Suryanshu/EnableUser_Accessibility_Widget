@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Inventory — Scope Document</title>
+    <link rel="stylesheet" href="report.css" />
+  </head>
+  <body>
+    <header>
+      <div class="wrap">
+        <h1>EnableUser — Scope & Inventory</h1>
+        <p class="meta" id="meta"></p>
+        <div class="actions">
+          <button id="btn-download-docx" class="primary">Download Scope (.docx)</button>
+          <button id="btn-download-xlsx">Download Inventory (.xlsx)</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section>
+        <h2>Crawl Summary</h2>
+        <div class="stats" id="stats"></div>
+      </section>
+
+      <section>
+        <h2>Content Types Detected</h2>
+        <p class="hint">What kind of manual testing each template will need is derived from this table. "Pages" = how many crawled URLs contain the content type.</p>
+        <table id="content-types-table">
+          <thead><tr><th>Content Type</th><th>Pages</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Templates</h2>
+        <p class="hint">Pages sharing the same DOM fingerprint + URL shape. Click a row to expand its content signals + recommended manual tests.</p>
+        <table id="templates-table">
+          <thead>
+            <tr>
+              <th>Template ID</th><th>URL Cluster</th><th>Pages</th>
+              <th>Sample URL</th><th>Content Signals</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Proposed Audit Sample</h2>
+        <p class="hint">One URL per template + critical-path pages. This is what we recommend auditing in full. Edit in the .xlsx if needed.</p>
+        <table id="sample-table">
+          <thead>
+            <tr><th>#</th><th>URL</th><th>Template</th><th>Reason</th><th>Manual Tests</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>All Pages</h2>
+        <p class="hint">Full inventory. Click a row to expand element counts and content flags.</p>
+        <table id="pages-table">
+          <thead>
+            <tr>
+              <th>URL</th><th>Template</th><th>URL Cluster</th>
+              <th>Depth</th><th>Source</th>
+              <th>Forms</th><th>Tables</th><th>Video</th><th>Iframes</th><th>Modals</th>
+              <th>Carousels</th><th>PDFs</th><th>Login</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="inventory.js"></script>
+  </body>
+</html>

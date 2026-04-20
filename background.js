@@ -14,6 +14,8 @@ import {
   probeCommonPaths,
   navSurfacedCollect
 } from "./lib/discovery.js";
+import { buildScopeDocx } from "./lib/docx-writer.js";
+import { buildInventoryXlsx } from "./lib/xlsx-writer.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -25,6 +27,7 @@ const SETTLE_MS = 2_500;
 
 const pending = new Map();
 const reports = new Map();
+const inventories = new Map(); // inventoryId → { inventory, files: { docx: Blob, xlsx: Blob } }
 const rateLimiter = new RateLimiter();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -32,10 +35,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try {
       if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId, msg.options));
       else if (msg.type === "SCAN_MULTI") sendResponse(await scanMulti(msg.tabId, msg.options));
+      else if (msg.type === "SCAN_INVENTORY") sendResponse(await scanInventory(msg.tabId, msg.options));
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
       else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: reports.get(msg.reportId) || null });
+      else if (msg.type === "GET_INVENTORY") sendResponse({ ok: true, inventory: inventories.get(msg.inventoryId)?.inventory || null });
       else if (msg.type === "DOWNLOAD_CSV") sendResponse(await downloadCsv(msg.reportId));
+      else if (msg.type === "DOWNLOAD_SCOPE_DOCX") sendResponse(await downloadInventoryFile(msg.inventoryId, "docx"));
+      else if (msg.type === "DOWNLOAD_INVENTORY_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "xlsx"));
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (err) {
       console.error("[EU]", err);
@@ -159,6 +166,302 @@ async function scanMulti(tabId, options) {
   return { ok: true, reportId };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Inventory mode — crawl but skip axe. Produces the scope document (.docx)
+// + inventory workbook (.xlsx) that a professional audit firm uses before
+// committing to the full audit. Same discovery pipeline as scanMulti, but
+// each page runs only content-signals.js (no axe-core, much faster).
+// ─────────────────────────────────────────────────────────────────────────
+async function scanInventory(tabId, options) {
+  const maxUrls = clamp(parseInt(options?.maxUrls, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
+  const crawlDepth = clamp(parseInt(options?.crawlDepth, 10) || DEFAULT_CRAWL_DEPTH, 1, HARD_MAX_DEPTH);
+
+  const tab = await chrome.tabs.get(tabId);
+  const startUrl = tab.url;
+  const seedOrigin = safeOrigin(startUrl);
+  const seedHost = safeHost(startUrl);
+
+  const queue = new RequestQueue({ scopeUrl: startUrl, maxUrls, maxDepth: crawlDepth, scope: "same-hostname" });
+  queue.enqueue(startUrl, { depth: 0, priority: 100, source: "seed" });
+
+  const pages = [];
+  const depthStats = {};
+
+  // Seed page runs in the current tab directly.
+  queue.next();
+  depthStats[0] = 1;
+  try {
+    const sig = await collectTemplateSignature(tabId);
+    const signals = await collectContentSignals(tabId);
+    const fingerprint = await sha1Prefix(sig?.sigStr || "", 12);
+    pages.push({
+      url: startUrl, title: tab.title, depth: 0, source: "seed",
+      template_id: fingerprint, url_cluster: sig?.urlCluster || "unknown",
+      ...signals
+    });
+  } catch (err) {
+    pages.push({ url: startUrl, depth: 0, source: "seed", error: String(err?.message || err) });
+  }
+
+  // Same discovery pipeline as scanMulti.
+  let sitemapUrls = [], hreflangUrls = [], commonPaths = [];
+  if (seedOrigin) {
+    [sitemapUrls, hreflangUrls, commonPaths] = await Promise.all([
+      discoverSeedsFromOrigin(seedOrigin).catch(() => []),
+      discoverHreflang(startUrl).catch(() => []),
+      probeCommonPaths(seedOrigin).catch(() => [])
+    ]);
+  }
+  queue.enqueueMany(sitemapUrls, { depth: 1, priority: 3, source: "sitemap" });
+  queue.enqueueMany(hreflangUrls, { depth: 1, priority: 5, source: "hreflang" });
+  queue.enqueueMany(commonPaths, { depth: 1, priority: 4, source: "common-path" });
+
+  const seedLinks = await collectNavLinks(tabId);
+  const navOnly = seedLinks.filter(l => l.priority >= 10).map(l => l.url);
+  const bodyOnly = seedLinks.filter(l => l.priority < 10).map(l => l.url);
+  queue.enqueueMany(navOnly, { depth: 1, priority: 8, source: "nav" });
+  queue.enqueueMany(bodyOnly, { depth: 1, priority: 2, source: "body" });
+
+  const active = new Set();
+
+  async function launch(req) {
+    try {
+      await rateLimiter.wait(req.url);
+      const result = await inventoryInNewTab(req.url, req.depth < crawlDepth);
+      rateLimiter.reportSuccess(req.url);
+      const { links = [], ...rest } = result;
+      pages.push({
+        url: req.url, depth: req.depth, source: req.source, ...rest
+      });
+      depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+      if (req.depth < crawlDepth) {
+        const nav = links.filter(l => l.priority >= 10).map(l => l.url);
+        const body = links.filter(l => l.priority < 10).map(l => l.url);
+        queue.enqueueMany(nav, { depth: req.depth + 1, priority: 8, source: "nav" });
+        queue.enqueueMany(body, { depth: req.depth + 1, priority: 2, source: "body" });
+      }
+    } catch (err) {
+      rateLimiter.reportFailure(req.url, { status: err?.status || 0 });
+      pages.push({ url: req.url, depth: req.depth, source: req.source, error: String(err?.message || err) });
+    }
+  }
+
+  function pump() {
+    while (active.size < CONCURRENT_TABS && queue.pending && queue.remaining > 0) {
+      const req = queue.next();
+      if (!req) break;
+      const p = launch(req).finally(() => active.delete(p));
+      active.add(p);
+    }
+  }
+  pump();
+  while (active.size > 0) { await Promise.race(active); pump(); }
+
+  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats });
+
+  // Generate both deliverables as blobs.
+  const [docxBlob, xlsxBlob] = await Promise.all([
+    buildScopeDocx(inventory),
+    buildInventoryXlsx(inventory)
+  ]);
+
+  const inventoryId = `inv-${Date.now()}`;
+  inventories.set(inventoryId, { inventory, files: { docx: docxBlob, xlsx: xlsxBlob } });
+
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
+  return { ok: true, inventoryId };
+}
+
+async function inventoryInNewTab(url, collectNextLinks) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  try {
+    await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
+    await sleep(SETTLE_MS);
+    const sig = await collectTemplateSignature(tab.id);
+    const signals = await collectContentSignals(tab.id);
+    const fingerprint = await sha1Prefix(sig?.sigStr || "", 12);
+    const out = {
+      title: tab.title || "",
+      template_id: fingerprint,
+      url_cluster: sig?.urlCluster || "unknown",
+      ...signals
+    };
+    if (collectNextLinks) {
+      try { out.links = await collectNavLinks(tab.id); } catch { out.links = []; }
+    }
+    return out;
+  } finally {
+    try { await chrome.tabs.remove(tab.id); } catch {}
+  }
+}
+
+async function sha1Prefix(str, hex) {
+  if (!str) return "";
+  const bytes = new TextEncoder().encode(str);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, hex);
+}
+
+// Critical-path URLs we always add to the sample if the crawl found them.
+const CRITICAL_PATH_TOKENS = [
+  "home", "index", "login", "signin", "signup", "register",
+  "contact", "search", "checkout", "cart", "account", "profile",
+  "accessibility", "privacy", "terms", "sitemap"
+];
+function isCriticalPath(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.toLowerCase();
+    if (path === "/" || path === "") return "home";
+    for (const tok of CRITICAL_PATH_TOKENS) {
+      if (new RegExp(`(^|/)${tok}(/|$|\\.)`).test(path)) return tok;
+    }
+    return null;
+  } catch { return null; }
+}
+
+function buildInventory(pages, meta) {
+  // Group by template — fingerprint + url_cluster.
+  const groups = new Map();
+  const contentTypeSummary = {
+    "Forms": 0, "Data Tables": 0, "Video": 0, "Audio": 0,
+    "Iframes": 0, "Modals": 0, "Carousels": 0, "Tabs": 0,
+    "Menus": 0, "Accordions": 0, "Datepickers": 0, "Dropdowns": 0,
+    "PDF Links": 0, "Login": 0, "CAPTCHA": 0, "Shadow DOM": 0
+  };
+  const testsUnion = new Map(); // test → why
+
+  for (const p of pages) {
+    if (p.error) continue;
+    const key = `${p.template_id}|${p.url_cluster}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        template_id: p.template_id, url_cluster: p.url_cluster,
+        page_count: 0, pages: [],
+        sample_url: p.url, sample_title: p.title || "",
+        flags: {}, recommendedTests: [], testSet: new Set(),
+        aggregatedCounts: {}
+      };
+      groups.set(key, g);
+    }
+    g.page_count++;
+    g.pages.push({ url: p.url, title: p.title || "" });
+    // OR flags together; prefer first sample
+    for (const [k, v] of Object.entries(p.flags || {})) {
+      g.flags[k] = g.flags[k] || v;
+    }
+    for (const r of (p.recommendedTests || [])) {
+      if (!g.testSet.has(r.test)) {
+        g.testSet.add(r.test);
+        g.recommendedTests.push(r);
+      }
+      if (!testsUnion.has(r.test)) testsUnion.set(r.test, r.why);
+    }
+    // Count content types across the corpus.
+    if (p.flags?.hasForms) contentTypeSummary["Forms"]++;
+    if (p.flags?.hasDataTable) contentTypeSummary["Data Tables"]++;
+    if (p.flags?.hasVideo) contentTypeSummary["Video"]++;
+    if (p.flags?.hasAudio) contentTypeSummary["Audio"]++;
+    if (p.flags?.hasIframe) contentTypeSummary["Iframes"]++;
+    if (p.flags?.hasModal) contentTypeSummary["Modals"]++;
+    if (p.flags?.hasCarousel) contentTypeSummary["Carousels"]++;
+    if (p.flags?.hasTabs) contentTypeSummary["Tabs"]++;
+    if (p.flags?.hasMenu) contentTypeSummary["Menus"]++;
+    if (p.flags?.hasAccordion) contentTypeSummary["Accordions"]++;
+    if (p.flags?.hasDatepicker) contentTypeSummary["Datepickers"]++;
+    if (p.flags?.hasDropdown) contentTypeSummary["Dropdowns"]++;
+    if (p.flags?.hasPdfLinks) contentTypeSummary["PDF Links"]++;
+    if (p.flags?.hasLogin) contentTypeSummary["Login"]++;
+    if (p.flags?.hasCaptcha) contentTypeSummary["CAPTCHA"]++;
+    if (p.flags?.hasShadowDom) contentTypeSummary["Shadow DOM"]++;
+  }
+
+  const templates = [...groups.values()]
+    .map(g => {
+      const signalBits = [];
+      if (g.flags.hasForms) signalBits.push("forms");
+      if (g.flags.hasDataTable) signalBits.push("tables");
+      if (g.flags.hasVideo) signalBits.push("video");
+      if (g.flags.hasAudio) signalBits.push("audio");
+      if (g.flags.hasIframe) signalBits.push("iframe");
+      if (g.flags.hasModal) signalBits.push("modal");
+      if (g.flags.hasCarousel) signalBits.push("carousel");
+      if (g.flags.hasTabs) signalBits.push("tabs");
+      if (g.flags.hasMenu) signalBits.push("menu");
+      if (g.flags.hasAccordion) signalBits.push("accordion");
+      if (g.flags.hasDatepicker) signalBits.push("datepicker");
+      if (g.flags.hasDropdown) signalBits.push("dropdown");
+      if (g.flags.hasPdfLinks) signalBits.push("pdf-links");
+      if (g.flags.hasLogin) signalBits.push("login");
+      if (g.flags.hasCaptcha) signalBits.push("captcha");
+      if (g.flags.hasShadowDom) signalBits.push("shadow-dom");
+      return {
+        template_id: g.template_id, url_cluster: g.url_cluster,
+        page_count: g.page_count, sample_url: g.sample_url,
+        sample_title: g.sample_title,
+        flags: g.flags, recommendedTests: g.recommendedTests,
+        contentSignalSummary: signalBits.join(", ") || "static content"
+      };
+    })
+    .sort((a, b) => b.page_count - a.page_count);
+
+  // Proposed sample: one URL per template + critical-path pages.
+  const sampleSet = new Map();
+  for (const t of templates) {
+    sampleSet.set(t.sample_url, {
+      url: t.sample_url, template_id: t.template_id, url_cluster: t.url_cluster,
+      reason: `Template representative (${t.page_count} page${t.page_count === 1 ? "" : "s"})`,
+      testCount: t.recommendedTests.length
+    });
+  }
+  for (const p of pages) {
+    if (p.error) continue;
+    const tag = isCriticalPath(p.url);
+    if (tag && !sampleSet.has(p.url)) {
+      sampleSet.set(p.url, {
+        url: p.url, template_id: p.template_id, url_cluster: p.url_cluster,
+        reason: `Critical path — ${tag}`,
+        testCount: (p.recommendedTests || []).length
+      });
+    }
+  }
+  const proposedSample = [...sampleSet.values()];
+
+  return {
+    meta: { ...meta, generatedAt: new Date().toISOString() },
+    pages, templates, proposedSample, contentTypeSummary,
+    recommendedTestsUnion: [...testsUnion.entries()].map(([test, why]) => ({ test, why }))
+  };
+}
+
+async function downloadInventoryFile(inventoryId, kind) {
+  const entry = inventories.get(inventoryId);
+  if (!entry) return { ok: false, error: "Inventory expired" };
+  const blob = entry.files[kind];
+  if (!blob) return { ok: false, error: `No ${kind} file` };
+  const dataUrl = await blobToDataUrl(blob);
+  const host = entry.inventory.meta.seedHost;
+  const stamp = entry.inventory.meta.generatedAt.replace(/[:.]/g, "-");
+  const filename = kind === "docx"
+    ? `enableuser-scope-${host}-${stamp}.docx`
+    : `enableuser-inventory-${host}-${stamp}.xlsx`;
+  await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
+  return { ok: true };
+}
+
+async function blobToDataUrl(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  // btoa chokes on non-ASCII; walk in 0x8000 chunks for large blobs.
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return `data:${blob.type};base64,${btoa(binary)}`;
+}
+
 async function collectNavLinks(tabId) {
   try {
     const [{ result }] = await chrome.scripting.executeScript({
@@ -209,6 +512,86 @@ async function injectAxe(tabId) {
     files: ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js"],
     world: "ISOLATED"
   });
+}
+
+// Inventory mode: no axe — just content-signals. Runs in the same isolated
+// world and returns whatever the injected function produces.
+async function collectContentSignals(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    files: ["lib/content-signals.js"],
+    world: "ISOLATED"
+  });
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    world: "ISOLATED",
+    func: () => (window.EU_ContentSignals ? window.EU_ContentSignals.collect() : null)
+  });
+  return result || null;
+}
+
+// Template fingerprint is the same algorithm used in the audit path, extracted
+// so inventory mode can compute it without loading axe (500KB).
+async function collectTemplateSignature(tabId) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    world: "ISOLATED",
+    func: computeTemplateFingerprintInline
+  });
+  return result || null;
+}
+
+// Serialisable standalone function (no imports) — executeScript ships it as
+// text to the page. Mirrors what content-script.js does for template signals.
+function computeTemplateFingerprintInline() {
+  const CSS_IN_JS_HASH = /^(?:jsx-|css-|sc-|emotion-|mui-|tw-|chakra-|_[a-zA-Z0-9]+_)[A-Za-z0-9]{4,}$/;
+  const STATE_PREFIXES = /^(?:is-|has-|active$|open$|closed$|selected$|hover$|focus$|disabled$|js-)/;
+  const UTILITY_NOISE = /^(?:flex|grid|row|col|mt|mb|mx|my|pt|pb|px|py|text-|bg-|border-|w-|h-|space-|gap-)\d/;
+  const firstClasses = (el, n) => {
+    const raw = (el.className || "").toString().trim();
+    if (!raw) return "";
+    return raw.split(/\s+/)
+      .filter(c => c.length > 1)
+      .filter(c => !/\d{4,}/.test(c))
+      .filter(c => !CSS_IN_JS_HASH.test(c))
+      .filter(c => !STATE_PREFIXES.test(c))
+      .filter(c => !UTILITY_NOISE.test(c))
+      .slice(0, n).join(" ");
+  };
+  const sig = [];
+  const landmarkTags = ["header","nav","main","article","aside","footer","section","form","dialog","details","summary","figure","figcaption","table","thead","tbody","tfoot","h1","h2","h3","h4","h5","h6"];
+  for (const tag of landmarkTags) {
+    for (const el of document.querySelectorAll(tag)) {
+      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
+    }
+  }
+  for (const el of document.querySelectorAll("[role]")) {
+    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
+  }
+  const hCounts = [1,2,3,4,5,6].map(n => document.querySelectorAll(`h${n}`).length);
+  sig.push("H:" + hCounts.join("-"));
+  const LAYOUT = ["layout","template","container","wrapper","grid","flex","row","col-","block","module","widget","component","page-","content"];
+  const seen = new Set();
+  for (const p of LAYOUT) {
+    for (const el of document.querySelectorAll(`[class*="${p}" i]`)) {
+      const k = `${el.tagName.toLowerCase()}::${firstClasses(el,3)}`;
+      if (!seen.has(k)) { seen.add(k); sig.push(k); }
+    }
+  }
+  const sigStr = sig.join("|");
+
+  const clusterUrl = (href) => {
+    let u; try { u = new URL(href); } catch { return "unknown"; }
+    const path = u.pathname.toLowerCase().replace(/^\/+|\/+$/g,"");
+    const parts = path.split("/").filter(Boolean);
+    if (!parts.length) return "home";
+    const last = parts[parts.length-1];
+    if (/[0-9a-f]{8}-[0-9a-f]{4}/.test(last) || /^\d+$/.test(last) || /\d{4}[/-]\d{2}/.test(path)) return `/${parts[0]}/[dynamic-id]`;
+    if (parts.length >= 3) return `/${parts[0]}/${parts[1]}/[detail]`;
+    if (parts.length === 2) return `/${parts[0]}/${parts[1]}`;
+    return `/${parts[0]}`;
+  };
+  return { sigStr, urlCluster: clusterUrl(location.href) };
 }
 
 function runContentScan(tabId) {

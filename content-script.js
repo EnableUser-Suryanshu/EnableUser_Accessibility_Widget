@@ -210,10 +210,23 @@ function extractSignature(root) {
   return sig;
 }
 
+// Class names that jitter between renders but don't indicate a different
+// template. We strip them before feeding into the fingerprint so the same
+// page rebuilt under a new webpack hash still clusters into the same group.
+const CSS_IN_JS_HASH = /^(?:jsx-|css-|sc-|emotion-|mui-|tw-|chakra-|ant-[a-z]+-fadein-|MuiBox-|_[a-zA-Z0-9]+_)[A-Za-z0-9]{4,}$/;
+const STATE_PREFIXES = /^(?:is-|has-|active$|open$|closed$|selected$|hover$|focus$|disabled$|aria-[a-z]+-(?:true|false)|js-|-[a-z]+-enter-|-[a-z]+-exit-)/;
+const UTILITY_NOISE = /^(?:flex|grid|row|col|mt|mb|mx|my|pt|pb|px|py|px-|py-|mx-|my-|mt-|mb-|ml-|mr-|pl-|pr-|text-|bg-|border-|w-|h-|min-w-|min-h-|max-w-|max-h-|space-|gap-)\d/;
+
 function firstClasses(el, n) {
   const raw = (el.className || "").toString().trim();
   if (!raw) return "";
-  const parts = raw.split(/\s+/).filter(c => c.length > 1 && !/\d{4,}/.test(c)).slice(0, n);
+  const parts = raw.split(/\s+/)
+    .filter(c => c.length > 1)
+    .filter(c => !/\d{4,}/.test(c))          // reject classes with long digit runs (generated ids)
+    .filter(c => !CSS_IN_JS_HASH.test(c))    // reject CSS-in-JS hash classes
+    .filter(c => !STATE_PREFIXES.test(c))    // reject interaction-state classes
+    .filter(c => !UTILITY_NOISE.test(c))     // reject Tailwind-style utility noise
+    .slice(0, n);
   return parts.join(" ");
 }
 
@@ -228,10 +241,20 @@ function clusterUrl(href) {
   if (!parts.length) return "home";
 
   const HUBS = [
+    // English
     "blog", "news", "articles", "article", "post", "posts", "newsletter", "research", "reports",
     "resources", "insights", "case-studies", "stories", "learn", "docs", "help", "support",
     "shop", "products", "store", "collections", "category", "authors", "author", "tags", "tag",
-    "topics", "events", "webinars", "podcast", "videos", "about", "team", "careers", "contact", "legal", "privacy"
+    "topics", "events", "webinars", "podcast", "videos", "about", "team", "careers", "contact", "legal", "privacy",
+    // Indian government / NIC common path tokens
+    "schemes", "services", "notifications", "tenders", "circulars", "gazettes", "acts",
+    "rules", "policy", "policies", "rti", "acts-rules", "press-releases", "downloads", "forms",
+    // Hindi (transliterated paths common on .gov.in/.nic.in)
+    "samachar", "seva", "sevaen", "yojana", "yojanaen", "niyam", "aadesh", "adhisuchana",
+    "suchna", "gathan", "sampark", "vibhag", "mantralaya", "sansthan",
+    // Hindi (native Devanagari — .gov.in sites increasingly use these in URLs)
+    "समाचार", "सेवा", "सेवाएं", "योजना", "योजनाएं", "नियम", "अधिसूचना", "सूचना",
+    "संपर्क", "विभाग", "मंत्रालय", "संस्थान", "सरकारी-योजनाएं"
   ];
   if (HUBS.includes(parts[0])) {
     return parts.length === 1 ? `/${parts[0]} [index]` : `/${parts[0]}/[detail]`;
@@ -252,7 +275,9 @@ async function shortHash(str) {
     const bytes = new TextEncoder().encode(str);
     const digest = await crypto.subtle.digest("SHA-1", bytes);
     const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
-    return hex.slice(0, 8);
+    // 12 hex = 48 bits. At 10k pages, collision probability is < 1 in 6 million.
+    // At 8 hex it was ~1 in 14 per 10k pages — too loose for audit use.
+    return hex.slice(0, 12);
   } catch {
     return "";
   }
