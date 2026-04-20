@@ -54,6 +54,17 @@
           <span>Crawl depth</span>
           <input id="opt-depth" type="number" min="1" max="5" step="1" value="1" />
         </label>
+        <label class="opt wide">
+          <span>Compliance profile</span>
+          <select id="opt-profile">
+            <option value="wcag21aa">WCAG 2.1 AA</option>
+            <option value="is17802">IS 17802 (India)</option>
+            <option value="gigw3">GIGW 3.0 (NIC India)</option>
+            <option value="en301549">EN 301 549 (EU)</option>
+            <option value="section508">Section 508 (US)</option>
+            <option value="ada">ADA Title III (US)</option>
+          </select>
+        </label>
       </section>
 
       <p id="status" class="status" hidden></p>

@@ -23,6 +23,23 @@
     });
     const durationMs = Math.round(performance.now() - started);
 
+    // Run our custom India / GIGW checks and merge them into the violation
+    // stream. They produce axe-shaped rule objects so the rest of the
+    // pipeline doesn't need to know they came from a different source.
+    const customRules = [];
+    try {
+      if (window.EU_IndiaChecks?.run) customRules.push(...window.EU_IndiaChecks.run(document));
+    } catch (e) { console.warn("[EU] india-checks failed", e); }
+    try {
+      if (window.EU_GIGWChecks?.run) customRules.push(...window.EU_GIGWChecks.run(document));
+    } catch (e) { console.warn("[EU] gigw-checks failed", e); }
+    // Split custom rules by impact — 'minor' / 'review' go to incomplete
+    // (auditor needs to confirm), others go to violations.
+    const customViolations = customRules.filter(r => r.impact !== "minor" || !r.tags?.includes("review"));
+    const customIncomplete = customRules.filter(r => r.impact === "minor" && r.tags?.includes("review"));
+    res.violations = [...(res.violations || []), ...customViolations];
+    res.incomplete = [...(res.incomplete || []), ...customIncomplete];
+
     // Normalise a result category (violations|passes|incomplete|inapplicable)
     // into a flat rule array with every node + every check preserved.
     const normRules = (rules) => (rules || []).map(r => ({

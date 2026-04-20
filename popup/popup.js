@@ -4,24 +4,28 @@ const btnMulti = $("btn-scan-multi");
 const statusEl = $("status");
 const maxUrlsInput = $("opt-max-urls");
 const depthInput = $("opt-depth");
+const profileSelect = $("opt-profile");
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_DEPTH = 1;
 const HARD_MAX_URLS = 500;
 const HARD_MAX_DEPTH = 5;
+const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
+  if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
 }).catch(() => {});
 
 function readScanOptions() {
   const maxUrls = clamp(parseInt(maxUrlsInput.value, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
   const crawlDepth = clamp(parseInt(depthInput.value, 10) || DEFAULT_DEPTH, 1, HARD_MAX_DEPTH);
+  const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : "wcag21aa";
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
-  chrome.storage?.local.set({ maxUrls, crawlDepth }).catch(() => {});
-  return { maxUrls, crawlDepth };
+  chrome.storage?.local.set({ maxUrls, crawlDepth, profile }).catch(() => {});
+  return { maxUrls, crawlDepth, profile };
 }
 
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
@@ -64,9 +68,10 @@ btnCurrent.addEventListener("click", async () => {
   const granted = await ensureHostPermission(tab.url);
   if (!granted) { setStatus("Permission denied.", true); return; }
 
+  const opts = readScanOptions();
   setBusy(true);
-  setStatus("Scanning current page…");
-  const res = await send({ type: "SCAN_CURRENT", tabId: tab.id });
+  setStatus(`Scanning current page (${opts.profile})…`);
+  const res = await send({ type: "SCAN_CURRENT", tabId: tab.id, options: opts });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scan failed.", true); return; }
   setStatus("Opening report…");

@@ -1,5 +1,6 @@
 import { toCsv } from "./lib/csv-writer.js";
 import { ALL_AA_CRITERIA, extractCriteriaFromTags } from "./lib/wcag-tags.js";
+import { standardsFor, PROFILES, PROFILE_KEYS, isInProfile, profileClause } from "./lib/standards.js";
 import {
   RequestQueue,
   RateLimiter,
@@ -29,7 +30,7 @@ const rateLimiter = new RateLimiter();
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId));
+      if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId, msg.options));
       else if (msg.type === "SCAN_MULTI") sendResponse(await scanMulti(msg.tabId, msg.options));
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
@@ -53,10 +54,11 @@ chrome.tabs.onRemoved.addListener(tabId => {
   }
 });
 
-async function scanCurrent(tabId) {
+async function scanCurrent(tabId, options) {
   const tab = await chrome.tabs.get(tabId);
   const result = await scanInExistingTab(tabId);
-  const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url });
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url, profile });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
@@ -66,6 +68,7 @@ async function scanCurrent(tabId) {
 async function scanMulti(tabId, options) {
   const maxUrls = clamp(parseInt(options?.maxUrls, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
   const crawlDepth = clamp(parseInt(options?.crawlDepth, 10) || DEFAULT_CRAWL_DEPTH, 1, HARD_MAX_DEPTH);
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
 
   const tab = await chrome.tabs.get(tabId);
   const startUrl = tab.url;
@@ -148,7 +151,7 @@ async function scanMulti(tabId, options) {
 
   console.log(`[EU] crawl complete — pages per depth:`, depthStats, "rate:", rateLimiter.snapshot());
   const report = buildReport(results, {
-    mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats
+    mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats, profile
   });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
@@ -198,9 +201,12 @@ async function scanInNewTab(url, collectNextLinks = false) {
 }
 
 async function injectAxe(tabId) {
+  // Inject axe-core + our custom check bundles together. They attach to
+  // window.EU_IndiaChecks / window.EU_GIGWChecks so the content-script can
+  // merge their output into the axe results.
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: false },
-    files: ["lib/axe.min.js"],
+    files: ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js"],
     world: "ISOLATED"
   });
 }
@@ -351,22 +357,38 @@ function buildReport(pages, meta) {
     // Violations: also drive the WCAG criterion pass/fail tally and issueRows.
     for (const v of p.violations || []) {
       const crits = extractCriteriaFromTags(v.tags || []);
+      // Custom rules (india-checks / gigw-checks) may not carry wcagXXX tags
+      // but still reference a WCAG criterion via their rule id. If the
+      // tag-extractor produced no criteria, we synthesise a single row with
+      // empty WCAG fields so the violation still appears.
+      const critList = crits.length ? crits : [{ num: "", level: "", name: "" }];
       for (const n of v.nodes || []) {
-        for (const crit of crits) {
-          failed.add(crit.num);
-          const st = criterionStats.get(crit.num);
-          if (st) { st.pagesFailed.add(pageUrl); st.totalViolations++; }
+        for (const crit of critList) {
+          if (crit.num) {
+            failed.add(crit.num);
+            const st = criterionStats.get(crit.num);
+            if (st) { st.pagesFailed.add(pageUrl); st.totalViolations++; }
+          }
+          const xref = crit.num ? standardsFor(crit.num) : null;
           issueRows.push({
             url: pageUrl,
             page_title: p.title || "",
             wcag_criterion: crit.num,
             wcag_level: crit.level,
             wcag_name: crit.name,
+            // Cross-framework clause references (null when SC isn't covered
+            // by that framework — Section 508 pre-WCAG-2.1 carve-outs etc).
+            gigw_clause:      xref?.gigw       || "",
+            is17802_clause:   xref?.is17802    || "",
+            en301549_clause:  xref?.en301549   || "",
+            section508_ref:   xref?.section508 || "",
+            ada_ref:          xref?.ada        || "",
             rule_id: v.ruleId,
             rule_impact: v.impact || "",
             rule_description: v.description || "",
             rule_help: v.help || "",
             rule_tags: (v.tags || []).join(" "),
+            rule_source: v.ruleId && (v.ruleId.startsWith("india-") || v.ruleId.startsWith("gigw-")) ? "custom" : "axe-core",
             impact: n.impact || v.impact || "minor",
             selector: (n.target || []).join(" "),
             target_array: n.target || [],
@@ -493,6 +515,50 @@ function buildReport(pages, meta) {
     }))
     .sort((a, b) => (b.page_count - a.page_count) || (b.total_violations - a.total_violations));
 
+  // ── Per-profile conformance ─────────────────────────────────────────────
+  // For each compliance profile (WCAG 2.1 AA, IS 17802, GIGW 3.0, EN 301 549,
+  // Section 508, ADA), compute: which in-scope SCs have failures across the
+  // corpus. Produces a compact table the report can render as "Conformance
+  // by Standard" and the ACR / VPAT generator can consume directly.
+  const profilesRows = PROFILE_KEYS.map(key => {
+    const p = PROFILES[key];
+    let applicable = 0, failed = 0, passed = 0, violations = 0;
+    const failingClauses = [];
+    for (const c of ALL_AA_CRITERIA) {
+      if (!isInProfile(key, c.num)) continue;
+      applicable++;
+      const st = criterionStats.get(c.num);
+      if (st && st.pagesFailed.size > 0) {
+        failed++;
+        violations += st.totalViolations;
+        failingClauses.push({
+          wcag: c.num,
+          name: c.name,
+          level: c.level,
+          clause: profileClause(key, c.num),
+          pages_failed: st.pagesFailed.size,
+          total_violations: st.totalViolations
+        });
+      } else if (st) {
+        passed++;
+      }
+    }
+    const conformance = applicable === 0 ? "N/A" :
+      failed === 0 ? "Fully conformant" :
+      failed < applicable * 0.1 ? "Partially conformant (≥90% SCs pass)" :
+      "Does not conform";
+    return {
+      profile_key: key,
+      profile_label: p.label,
+      applicable_criteria: applicable,
+      passed_criteria: passed,
+      failed_criteria: failed,
+      total_violations: violations,
+      conformance_status: conformance,
+      failing_clauses: failingClauses.sort((a, b) => b.total_violations - a.total_violations)
+    };
+  });
+
   return {
     meta: { ...meta, generatedAt: new Date().toISOString(), totalPages: pages.length, totalTemplates: templatesRows.length },
     summaryRows,
@@ -504,6 +570,7 @@ function buildReport(pages, meta) {
     envRows,
     pagesRows,
     templatesRows,
+    profilesRows,
     pages
   };
 }
@@ -537,12 +604,19 @@ async function downloadCsv(reportId) {
   const issueCols = [
     "url", "page_title",
     "wcag_criterion", "wcag_level", "wcag_name",
-    "rule_id", "rule_impact", "rule_description", "rule_help", "rule_tags",
+    "gigw_clause", "is17802_clause", "en301549_clause", "section508_ref", "ada_ref",
+    "rule_id", "rule_source", "rule_impact", "rule_description", "rule_help", "rule_tags",
     "impact", "selector", "ancestry", "xpath", "html_snippet",
     "failure_summary", "help_url",
     "checks_any", "checks_all", "checks_none"
   ];
   const issuesCsv = toCsv(issueCols, flatten(report.issueRows, issueCols));
+
+  const profilesCols = [
+    "profile_key", "profile_label", "applicable_criteria", "passed_criteria",
+    "failed_criteria", "total_violations", "conformance_status"
+  ];
+  const profilesCsv = toCsv(profilesCols, flatten(report.profilesRows || [], profilesCols));
 
   const categoryCols = [
     "url", "page_title", "scan_started_at",
@@ -602,6 +676,7 @@ async function downloadCsv(reportId) {
       ? `# Discovery: nav=${report.meta.discoveryStats.nav} body=${report.meta.discoveryStats.body} sitemap=${report.meta.discoveryStats.sitemap} hreflang=${report.meta.discoveryStats.hreflang} paths=${report.meta.discoveryStats.commonPaths}\r\n`
       : ``) +
     `\r\n## WCAG 2.1 AA Summary\r\n` + summaryCsv +
+    `\r\n\r\n## Conformance by Standard (WCAG / IS 17802 / GIGW / EN 301 549 / Section 508 / ADA)\r\n` + profilesCsv +
     `\r\n\r\n## Templates\r\n` + templatesCsv +
     `\r\n\r\n## Violations (one row per violation × WCAG criterion × node)\r\n` + issuesCsv +
     `\r\n\r\n## Passes (one row per node)\r\n` + passesCsv +

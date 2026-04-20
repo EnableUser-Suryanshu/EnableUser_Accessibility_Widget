@@ -198,6 +198,58 @@ function renderNodeDetails(i) {
     sumBody.appendChild(tr);
   }
 
+  // ── Conformance by Standard ──
+  // Each row expands to show which clauses failed, with a count per clause.
+  const profilesBody = document.querySelector("#profiles-table tbody");
+  const activeProfile = report.meta.profile || "wcag21aa";
+  for (const pr of report.profilesRows || []) {
+    const isActive = pr.profile_key === activeProfile;
+    const statusClass =
+      pr.conformance_status === "Fully conformant" ? "pass" :
+      pr.conformance_status === "Does not conform" ? "fail" : "";
+    const mainRow = el("tr", { class: "profile-row" + (isActive ? " profile-active" : "") });
+    const labelCell = el("td", {}, [pr.profile_label + (isActive ? " ★" : "")]);
+    mainRow.appendChild(labelCell);
+    mainRow.appendChild(el("td", {}, [String(pr.applicable_criteria)]));
+    mainRow.appendChild(el("td", { class: "pass" }, [String(pr.passed_criteria)]));
+    mainRow.appendChild(el("td", { class: pr.failed_criteria > 0 ? "fail" : "" }, [String(pr.failed_criteria)]));
+    mainRow.appendChild(el("td", {}, [String(pr.total_violations)]));
+    mainRow.appendChild(el("td", { class: statusClass }, [pr.conformance_status]));
+
+    const detailRow = el("tr", { class: "profile-detail-row" });
+    const detailCell = el("td", { colspan: "6" });
+    if (pr.failing_clauses && pr.failing_clauses.length) {
+      const grid = el("table", { class: "failing-clauses" });
+      grid.appendChild(el("thead", {}, [
+        el("tr", {}, [
+          el("th", {}, ["Clause"]), el("th", {}, ["WCAG SC"]),
+          el("th", {}, ["Name"]), el("th", {}, ["Level"]),
+          el("th", {}, ["Pages Failed"]), el("th", {}, ["Total Violations"])
+        ])
+      ]));
+      const body = el("tbody");
+      for (const f of pr.failing_clauses) {
+        body.appendChild(el("tr", {}, [
+          el("td", { class: "mono" }, [f.clause || ""]),
+          el("td", {}, [f.wcag || ""]),
+          el("td", {}, [f.name || ""]),
+          el("td", {}, [f.level || ""]),
+          el("td", { class: "fail" }, [String(f.pages_failed)]),
+          el("td", { class: "fail" }, [String(f.total_violations)])
+        ]));
+      }
+      grid.appendChild(body);
+      detailCell.appendChild(grid);
+    } else {
+      detailCell.appendChild(el("p", { class: "muted" }, ["No failing clauses in this profile."]));
+    }
+    detailRow.appendChild(detailCell);
+
+    mainRow.addEventListener("click", () => mainRow.classList.toggle("expanded"));
+    profilesBody.appendChild(mainRow);
+    profilesBody.appendChild(detailRow);
+  }
+
   // ── Templates table ──
   const templatesBody = document.querySelector("#templates-table tbody");
   for (const t of report.templatesRows || []) {
