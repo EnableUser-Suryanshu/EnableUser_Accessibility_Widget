@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>EnableUser</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>EnableUser: Smart Accessibility Testing for Your Application</h1>
+    </header>
+
+    <main>
+      <section class="row">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <circle cx="10" cy="14" r="2"></circle>
+            <line x1="11.5" y1="15.5" x2="14" y2="18"></line>
+          </svg>
+        </div>
+        <div class="text">
+          <div class="title">Scan Current Page</div>
+          <div class="sub">Only the current page will be scanned</div>
+        </div>
+        <button id="btn-scan-current" class="scan">Scan</button>
+      </section>
+
+      <hr />
+
+      <section class="row">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <circle cx="10" cy="14" r="2"></circle>
+            <line x1="11.5" y1="15.5" x2="14" y2="18"></line>
+          </svg>
+        </div>
+        <div class="text">
+          <div class="title">Multi Page Scan</div>
+          <div class="sub">Crawls same-site links + sitemap.xml / robots.txt</div>
+        </div>
+        <button id="btn-scan-multi" class="scan">Scan</button>
+      </section>
+
+      <section class="options">
+        <label class="opt">
+          <span>Max URLs</span>
+          <input id="opt-max-urls" type="number" min="1" max="500" step="1" value="50" />
+        </label>
+        <label class="opt">
+          <span>Crawl depth</span>
+          <input id="opt-depth" type="number" min="1" max="5" step="1" value="1" />
+        </label>
+      </section>
+
+      <p id="status" class="status" hidden></p>
+    </main>
+
+    <footer>
+      <p>To subscribe to the advanced features of EnableUser, kindly contact:<br />
+        <a href="mailto:teamenableuser@gmail.com">teamenableuser@gmail.com</a>
+      </p>
+      <p class="meta">Version 0.1.0 | Powered by axe-core</p>
+    </footer>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
