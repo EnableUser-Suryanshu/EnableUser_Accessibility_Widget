@@ -354,9 +354,15 @@ function renderTemplates(inventory) {
   }
   templates.forEach((t, i) => {
     const typeLabel = t.isSPA ? "dynamic (SPA)" : (t.sample_pageType || "static");
+    // Templates now cluster by fingerprint alone, so a single template can
+    // span multiple URL shapes. Show the primary cluster + a count of others.
+    const extraClusters = Math.max(0, (t.cluster_count || 1) - 1);
+    const clusterLabel = extraClusters > 0
+      ? `${t.url_cluster || ""} (+${extraClusters} more URL cluster${extraClusters === 1 ? "" : "s"})`
+      : (t.url_cluster || "");
     const row = el("tr", { class: "template-row" }, [
       el("td", { class: "mono" }, [t.template_id || ""]),
-      el("td", {}, [`${t.url_cluster || ""}  `, el("span", { class: "badge" }, [typeLabel])]),
+      el("td", {}, [`${clusterLabel}  `, el("span", { class: "badge" }, [typeLabel])]),
       el("td", {}, [String(t.page_count)]),
       el("td", {}, [
         el("a", { href: t.sample_url, target: "_blank", rel: "noopener" }, [t.sample_url])
@@ -562,10 +568,33 @@ async function main() {
   renderStats(inventory);
   renderAuditStats(inventory);
   renderContentTypes(inventory);
+  renderShellPages(inventory);
   renderTemplates(inventory);
   renderSample(inventory);
   renderPages(inventory);
   wireDownloads();
+}
+
+function renderShellPages(inventory) {
+  const section = document.getElementById("shell-section");
+  const hint = document.getElementById("shell-hint");
+  const list = document.getElementById("shell-list");
+  if (!section || !hint || !list) return;
+  const summary = inventory.shellSummary;
+  if (!summary || !summary.count) { section.hidden = true; return; }
+  section.hidden = false;
+  hint.textContent = `${summary.count} URL${summary.count === 1 ? "" : "s"} returned the same DOM + text as the seed page (probable soft-404 / SPA shell). Excluded from the pages + templates tables below. ${summary.explanation || ""}`;
+  list.innerHTML = "";
+  for (const u of summary.sample_urls || []) {
+    list.appendChild(el("li", {}, [
+      el("a", { href: u, target: "_blank", rel: "noopener" }, [u])
+    ]));
+  }
+  if (summary.count > (summary.sample_urls || []).length) {
+    list.appendChild(el("li", { class: "muted" }, [
+      `… and ${summary.count - (summary.sample_urls || []).length} more (see full inventory xlsx)`
+    ]));
+  }
 }
 
 main().catch(err => {

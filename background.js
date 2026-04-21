@@ -11,7 +11,6 @@ import {
 import {
   discoverSeedsFromOrigin,
   discoverHreflang,
-  probeCommonPaths,
   navSurfacedCollect
 } from "./lib/discovery.js";
 import { buildScopeDocx } from "./lib/docx-writer.js";
@@ -145,17 +144,19 @@ async function scanMulti(tabId, options) {
   const startScan = await scanInExistingTab(tabId);
   results.push({ url: startUrl, title: tab.title, depth: 0, source: "seed", ...startScan });
 
-  let sitemapUrls = [], hreflangUrls = [], commonPaths = [];
+  // Evidence-based discovery only. NO speculative common-path probing —
+  // on SPAs every path returns 200 (server ships the shell, client routes
+  // internally) so probing produces 40 false positives per site. Real pages
+  // come from the sitemap, hreflang alternates, or in-page links.
+  let sitemapUrls = [], hreflangUrls = [];
   if (seedOrigin) {
-    [sitemapUrls, hreflangUrls, commonPaths] = await Promise.all([
+    [sitemapUrls, hreflangUrls] = await Promise.all([
       discoverSeedsFromOrigin(seedOrigin).catch(() => []),
-      discoverHreflang(startUrl).catch(() => []),
-      probeCommonPaths(seedOrigin).catch(() => [])
+      discoverHreflang(startUrl).catch(() => [])
     ]);
   }
   discoveryStats.sitemap = queue.enqueueMany(sitemapUrls, { depth: 1, priority: 3, source: "sitemap" });
   discoveryStats.hreflang = queue.enqueueMany(hreflangUrls, { depth: 1, priority: 5, source: "hreflang" });
-  discoveryStats.commonPaths = queue.enqueueMany(commonPaths, { depth: 1, priority: 4, source: "common-path" });
 
   const seedLinks = await collectNavLinks(tabId);
   const navOnly = seedLinks.filter(l => l.priority >= 10).map(l => l.url);
@@ -163,7 +164,7 @@ async function scanMulti(tabId, options) {
   discoveryStats.nav = queue.enqueueMany(navOnly, { depth: 1, priority: 8, source: "nav" });
   discoveryStats.body = queue.enqueueMany(bodyOnly, { depth: 1, priority: 2, source: "body" });
 
-  console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap} hreflang:${discoveryStats.hreflang} paths:${discoveryStats.commonPaths} | pending:${queue.pending}`);
+  console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap} hreflang:${discoveryStats.hreflang} | pending:${queue.pending}`);
 
   const active = new Set();
 
@@ -284,18 +285,18 @@ async function scanInventory(tabId, options) {
     pages.push({ url: startUrl, depth: 0, source: "seed", error: String(err?.message || err) });
   }
 
-  // Same discovery pipeline as scanMulti.
-  let sitemapUrls = [], hreflangUrls = [], commonPaths = [];
+  // Same discovery pipeline as scanMulti: evidence-based only (sitemap +
+  // hreflang + in-page links). No speculative common-path probing — it
+  // fabricates 40 false-positive URLs on every SPA.
+  let sitemapUrls = [], hreflangUrls = [];
   if (seedOrigin) {
-    [sitemapUrls, hreflangUrls, commonPaths] = await Promise.all([
+    [sitemapUrls, hreflangUrls] = await Promise.all([
       discoverSeedsFromOrigin(seedOrigin).catch(() => []),
-      discoverHreflang(startUrl).catch(() => []),
-      probeCommonPaths(seedOrigin).catch(() => [])
+      discoverHreflang(startUrl).catch(() => [])
     ]);
   }
   queue.enqueueMany(sitemapUrls, { depth: 1, priority: 3, source: "sitemap" });
   queue.enqueueMany(hreflangUrls, { depth: 1, priority: 5, source: "hreflang" });
-  queue.enqueueMany(commonPaths, { depth: 1, priority: 4, source: "common-path" });
 
   const seedLinks = await collectNavLinks(tabId);
   const navOnly = seedLinks.filter(l => l.priority >= 10).map(l => l.url);
@@ -517,7 +518,39 @@ function isCriticalPath(url) {
 }
 
 function buildInventory(pages, meta) {
-  // Group by template — fingerprint + url_cluster.
+  // ── Shell / soft-404 detection ─────────────────────────────────────
+  // The seed page (the URL the user originally gave us) is the reference
+  // shell. Any subsequently-crawled page whose DOM fingerprint AND text hash
+  // BOTH match the seed's is almost certainly either the SPA's shell
+  // returned on unknown routes (a soft-404) or a duplicate of the homepage.
+  // We keep them in a separate bucket for transparency but exclude from
+  // the main pages / templates tables so the inventory reflects real
+  // distinct pages.
+  const seedPage = pages.find(p => p.source === "seed" && !p.error) || null;
+  const seedFp = seedPage?.template_id || null;
+  const seedTextHash = seedPage?.text_hash || null;
+  const shellPages = [];
+  const realPages = [];
+  for (const p of pages) {
+    if (p.error) { realPages.push(p); continue; }
+    if (p === seedPage) { realPages.push(p); continue; }
+    const isShell =
+      seedFp && p.template_id === seedFp &&
+      seedTextHash && p.text_hash === seedTextHash;
+    if (isShell) {
+      p.isShell = true;
+      shellPages.push(p);
+    } else {
+      realPages.push(p);
+    }
+  }
+
+  // Group by template fingerprint ALONE. Previously the key was
+  // `fingerprint|url_cluster` which fragmented SPA shells into N rows (one
+  // per URL path). Now many URL paths sharing the same fingerprint cluster
+  // as one template, with the full set of distinct url_clusters carried
+  // along as a facet (so the viewer can still show "this template spans
+  // /about, /team, /services, …").
   const groups = new Map();
   const contentTypeSummary = {
     "Forms": 0, "Data Tables": 0, "Video": 0, "Audio": 0,
@@ -533,13 +566,15 @@ function buildInventory(pages, meta) {
   // single number.
   const corpusAudit = { violations: 0, incomplete: 0, passes: 0, inapplicable: 0, pagesAudited: 0, pagesScreenshotted: 0 };
 
-  for (const p of pages) {
+  for (const p of realPages) {
     if (p.error) continue;
-    const key = `${p.template_id}|${p.url_cluster}`;
+    const key = p.template_id || "unknown";
     let g = groups.get(key);
     if (!g) {
       g = {
-        template_id: p.template_id, url_cluster: p.url_cluster,
+        template_id: p.template_id,
+        url_cluster: p.url_cluster, // primary (first-seen) cluster label
+        url_clusters: new Set(),   // all distinct clusters in this template
         page_count: 0, pages: [],
         sample_url: p.url, sample_title: p.title || "",
         sample_pageType: p.pageType || "unknown",
@@ -554,6 +589,7 @@ function buildInventory(pages, meta) {
       };
       groups.set(key, g);
     }
+    if (p.url_cluster) g.url_clusters.add(p.url_cluster);
     g.page_count++;
     g.pages.push({
       url: p.url,
@@ -629,8 +665,12 @@ function buildInventory(pages, meta) {
       if (g.flags.hasLogin) signalBits.push("login");
       if (g.flags.hasCaptcha) signalBits.push("captcha");
       if (g.flags.hasShadowDom) signalBits.push("shadow-dom");
+      const clusterList = [...g.url_clusters];
       return {
-        template_id: g.template_id, url_cluster: g.url_cluster,
+        template_id: g.template_id,
+        url_cluster: g.url_cluster, // primary cluster (first-seen)
+        url_clusters: clusterList,  // full set
+        cluster_count: clusterList.length,
         page_count: g.page_count, sample_url: g.sample_url,
         sample_title: g.sample_title,
         sample_pageType: g.sample_pageType,
@@ -671,13 +711,27 @@ function buildInventory(pages, meta) {
   }
   const proposedSample = [...sampleSet.values()];
 
+  // Compact shell-page summary for the viewer. Lets the operator see
+  // "these 37 URLs all returned the homepage shell — probably soft-404s or
+  // SPA route fallbacks" without these polluting the real inventory.
+  const shellSummary = shellPages.length ? {
+    count: shellPages.length,
+    sample_urls: shellPages.slice(0, 20).map(p => p.url),
+    explanation: "These URLs were crawled but returned the same DOM + text as the seed page. On SPAs this usually means the client router matched them to the default/home route (soft-404). Excluded from the main pages + templates tables so they don't inflate inventory counts."
+  } : null;
+
   return {
     meta: {
       ...meta,
       crawlDepthLabel: Number.isFinite(meta.crawlDepth) ? String(meta.crawlDepth) : "unbounded",
       generatedAt: new Date().toISOString()
     },
-    pages, templates, proposedSample, contentTypeSummary,
+    // `pages` is the real set (shell pages excluded). Keep shellPages
+    // addressable separately so nothing is silently dropped.
+    pages: realPages,
+    shellPages,
+    shellSummary,
+    templates, proposedSample, contentTypeSummary,
     corpusAudit,
     recommendedTestsUnion: [...testsUnion.entries()].map(([test, why]) => ({ test, why }))
   };
