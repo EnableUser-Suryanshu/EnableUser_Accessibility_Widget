@@ -194,8 +194,25 @@ async function computeTemplateSignals() {
 // `_fp_bs4_extract_elements` builds — but from the live DOM, not parsed HTML.
 // Shadow DOM is traversed so the fingerprint is structurally complete for
 // web-component-heavy pages (Lit, Stencil, SFDC Lightning, Polymer).
+//
+// Feature improvements over the original: (a) relative-depth bucketing on
+// each landmark (so listing vs detail pages with same tags but different
+// nesting cluster apart), (b) direct-child-count bucketing on containers
+// (so a <main> with 3 cards vs 50 cards hashes differently).
 function extractSignature(root) {
   const sig = [];
+  const baseDepth = depthOf(root);
+
+  // Bucket a count into {0, 1, few=2-5, many=6-20, mass=21+}
+  const bucket = n =>
+    n === 0 ? "0" :
+    n === 1 ? "1" :
+    n <= 5 ? "few" :
+    n <= 20 ? "many" : "mass";
+  const depthBucket = d =>
+    d <= 2 ? "shallow" :
+    d <= 5 ? "mid" :
+    d <= 9 ? "deep" : "vdeep";
 
   const landmarkTags = [
     "header", "nav", "main", "article", "aside", "footer",
@@ -205,12 +222,15 @@ function extractSignature(root) {
   ];
   for (const tag of landmarkTags) {
     for (const el of qsaDeep(tag, root)) {
-      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}`);
+      const d = depthBucket(depthOf(el) - baseDepth);
+      const kids = bucket(el.children?.length || 0);
+      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}:k=${kids}`);
     }
   }
 
   for (const el of qsaDeep("[role]", root)) {
-    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}`);
+    const d = depthBucket(depthOf(el) - baseDepth);
+    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}`);
   }
 
   const hCounts = [1, 2, 3, 4, 5, 6].map(n => qsaDeep(`h${n}`, root).length);
@@ -223,7 +243,8 @@ function extractSignature(root) {
   const seen = new Set();
   for (const pattern of LAYOUT_PATTERNS) {
     for (const el of qsaDeep(`[class*="${pattern}" i]`, root)) {
-      const key = `${el.tagName.toLowerCase()}::${firstClasses(el, 3)}`;
+      const kids = bucket(el.children?.length || 0);
+      const key = `${el.tagName.toLowerCase()}::${firstClasses(el, 3)}:k=${kids}`;
       if (seen.has(key)) continue;
       seen.add(key);
       sig.push(key);
@@ -231,6 +252,19 @@ function extractSignature(root) {
   }
 
   return sig;
+}
+
+// Depth relative to document root. Traverses across shadow boundaries via
+// .host so an element inside a web component still reports its true depth.
+function depthOf(node) {
+  let d = 0, cur = node;
+  while (cur && cur.parentNode) {
+    if (cur.parentNode.host) cur = cur.parentNode.host;
+    else cur = cur.parentNode;
+    d++;
+    if (d > 200) break; // safety
+  }
+  return d;
 }
 
 // Class names that jitter between renders but don't indicate a different

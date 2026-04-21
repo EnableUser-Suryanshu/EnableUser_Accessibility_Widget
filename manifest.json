@@ -16,7 +16,8 @@
     "scripting",
     "activeTab",
     "downloads",
-    "storage"
+    "storage",
+    "debugger"
   ],
   "optional_host_permissions": [
     "http://*/*",

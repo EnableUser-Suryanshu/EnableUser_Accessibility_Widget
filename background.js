@@ -174,7 +174,15 @@ async function scanMulti(tabId, options) {
 // ─────────────────────────────────────────────────────────────────────────
 async function scanInventory(tabId, options) {
   const maxUrls = clamp(parseInt(options?.maxUrls, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
-  const crawlDepth = clamp(parseInt(options?.crawlDepth, 10) || DEFAULT_CRAWL_DEPTH, 1, HARD_MAX_DEPTH);
+  // Inventory mode has NO depth cap. The only real crawl bound is maxUrls —
+  // the priority queue biases shallow pages first, so unbounded depth just
+  // means "keep expanding until maxUrls is reached or the frontier is empty".
+  // A user-supplied crawlDepth is still honoured if provided (> 0), for
+  // operators who want to short-circuit a deep site deliberately.
+  const rawDepth = parseInt(options?.crawlDepth, 10);
+  const crawlDepth = (Number.isFinite(rawDepth) && rawDepth > 0)
+    ? Math.min(rawDepth, HARD_MAX_DEPTH)
+    : Number.POSITIVE_INFINITY;
 
   const tab = await chrome.tabs.get(tabId);
   const startUrl = tab.url;
@@ -187,16 +195,36 @@ async function scanInventory(tabId, options) {
   const pages = [];
   const depthStats = {};
 
-  // Seed page runs in the current tab directly.
+  // Seed page runs the SAME full audit stack as every other crawled URL —
+  // axe + india + gigw + content-signals + full-page screenshot. Runs in the
+  // existing tab (no new tab open) so the user's session/cookies/scroll
+  // state is preserved for the seed.
   queue.next();
   depthStats[0] = 1;
   try {
-    const sig = await collectTemplateSignature(tabId);
+    await injectAxe(tabId);
+    const auditPayload = await runContentScan(tabId);
     const signals = await collectContentSignals(tabId);
-    const fingerprint = await sha1Prefix(sig?.sigStr || "", 12);
+    let screenshot = null;
+    try { screenshot = await captureFullPageScreenshot(tabId); }
+    catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
+    const tmpl = auditPayload?.template || {};
     pages.push({
-      url: startUrl, title: tab.title, depth: 0, source: "seed",
-      template_id: fingerprint, url_cluster: sig?.urlCluster || "unknown",
+      url: startUrl, title: auditPayload?.title || tab.title || "", depth: 0, source: "seed",
+      template_id: tmpl.fingerprint || "unknown",
+      url_cluster: tmpl.urlCluster || "unknown",
+      text_hash: tmpl.textHash || "",
+      element_counts: tmpl.elementCounts || {},
+      audit: {
+        scanStartedAt: auditPayload?.scanStartedAt || null,
+        scanDurationMs: auditPayload?.scanDurationMs || 0,
+        testEngine: auditPayload?.testEngine || null,
+        violations: auditPayload?.violations || [],
+        passes: auditPayload?.passes || [],
+        incomplete: auditPayload?.incomplete || [],
+        inapplicable: auditPayload?.inapplicable || []
+      },
+      screenshot,
       ...signals
     });
   } catch (err) {
@@ -272,26 +300,87 @@ async function scanInventory(tabId, options) {
   return { ok: true, inventoryId };
 }
 
+// Inventory mode per-page worker. Runs the FULL audit stack (axe + india +
+// gigw) + content-signals + full-page screenshot. The result is a complete
+// per-page record: violations/passes/incomplete/inapplicable, template
+// fingerprint, content-type flags, actual component values, and a PNG
+// screenshot blob. This replaces the earlier signals-only path on user
+// direction — inventory mode IS the full audit, not a lightweight preview.
 async function inventoryInNewTab(url, collectNextLinks) {
   const tab = await chrome.tabs.create({ url, active: false });
+  const tabId = tab.id;
   try {
-    await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
+    await waitForTabComplete(tabId, TAB_TIMEOUT_MS);
     await sleep(SETTLE_MS);
-    const sig = await collectTemplateSignature(tab.id);
-    const signals = await collectContentSignals(tab.id);
-    const fingerprint = await sha1Prefix(sig?.sigStr || "", 12);
+
+    // Full audit stack — same code path as scanMulti.
+    await injectAxe(tabId);
+    const auditPayload = await runContentScan(tabId);
+
+    // Content signals (with shadow DOM, actual values, static/dynamic class).
+    const signals = await collectContentSignals(tabId);
+
+    // Full-page screenshot via chrome.debugger. Falls back gracefully to
+    // visible-viewport capture if debugger attach is refused (e.g. DevTools
+    // already open on this tab, chrome:// URL, policy).
+    let screenshot = null;
+    try {
+      screenshot = await captureFullPageScreenshot(tabId);
+    } catch (err) {
+      console.warn(`[EU] screenshot failed for ${url}:`, err?.message || err);
+    }
+
+    const tmpl = auditPayload?.template || {};
     const out = {
-      title: tab.title || "",
-      template_id: fingerprint,
-      url_cluster: sig?.urlCluster || "unknown",
+      title: auditPayload?.title || tab.title || "",
+      template_id: tmpl.fingerprint || "unknown",
+      url_cluster: tmpl.urlCluster || "unknown",
+      text_hash: tmpl.textHash || "",
+      element_counts: tmpl.elementCounts || {},
+      // Full audit — same shape as multi-page mode.
+      audit: {
+        scanStartedAt: auditPayload?.scanStartedAt || null,
+        scanDurationMs: auditPayload?.scanDurationMs || 0,
+        testEngine: auditPayload?.testEngine || null,
+        violations: auditPayload?.violations || [],
+        passes: auditPayload?.passes || [],
+        incomplete: auditPayload?.incomplete || [],
+        inapplicable: auditPayload?.inapplicable || []
+      },
+      screenshot, // { dataUrl, width, height } | null
       ...signals
     };
     if (collectNextLinks) {
-      try { out.links = await collectNavLinks(tab.id); } catch { out.links = []; }
+      try { out.links = await collectNavLinks(tabId); } catch { out.links = []; }
     }
     return out;
   } finally {
-    try { await chrome.tabs.remove(tab.id); } catch {}
+    try { await chrome.tabs.remove(tabId); } catch {}
+  }
+}
+
+// Capture a true full-page screenshot via chrome.debugger + DevTools Protocol.
+// This is the only in-Chrome way to get below-the-fold content in a single
+// call (viewport captureVisibleTab only sees what's currently visible).
+// Trade-off: a yellow "being debugged" bar appears on the target tab while
+// debugger is attached. For background tabs that's invisible to the user.
+async function captureFullPageScreenshot(tabId) {
+  const target = { tabId };
+  await chrome.debugger.attach(target, "1.3");
+  try {
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: true,
+      fromSurface: true
+    });
+    if (!result?.data) return null;
+    return {
+      dataUrl: `data:image/png;base64,${result.data}`,
+      bytes: result.data.length
+    };
+  } finally {
+    try { await chrome.debugger.detach(target); } catch {}
   }
 }
 
@@ -327,9 +416,15 @@ function buildInventory(pages, meta) {
     "Forms": 0, "Data Tables": 0, "Video": 0, "Audio": 0,
     "Iframes": 0, "Modals": 0, "Carousels": 0, "Tabs": 0,
     "Menus": 0, "Accordions": 0, "Datepickers": 0, "Dropdowns": 0,
-    "PDF Links": 0, "Login": 0, "CAPTCHA": 0, "Shadow DOM": 0
+    "PDF Links": 0, "Login": 0, "CAPTCHA": 0, "Shadow DOM": 0,
+    "Dynamic Pages (SPA)": 0, "Static Pages": 0
   };
   const testsUnion = new Map(); // test → why
+
+  // Corpus-level audit roll-up — total violations/incomplete/passes across the
+  // inventory. Lets the scope document answer "how big is this audit?" in a
+  // single number.
+  const corpusAudit = { violations: 0, incomplete: 0, passes: 0, inapplicable: 0, pagesAudited: 0, pagesScreenshotted: 0 };
 
   for (const p of pages) {
     if (p.error) continue;
@@ -340,13 +435,41 @@ function buildInventory(pages, meta) {
         template_id: p.template_id, url_cluster: p.url_cluster,
         page_count: 0, pages: [],
         sample_url: p.url, sample_title: p.title || "",
+        sample_pageType: p.pageType || "unknown",
+        sample_spaMarkers: p.spaMarkers || [],
+        sample_components: p.components || null,
+        sample_screenshot: p.screenshot || null,
+        sample_audit: p.audit || null,
         flags: {}, recommendedTests: [], testSet: new Set(),
-        aggregatedCounts: {}
+        aggregatedCounts: {},
+        totalViolations: 0, totalIncomplete: 0, totalPasses: 0,
+        isSPA: false
       };
       groups.set(key, g);
     }
     g.page_count++;
-    g.pages.push({ url: p.url, title: p.title || "" });
+    g.pages.push({
+      url: p.url,
+      title: p.title || "",
+      pageType: p.pageType || "unknown",
+      violations: (p.audit?.violations || []).length,
+      incomplete: (p.audit?.incomplete || []).length,
+      passes: (p.audit?.passes || []).length,
+      hasScreenshot: !!p.screenshot?.dataUrl
+    });
+    // Aggregate audit roll-up per template + corpus.
+    g.totalViolations += (p.audit?.violations || []).length;
+    g.totalIncomplete += (p.audit?.incomplete || []).length;
+    g.totalPasses += (p.audit?.passes || []).length;
+    if (p.audit) {
+      corpusAudit.pagesAudited++;
+      corpusAudit.violations += (p.audit.violations || []).length;
+      corpusAudit.incomplete += (p.audit.incomplete || []).length;
+      corpusAudit.passes += (p.audit.passes || []).length;
+      corpusAudit.inapplicable += (p.audit.inapplicable || []).length;
+    }
+    if (p.screenshot?.dataUrl) corpusAudit.pagesScreenshotted++;
+    if (p.flags?.isSPA) g.isSPA = true;
     // OR flags together; prefer first sample
     for (const [k, v] of Object.entries(p.flags || {})) {
       g.flags[k] = g.flags[k] || v;
@@ -375,11 +498,14 @@ function buildInventory(pages, meta) {
     if (p.flags?.hasLogin) contentTypeSummary["Login"]++;
     if (p.flags?.hasCaptcha) contentTypeSummary["CAPTCHA"]++;
     if (p.flags?.hasShadowDom) contentTypeSummary["Shadow DOM"]++;
+    if (p.pageType === "dynamic") contentTypeSummary["Dynamic Pages (SPA)"]++;
+    else if (p.pageType === "static") contentTypeSummary["Static Pages"]++;
   }
 
   const templates = [...groups.values()]
     .map(g => {
       const signalBits = [];
+      if (g.isSPA) signalBits.push("SPA");
       if (g.flags.hasForms) signalBits.push("forms");
       if (g.flags.hasDataTable) signalBits.push("tables");
       if (g.flags.hasVideo) signalBits.push("video");
@@ -400,7 +526,17 @@ function buildInventory(pages, meta) {
         template_id: g.template_id, url_cluster: g.url_cluster,
         page_count: g.page_count, sample_url: g.sample_url,
         sample_title: g.sample_title,
+        sample_pageType: g.sample_pageType,
+        sample_spaMarkers: g.sample_spaMarkers,
+        sample_components: g.sample_components,
+        sample_screenshot: g.sample_screenshot,
+        sample_audit: g.sample_audit,
+        pages: g.pages,
+        isSPA: g.isSPA,
         flags: g.flags, recommendedTests: g.recommendedTests,
+        totalViolations: g.totalViolations,
+        totalIncomplete: g.totalIncomplete,
+        totalPasses: g.totalPasses,
         contentSignalSummary: signalBits.join(", ") || "static content"
       };
     })
@@ -429,8 +565,13 @@ function buildInventory(pages, meta) {
   const proposedSample = [...sampleSet.values()];
 
   return {
-    meta: { ...meta, generatedAt: new Date().toISOString() },
+    meta: {
+      ...meta,
+      crawlDepthLabel: Number.isFinite(meta.crawlDepth) ? String(meta.crawlDepth) : "unbounded",
+      generatedAt: new Date().toISOString()
+    },
     pages, templates, proposedSample, contentTypeSummary,
+    corpusAudit,
     recommendedTestsUnion: [...testsUnion.entries()].map(([test, why]) => ({ test, why }))
   };
 }
@@ -577,15 +718,29 @@ function computeTemplateFingerprintInline() {
     })(document);
     return out;
   }
+  const bucket = n => n === 0 ? "0" : n === 1 ? "1" : n <= 5 ? "few" : n <= 20 ? "many" : "mass";
+  const depthBucket = d => d <= 2 ? "shallow" : d <= 5 ? "mid" : d <= 9 ? "deep" : "vdeep";
+  const depthOf = (node) => {
+    let d = 0, cur = node;
+    while (cur && cur.parentNode) {
+      cur = cur.parentNode.host ? cur.parentNode.host : cur.parentNode;
+      d++;
+      if (d > 200) break;
+    }
+    return d;
+  };
   const sig = [];
   const landmarkTags = ["header","nav","main","article","aside","footer","section","form","dialog","details","summary","figure","figcaption","table","thead","tbody","tfoot","h1","h2","h3","h4","h5","h6"];
   for (const tag of landmarkTags) {
     for (const el of qsaDeep(tag)) {
-      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
+      const d = depthBucket(depthOf(el));
+      const k = bucket(el.children ? el.children.length : 0);
+      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}:d=${d}:k=${k}`);
     }
   }
   for (const el of qsaDeep("[role]")) {
-    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
+    const d = depthBucket(depthOf(el));
+    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}:d=${d}`);
   }
   const hCounts = [1,2,3,4,5,6].map(n => qsaDeep(`h${n}`).length);
   sig.push("H:" + hCounts.join("-"));
@@ -593,7 +748,7 @@ function computeTemplateFingerprintInline() {
   const seen = new Set();
   for (const p of LAYOUT) {
     for (const el of qsaDeep(`[class*="${p}" i]`)) {
-      const k = `${el.tagName.toLowerCase()}::${firstClasses(el,3)}`;
+      const k = `${el.tagName.toLowerCase()}::${firstClasses(el,3)}:k=${bucket(el.children?el.children.length:0)}`;
       if (!seen.has(k)) { seen.add(k); sig.push(k); }
     }
   }

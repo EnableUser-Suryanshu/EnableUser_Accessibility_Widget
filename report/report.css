@@ -207,3 +207,53 @@ button.primary:hover { background: #1e3a8a; }
 .failing-clauses .clause-code { font-family: ui-monospace, Menlo, Consolas, monospace; color: #1e3a8a; font-weight: 600; }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 .muted { color: #6b7280; }
+
+/* Inventory-mode additions (badge, screenshots, component tables) */
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.screenshot-wrap { margin-top: 12px; }
+.screenshot-thumb {
+  display: block;
+  max-width: 320px;
+  max-height: 400px;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  cursor: zoom-in;
+  transition: max-width 0.15s ease, max-height 0.15s ease;
+  object-fit: contain;
+}
+.screenshot-thumb.expanded {
+  max-width: 100%;
+  max-height: none;
+  cursor: zoom-out;
+}
+.components-detail { margin-top: 14px; }
+.components-detail strong { font-size: 12px; }
+.form-block { margin: 6px 0 10px; padding: 8px; background: #f9fafb; border-radius: 4px; border: 1px solid #e5e7eb; }
+.form-heading { font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+.form-fields {
+  width: 100%;
+  font-size: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 3px;
+}
+.form-fields th { background: #f1f5f9; font-size: 11px; padding: 4px 8px; text-align: left; }
+.form-fields td { padding: 4px 8px; border-top: 1px solid #eef2f6; }
+.compact-list {
+  columns: 2;
+  column-gap: 24px;
+  margin: 4px 0;
+  font-size: 12px;
+}
+.compact-list li { break-inside: avoid; margin: 2px 0; }
+.audit-detail { margin-top: 12px; }
+td.fail { color: #b91c1c; font-weight: 600; }
+.stat.ok .value { color: #166534; }

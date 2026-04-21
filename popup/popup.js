@@ -8,7 +8,7 @@ const depthInput = $("opt-depth");
 const profileSelect = $("opt-profile");
 
 const DEFAULT_MAX_URLS = 50;
-const DEFAULT_DEPTH = 1;
+const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
 const HARD_MAX_URLS = 500;
 const HARD_MAX_DEPTH = 5;
 const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "en301549", "section508", "ada"];
@@ -21,7 +21,12 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
 
 function readScanOptions() {
   const maxUrls = clamp(parseInt(maxUrlsInput.value, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
-  const crawlDepth = clamp(parseInt(depthInput.value, 10) || DEFAULT_DEPTH, 1, HARD_MAX_DEPTH);
+  // Accept 0 as "unbounded" for inventory mode. background.js converts 0 to
+  // Infinity. Multi mode clamps to at least 1 on its side.
+  const rawDepth = parseInt(depthInput.value, 10);
+  const crawlDepth = Number.isFinite(rawDepth) && rawDepth >= 0
+    ? Math.min(rawDepth, HARD_MAX_DEPTH)
+    : DEFAULT_DEPTH;
   const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : "wcag21aa";
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
@@ -111,8 +116,9 @@ btnInventory?.addEventListener("click", async () => {
   if (!granted) { setStatus("Permission denied.", true); return; }
 
   const opts = readScanOptions();
+  const depthLabel = opts.crawlDepth === 0 ? "unbounded" : String(opts.crawlDepth);
   setBusy(true);
-  setStatus(`Scoping crawl (up to ${opts.maxUrls} URLs, depth ${opts.crawlDepth}) — no axe, detecting content types only…`);
+  setStatus(`Full-audit crawl (up to ${opts.maxUrls} URLs, depth ${depthLabel}) — axe + India + GIGW + screenshots + component inventory per page. This will take a while…`);
   const res = await send({ type: "SCAN_INVENTORY", tabId: tab.id, options: opts });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scope failed.", true); return; }
