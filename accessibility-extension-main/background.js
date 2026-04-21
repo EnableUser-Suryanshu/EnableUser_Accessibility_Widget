@@ -339,7 +339,8 @@ async function scanInventory(tabId, options) {
   pump();
   while (active.size > 0) { await Promise.race(active); pump(); }
 
-  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats });
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile });
   const inventoryId = `inv-${Date.now()}`;
 
   // Store the inventory in memory with EMPTY deliverable slots. The .docx /

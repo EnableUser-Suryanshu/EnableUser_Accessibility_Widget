@@ -126,17 +126,79 @@ function buildDocumentXml(inventory) {
 
   // Methodology
   parts.push(heading("2. Methodology", 2));
-  parts.push(paragraph("The EnableUser extension runs inside a real logged-in Chrome browser (same session, same cookies, same geography as the user). Discovery covers:", { size: 22 }));
-  parts.push(paragraph("• Seed page and same-hostname body/nav links crawled to the configured depth.", { size: 22 }));
-  parts.push(paragraph("• sitemap.xml + sitemap index expansion via robots.txt.", { size: 22 }));
-  parts.push(paragraph("• hreflang alternate URLs from <link rel=\"alternate\"> tags.", { size: 22 }));
-  parts.push(paragraph("• Common governance paths probed: /accessibility, /terms, /privacy, /contact, /sitemap.", { size: 22 }));
-  parts.push(paragraph("• DOM-shape fingerprint (landmarks + roles + heading tree + layout class patterns) + URL-shape cluster. Pages with matching fingerprints are grouped as the same template.", { size: 22 }));
-  parts.push(paragraph("• Per-page content-type detection: forms, video/audio, data tables, iframes, modals, carousels, tabs, menus, accordions, datepickers, dropdowns, PDF links, login surfaces, CAPTCHA. This detection drives the per-template manual-test checklist.", { size: 22 }));
+  parts.push(paragraph("The EnableUser extension runs inside a real logged-in Chrome browser (same session, same cookies, same geography as the user). Every crawled URL is opened in a real tab, rendered to post-hydration state, scrolled to exhaust lazy-loaded content, and audited live. Discovery is evidence-based — we do not probe speculative or guessed URLs. Sources:", { size: 22 }));
+  parts.push(paragraph("• sitemap.xml + sitemap-index walk (unbounded depth), augmented by Sitemap: directives in robots.txt.", { size: 22 }));
+  parts.push(paragraph("• hreflang alternate URLs from <link rel=\"alternate\"> tags on the seed page.", { size: 22 }));
+  parts.push(paragraph("• In-browser link discovery from every rendered page: nav/header/footer links, body links, shadow-DOM traversal, mega-menu expansion (click + hover triggers), infinite-scroll exhaustion, and route paths harvested from Next.js / Nuxt / Apollo / Redux JSON hydration dumps.", { size: 22 }));
+  parts.push(paragraph("• DOM-shape fingerprint (landmarks + roles + heading tree + layout class patterns) — pages with matching fingerprints are grouped as the same template.", { size: 22 }));
+  parts.push(paragraph("• Per-page content-type detection: forms, video/audio, data tables, iframes, modals, carousels, tabs, menus, accordions, datepickers, dropdowns, PDF links, login surfaces, CAPTCHA. This detection drives the per-template manual-test checklist in the component inventory.", { size: 22 }));
+  parts.push(paragraph("• Post-crawl shell / soft-404 detection: any URL whose DOM fingerprint and visible text both match the seed page's is classified as a shell page and excluded from the pages and templates tables (surfaced separately as \"Shell / Soft-404 Pages\"). This prevents SPA route fallbacks from inflating inventory counts.", { size: 22 }));
+  parts.push(emptyParagraph());
+
+  // Conformance Scope & Limitations — the honest scope-boundary section.
+  // This is the defensible-vs-marketing framing: what the tool catches
+  // automatically, what it can't catch, and exactly how the manual audit
+  // on top of this inventory closes the gap.
+  const selectedProfile = meta.profile || "wcag21aa";
+  const profileLabels = {
+    wcag21aa:   "WCAG 2.1 AA",
+    is17802:    "IS 17802 (India)",
+    gigw3:      "GIGW 3.0 (NIC)",
+    en301549:   "EN 301 549 v3.2.1 (EU)",
+    section508: "Section 508 (US)",
+    ada:        "ADA Title III (US)"
+  };
+  const profileLabel = profileLabels[selectedProfile] || "WCAG 2.1 AA";
+  parts.push(heading("3. Conformance Scope & Limitations", 2));
+  parts.push(paragraph(`Selected compliance profile for this engagement: ${profileLabel}.`, { bold: true, size: 22 }));
+  parts.push(emptyParagraph());
+
+  parts.push(paragraph("What the automated pass covers:", { bold: true, size: 22 }));
+  parts.push(paragraph("• axe-core 4.11.3 rules mapped to WCAG 2.1 Level A and AA success criteria, executed against the post-hydration DOM of every crawled page (seed + sitemap + hreflang + in-browser-discovered links).", { size: 22 }));
+  parts.push(paragraph("• Four India-specific custom rules (Devanagari / Bengali / Tamil / etc. script-to-lang mismatch on WCAG 3.1.1; passage-level lang switch detection on 3.1.2; RTL direction for Arabic/Urdu content on 1.3.4; font script-coverage for regional fonts on 1.4.1).", { size: 22 }));
+  parts.push(paragraph("• GIGW 3.0 governance clauses via the shared CRITERION_MAP — every WCAG finding carries its GIGW clause, IS 17802 clause, EN 301 549 section, and Section 508 reference.", { size: 22 }));
+  parts.push(paragraph("• Content-type detection per page — forms, video/audio, tables, modals, carousels, tabs, menus, accordions, datepickers, dropdowns, PDF links, login surfaces, CAPTCHA, shadow DOM — with the actual component values (field labels, input types, modal titles, tab labels, menu items, table captions, carousel slide counts) recorded as evidence for manual test case drafting.", { size: 22 }));
+  parts.push(emptyParagraph());
+
+  if (selectedProfile === "is17802") {
+    parts.push(paragraph("IS 17802 Part 1 chapter coverage (India):", { bold: true, size: 22 }));
+    parts.push(paragraph("• Chapter 9 (Web content): covered by the automated pass above, which mirrors EN 301 549 v3.2.1 / WCAG 2.1 A+AA.", { size: 22 }));
+    parts.push(paragraph("• Chapters 5 (closed-functionality / biometrics / two-way voice), 6 (two-way voice communication), 7 (video caption accuracy — we detect <track> presence, not content accuracy), 8 (hardware), 10 (non-web documents — PDF links counted but PDFs are not audited by this pass), 11 (non-web software), 12 (documentation / support), 13 (relay / emergency services) are NOT auditable by any web crawler. If in scope they must be assessed through manual hardware / document / process review.", { size: 22 }));
+    parts.push(emptyParagraph());
+  } else if (selectedProfile === "en301549") {
+    parts.push(paragraph("EN 301 549 v3.2.1 (EU) chapter coverage:", { bold: true, size: 22 }));
+    parts.push(paragraph("• Chapter 9 / 10 (Web content + non-web documents): Chapter 9 covered automatically; non-web documents (PDFs, downloadable DOCX / XLSX) require separate tagged-document review and are out of scope for this pass unless explicitly added.", { size: 22 }));
+    parts.push(paragraph("• Chapters 5–8, 11–13 (hardware, two-way voice, non-web software, documentation, relay services) are out of scope for automated web testing.", { size: 22 }));
+    parts.push(emptyParagraph());
+  } else if (selectedProfile === "gigw3") {
+    parts.push(paragraph("GIGW 3.0 scope note:", { bold: true, size: 22 }));
+    parts.push(paragraph("GIGW 3.0 inherits WCAG 2.1 A+AA as its accessibility baseline (covered automatically) plus governance clauses around multilingual content, citizen services, and grievance redressal. Governance clauses that depend on process / policy evidence (grievance redressal SLAs, privacy policy content, cyber-security certifications) are surfaced where content-detectable but ultimately require client-supplied evidence.", { size: 22 }));
+    parts.push(emptyParagraph());
+  } else if (selectedProfile === "section508") {
+    parts.push(paragraph("Section 508 (US) scope note:", { bold: true, size: 22 }));
+    parts.push(paragraph("Section 508 adopts WCAG 2.0 A+AA as its baseline (the 2018 Refresh). The automated pass covers the WCAG 2.0 rule-set mapped through axe-core; WCAG 2.1-only criteria (orientation, reflow, content on hover/focus, etc.) are not in the Section 508 profile and are excluded from conformance scoring.", { size: 22 }));
+    parts.push(emptyParagraph());
+  } else if (selectedProfile === "ada") {
+    parts.push(paragraph("ADA Title III (US) scope note:", { bold: true, size: 22 }));
+    parts.push(paragraph("The ADA does not name a technical standard. WCAG 2.1 AA is the de-facto bar applied in DoJ settlements and consent decrees and is what the automated pass covers. Legal defensibility also requires a documented remediation process and accessibility statement — out of the tool's scope, client-supplied.", { size: 22 }));
+    parts.push(emptyParagraph());
+  }
+
+  parts.push(paragraph("What the automated pass does NOT catch:", { bold: true, size: 22 }));
+  parts.push(paragraph("Automated rule-based tools — regardless of vendor — catch approximately 30–40% of WCAG / Chapter 9 issues on the pages they reach. The remaining 60–70% require human judgment: cognitive load, reading order for screen readers, meaningful sequence when visual order ≠ DOM order, sufficient contrast where automated detection fails (e.g. text on gradients / images), caption / transcript accuracy, error-recovery flow in forms, focus management across route transitions, and any criterion that depends on operator intent (labels in name, on-focus change, on-input change).", { size: 22 }));
+  parts.push(emptyParagraph());
+
+  parts.push(paragraph("Two classes of pages automated crawling cannot reach:", { bold: true, size: 22 }));
+  parts.push(paragraph("1) Authenticated pages. Addressed by running the crawl inside the user's real Chrome session after manual login — session cookies carry forward automatically, and depth-bounded link discovery from the authenticated seed reaches dashboards, account settings, and in-product surfaces. Pages requiring multi-step workflows post-login (e.g. dashboards rendered only after a specific action) are added as explicit manual walkthroughs.", { size: 22 }));
+  parts.push(paragraph("2) Dynamic pages reachable only via search, filter, or form submission. No crawler can auto-generate the queries, filter combinations, or form POSTs that materialise these views. Addressed by curating a representative set of queries / filter combinations / form submissions per affected template (drawn from the component inventory in Section 4a) and auditing each via the \"scan current tab\" mode after the operator navigates to the materialised state.", { size: 22 }));
+  parts.push(emptyParagraph());
+
+  parts.push(paragraph("How the component inventory bounds the manual audit:", { bold: true, size: 22 }));
+  parts.push(paragraph("Section 4a (Component Inventory) enumerates every form, modal, data table, tab set, carousel, and menu on the representative page of each template — including actual field names, input types, dialog titles, table captions, and menu labels. This converts the manual audit from an open-ended \"test the site\" into a bounded \"test these specific components at these specific URLs,\" which is what makes the audit both estimable (N test cases × M URLs) and defensible (evidence that every interactive component in scope was exercised).", { size: 22 }));
   parts.push(emptyParagraph());
 
   // Template breakdown
-  parts.push(heading("3. Template Breakdown", 2));
+  parts.push(heading("4. Template Breakdown", 2));
   parts.push(paragraph(`${templates.length} template${templates.length === 1 ? "" : "s"} detected across the crawl. "Type" is static vs dynamic based on framework markers (React, Nuxt, Angular, Vue, Next.js, Turbo, Svelte/Qwik) plus a low-text / high-script heuristic for unlabelled client-rendered shells.`, { size: 22 }));
   parts.push(emptyParagraph());
   {
@@ -159,7 +221,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Component inventory — actual values, per template sample.
-  parts.push(heading("3a. Component Inventory (Per Template Sample)", 3));
+  parts.push(heading("4a. Component Inventory (Per Template Sample)", 3));
   parts.push(paragraph("Actual component values captured from each template's representative page. Auditors use this to write per-component test scripts.", { size: 22 }));
   parts.push(emptyParagraph());
   for (const t of templates) {
@@ -223,7 +285,7 @@ function buildDocumentXml(inventory) {
   }
 
   // Content-type detection summary
-  parts.push(heading("4. Content-Type Detection Summary", 2));
+  parts.push(heading("5. Content-Type Detection Summary", 2));
   parts.push(paragraph("Presence of each content type across the crawled corpus:", { size: 22 }));
   parts.push(emptyParagraph());
   {
@@ -236,7 +298,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Proposed sample
-  parts.push(heading("5. Proposed Audit Sample", 2));
+  parts.push(heading("6. Proposed Audit Sample", 2));
   parts.push(paragraph(`${proposedSample.length} URL${proposedSample.length === 1 ? "" : "s"} recommended for the full audit pass. One representative per template + critical-path pages.`, { size: 22 }));
   parts.push(emptyParagraph());
   {
@@ -249,7 +311,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Automated audit findings — top rules by violation count across the corpus.
-  parts.push(heading("6. Automated Audit Findings", 2));
+  parts.push(heading("7. Automated Audit Findings", 2));
   {
     const ruleAgg = new Map();
     for (const p of pages) {
@@ -282,7 +344,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Manual-test union
-  parts.push(heading("7. Manual Test Matrix", 2));
+  parts.push(heading("8. Manual Test Matrix", 2));
   parts.push(paragraph("Manual-only checks derived from the content-type detection. Each check is required for one or more templates in the proposed sample. A full audit report will document pass/fail per test per URL.", { size: 22 }));
   parts.push(emptyParagraph());
   {
@@ -295,7 +357,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Assumptions & exclusions
-  parts.push(heading("8. Assumptions and Exclusions", 2));
+  parts.push(heading("9. Assumptions and Exclusions", 2));
   parts.push(paragraph("Assumptions:", { bold: true, size: 22 }));
   parts.push(paragraph("• Scope is limited to public-web pages reachable from the seed URL on the same hostname.", { size: 22 }));
   parts.push(paragraph("• Client provides credentials for any authenticated areas in scope.", { size: 22 }));
@@ -310,7 +372,7 @@ function buildDocumentXml(inventory) {
   parts.push(emptyParagraph());
 
   // Acceptance criteria
-  parts.push(heading("9. Acceptance Criteria", 2));
+  parts.push(heading("10. Acceptance Criteria", 2));
   parts.push(paragraph("The audit is considered complete when:", { size: 22 }));
   parts.push(paragraph("• Each template representative URL has a recorded automated (axe) scan + manual test pass.", { size: 22 }));
   parts.push(paragraph("• All critical / serious issues have a reproduction selector, WCAG reference, and proposed remediation.", { size: 22 }));
