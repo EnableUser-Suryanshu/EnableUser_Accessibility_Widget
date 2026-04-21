@@ -19,8 +19,11 @@ import { buildInventoryXlsx } from "./lib/xlsx-writer.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
-const HARD_MAX_URLS = 500;
-const HARD_MAX_DEPTH = 5;
+// Intentionally NO HARD_MAX_URLS ceiling. The user's explicit direction: a
+// professional audit tool doesn't impose arbitrary limits on the operator.
+// We floor at 1 to prevent a zero-URL crawl, and let the operator set any
+// upper number they're willing to wait for. Concurrency + rate-limiter keep
+// the target site safe regardless of total URL count.
 const CONCURRENT_TABS = 5;
 const TAB_TIMEOUT_MS = 60_000;
 const SETTLE_MS = 2_500;
@@ -28,7 +31,20 @@ const SETTLE_MS = 2_500;
 const pending = new Map();
 const reports = new Map();
 const inventories = new Map(); // inventoryId → { inventory, files: { docx: Blob, xlsx: Blob } }
+// Full-page screenshots live here, keyed by a per-screenshot id. Kept OUT of
+// the inventory payload because a single inventory with 500 pages × ~500KB
+// PNGs would blow past chrome.runtime.sendMessage's practical payload ceiling
+// (~32-64MB). The inventory stores only {id, bytes} references; the viewer
+// fetches each image on demand via the GET_SCREENSHOT message.
+const inventoryScreenshots = new Map(); // screenshotId → { dataUrl, bytes }
 const rateLimiter = new RateLimiter();
+
+// Enforce a non-zero floor on numeric options without imposing a ceiling.
+function floorInt(raw, fallback, floor = 1) {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(floor, n);
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
@@ -39,7 +55,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
       else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: reports.get(msg.reportId) || null });
-      else if (msg.type === "GET_INVENTORY") sendResponse({ ok: true, inventory: inventories.get(msg.inventoryId)?.inventory || null });
+      else if (msg.type === "GET_INVENTORY") sendResponse(await getInventory(msg.inventoryId));
+      else if (msg.type === "GET_SCREENSHOT") sendResponse(await getScreenshot(msg.id));
       else if (msg.type === "DOWNLOAD_CSV") sendResponse(await downloadCsv(msg.reportId));
       else if (msg.type === "DOWNLOAD_SCOPE_DOCX") sendResponse(await downloadInventoryFile(msg.inventoryId, "docx"));
       else if (msg.type === "DOWNLOAD_INVENTORY_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "xlsx"));
@@ -51,6 +68,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   })();
   return true;
 });
+
+// GET_INVENTORY / GET_SCREENSHOT both hit the in-memory Map first, then fall
+// back to chrome.storage.local. This is what survives MV3 service-worker
+// eviction: the worker may have been restarted since the crawl completed, in
+// which case our Maps are empty but storage.local still has the data.
+async function getInventory(inventoryId) {
+  let inventory = inventories.get(inventoryId)?.inventory || null;
+  if (!inventory) {
+    try {
+      const key = `inv:${inventoryId}`;
+      const stored = await chrome.storage.local.get(key);
+      inventory = stored[key] || null;
+    } catch (err) {
+      console.warn("[EU] getInventory storage fallback failed", err);
+    }
+  }
+  return { ok: true, inventory };
+}
+
+async function getScreenshot(id) {
+  if (!id) return { ok: false, dataUrl: null };
+  let entry = inventoryScreenshots.get(id) || null;
+  if (!entry) {
+    try {
+      const key = `shot:${id}`;
+      const stored = await chrome.storage.local.get(key);
+      entry = stored[key] || null;
+    } catch (err) {
+      console.warn("[EU] getScreenshot storage fallback failed", err);
+    }
+  }
+  return { ok: !!entry, dataUrl: entry?.dataUrl || null };
+}
 
 chrome.tabs.onRemoved.addListener(tabId => {
   const entry = pending.get(tabId);
@@ -73,8 +123,10 @@ async function scanCurrent(tabId, options) {
 }
 
 async function scanMulti(tabId, options) {
-  const maxUrls = clamp(parseInt(options?.maxUrls, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
-  const crawlDepth = clamp(parseInt(options?.crawlDepth, 10) || DEFAULT_CRAWL_DEPTH, 1, HARD_MAX_DEPTH);
+  // No arbitrary upper cap on maxUrls or crawlDepth — the operator decides how
+  // big the crawl is. Floor-only: at least 1 URL, at least depth 1.
+  const maxUrls = floorInt(options?.maxUrls, DEFAULT_MAX_URLS, 1);
+  const crawlDepth = floorInt(options?.crawlDepth, DEFAULT_CRAWL_DEPTH, 1);
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
 
   const tab = await chrome.tabs.get(tabId);
@@ -173,15 +225,16 @@ async function scanMulti(tabId, options) {
 // each page runs only content-signals.js (no axe-core, much faster).
 // ─────────────────────────────────────────────────────────────────────────
 async function scanInventory(tabId, options) {
-  const maxUrls = clamp(parseInt(options?.maxUrls, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
+  // Inventory mode: no ceilings on maxUrls or depth. The operator decides.
+  const maxUrls = floorInt(options?.maxUrls, DEFAULT_MAX_URLS, 1);
   // Inventory mode has NO depth cap. The only real crawl bound is maxUrls —
   // the priority queue biases shallow pages first, so unbounded depth just
   // means "keep expanding until maxUrls is reached or the frontier is empty".
-  // A user-supplied crawlDepth is still honoured if provided (> 0), for
-  // operators who want to short-circuit a deep site deliberately.
+  // A user-supplied crawlDepth > 0 is still honoured exactly (no upper clamp),
+  // for operators who want to short-circuit a deep site deliberately.
   const rawDepth = parseInt(options?.crawlDepth, 10);
   const crawlDepth = (Number.isFinite(rawDepth) && rawDepth > 0)
-    ? Math.min(rawDepth, HARD_MAX_DEPTH)
+    ? rawDepth
     : Number.POSITIVE_INFINITY;
 
   const tab = await chrome.tabs.get(tabId);
@@ -296,8 +349,35 @@ async function scanInventory(tabId, options) {
   const inventoryId = `inv-${Date.now()}`;
   inventories.set(inventoryId, { inventory, files: { docx: docxBlob, xlsx: xlsxBlob } });
 
+  // Persist inventory + screenshots to chrome.storage.local so the viewer can
+  // recover after MV3 service-worker eviction. Deliverable blobs are NOT
+  // persisted (they can always be regenerated from the inventory). The
+  // "unlimitedStorage" permission lifts the 10MB default cap so large crawls
+  // (hundreds of full-page PNGs) don't hit the quota ceiling.
+  persistInventory(inventoryId, inventory).catch(err =>
+    console.warn("[EU] persistInventory failed", err));
+
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
   return { ok: true, inventoryId };
+}
+
+// Fire-and-forget persistence. One chrome.storage.local.set call containing
+// the inventory payload + every screenshot it references.
+async function persistInventory(inventoryId, inventory) {
+  const record = { [`inv:${inventoryId}`]: inventory };
+  const seen = new Set();
+  const collect = (shot) => {
+    if (!shot?.id || seen.has(shot.id)) return;
+    const entry = inventoryScreenshots.get(shot.id);
+    if (entry) {
+      record[`shot:${shot.id}`] = entry;
+      seen.add(shot.id);
+    }
+  };
+  for (const p of inventory.pages || []) collect(p.screenshot);
+  for (const t of inventory.templates || []) collect(t.sample_screenshot);
+  await chrome.storage.local.set(record);
+  console.log(`[EU] persisted inventory ${inventoryId} + ${seen.size} screenshot(s) to storage.local`);
 }
 
 // Inventory mode per-page worker. Runs the FULL audit stack (axe + india +
@@ -364,6 +444,13 @@ async function inventoryInNewTab(url, collectNextLinks) {
 // call (viewport captureVisibleTab only sees what's currently visible).
 // Trade-off: a yellow "being debugged" bar appears on the target tab while
 // debugger is attached. For background tabs that's invisible to the user.
+//
+// The large PNG data URL is NOT returned on the page record. Instead we
+// stash it in `inventoryScreenshots` keyed by a short id and return just the
+// reference. This keeps the inventory payload small enough to pass through
+// chrome.runtime.sendMessage (practical ceiling ~32-64MB) even on crawls of
+// hundreds of full-page screenshots. The renderer fetches each image on
+// demand via the GET_SCREENSHOT message.
 async function captureFullPageScreenshot(tabId) {
   const target = { tabId };
   await chrome.debugger.attach(target, "1.3");
@@ -375,10 +462,11 @@ async function captureFullPageScreenshot(tabId) {
       fromSurface: true
     });
     if (!result?.data) return null;
-    return {
-      dataUrl: `data:image/png;base64,${result.data}`,
-      bytes: result.data.length
-    };
+    const id = `shot-${crypto.randomUUID()}`;
+    const dataUrl = `data:image/png;base64,${result.data}`;
+    const bytes = result.data.length;
+    inventoryScreenshots.set(id, { dataUrl, bytes });
+    return { id, bytes };
   } finally {
     try { await chrome.debugger.detach(target); } catch {}
   }
@@ -455,7 +543,7 @@ function buildInventory(pages, meta) {
       violations: (p.audit?.violations || []).length,
       incomplete: (p.audit?.incomplete || []).length,
       passes: (p.audit?.passes || []).length,
-      hasScreenshot: !!p.screenshot?.dataUrl
+      hasScreenshot: !!p.screenshot?.id
     });
     // Aggregate audit roll-up per template + corpus.
     g.totalViolations += (p.audit?.violations || []).length;
@@ -468,7 +556,7 @@ function buildInventory(pages, meta) {
       corpusAudit.passes += (p.audit.passes || []).length;
       corpusAudit.inapplicable += (p.audit.inapplicable || []).length;
     }
-    if (p.screenshot?.dataUrl) corpusAudit.pagesScreenshotted++;
+    if (p.screenshot?.id) corpusAudit.pagesScreenshotted++;
     if (p.flags?.isSPA) g.isSPA = true;
     // OR flags together; prefer first sample
     for (const [k, v] of Object.entries(p.flags || {})) {
@@ -577,13 +665,32 @@ function buildInventory(pages, meta) {
 }
 
 async function downloadInventoryFile(inventoryId, kind) {
-  const entry = inventories.get(inventoryId);
-  if (!entry) return { ok: false, error: "Inventory expired" };
-  const blob = entry.files[kind];
-  if (!blob) return { ok: false, error: `No ${kind} file` };
+  let entry = inventories.get(inventoryId);
+  let inventory = entry?.inventory || null;
+  let blob = entry?.files?.[kind] || null;
+
+  // Memory miss → the service worker may have been evicted since the crawl
+  // completed. Reload the inventory from storage.local and regenerate the
+  // deliverable blob on the fly.
+  if (!blob) {
+    if (!inventory) {
+      try {
+        const key = `inv:${inventoryId}`;
+        const stored = await chrome.storage.local.get(key);
+        inventory = stored[key] || null;
+      } catch (err) {
+        console.warn("[EU] downloadInventoryFile storage fallback failed", err);
+      }
+    }
+    if (!inventory) return { ok: false, error: "Inventory expired" };
+    blob = kind === "docx"
+      ? await buildScopeDocx(inventory)
+      : await buildInventoryXlsx(inventory);
+  }
+
   const dataUrl = await blobToDataUrl(blob);
-  const host = entry.inventory.meta.seedHost;
-  const stamp = entry.inventory.meta.generatedAt.replace(/[:.]/g, "-");
+  const host = inventory.meta.seedHost;
+  const stamp = inventory.meta.generatedAt.replace(/[:.]/g, "-");
   const filename = kind === "docx"
     ? `enableuser-scope-${host}-${stamp}.docx`
     : `enableuser-inventory-${host}-${stamp}.xlsx`;
@@ -1258,7 +1365,6 @@ function safeHost(u) {
   try { return new URL(u).hostname.replace(/[^a-z0-9.-]/gi, "_"); } catch { return "site"; }
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 function safeOrigin(u) { try { return new URL(u).origin; } catch { return null; } }
 
 function waitForTabComplete(tabId, timeoutMs) {

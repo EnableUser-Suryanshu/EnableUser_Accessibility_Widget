@@ -17,6 +17,7 @@
     "activeTab",
     "downloads",
     "storage",
+    "unlimitedStorage",
     "debugger"
   ],
   "optional_host_permissions": [

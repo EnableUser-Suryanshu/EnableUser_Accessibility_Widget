@@ -279,13 +279,66 @@ function renderAuditDetail(audit) {
   return wrap;
 }
 
+// 1×1 transparent PNG — placeholder while the real screenshot loads. Prevents
+// layout jump and gives the browser something to render in the <img> tag.
+const BLANK_IMG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+// Shared IntersectionObserver: when a screenshot thumbnail scrolls into view
+// (or within 400px of it), fetch the full PNG data URL from the background
+// service worker and swap it in. Previously the whole inventory payload
+// shipped every dataUrl up-front, which blew past sendMessage's payload
+// ceiling on large crawls. Now we ship only {id, bytes} references and pull
+// each image on demand.
+const screenshotObserver = ("IntersectionObserver" in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const img = entry.target;
+        obs.unobserve(img);
+        loadScreenshot(img);
+      }
+    }, { rootMargin: "400px 0px" })
+  : null;
+
+function loadScreenshot(img) {
+  const id = img.getAttribute("data-shot-id");
+  if (!id || img.getAttribute("data-loaded") === "1") return;
+  img.setAttribute("data-loaded", "loading");
+  send({ type: "GET_SCREENSHOT", id }).then(res => {
+    if (res?.ok && res.dataUrl) {
+      img.src = res.dataUrl;
+      img.setAttribute("data-loaded", "1");
+    } else {
+      img.setAttribute("data-loaded", "error");
+      img.alt = "screenshot unavailable (expired)";
+      img.classList.add("screenshot-missing");
+    }
+  }).catch(err => {
+    console.warn("[EU] screenshot fetch failed", err);
+    img.setAttribute("data-loaded", "error");
+  });
+}
+
 function renderScreenshot(shot, caption) {
-  if (!shot?.dataUrl) return null;
+  if (!shot?.id) return null;
   const wrap = el("div", { class: "screenshot-wrap" });
   wrap.appendChild(el("div", { class: "check-group-label" }, [caption || "Full-page screenshot"]));
-  const img = el("img", { class: "screenshot-thumb", src: shot.dataUrl, alt: "full-page screenshot" });
-  img.addEventListener("click", () => img.classList.toggle("expanded"));
+  const img = el("img", {
+    class: "screenshot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": shot.id,
+    alt: "full-page screenshot (loading)"
+  });
+  img.addEventListener("click", () => {
+    img.classList.toggle("expanded");
+    // If the user clicks the placeholder before the observer fires (e.g. IO
+    // not supported), force-load on interaction too.
+    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
+  });
   wrap.appendChild(img);
+  if (screenshotObserver) screenshotObserver.observe(img);
+  else loadScreenshot(img); // Fallback: no IntersectionObserver → load eagerly.
   return wrap;
 }
 
@@ -430,7 +483,7 @@ function renderPages(inventory) {
       el("td", {}, [String(c.carousels ?? 0)]),
       el("td", {}, [String(c.pdfLinks ?? 0)]),
       boolCell(f.hasLogin),
-      boolCell(!!p.screenshot?.dataUrl)
+      boolCell(!!p.screenshot?.id)
     ]);
 
     const detailChildren = [

@@ -9,8 +9,9 @@ const profileSelect = $("opt-profile");
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
-const HARD_MAX_URLS = 500;
-const HARD_MAX_DEPTH = 5;
+// No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
+// operator decides the size of the crawl. background.js enforces only a
+// minimum floor (1) so no one accidentally launches a zero-URL scan.
 const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "en301549", "section508", "ada"];
 
 chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
@@ -20,21 +21,19 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
 }).catch(() => {});
 
 function readScanOptions() {
-  const maxUrls = clamp(parseInt(maxUrlsInput.value, 10) || DEFAULT_MAX_URLS, 1, HARD_MAX_URLS);
+  // Floor-only on maxUrls. No ceiling.
+  const parsedMax = parseInt(maxUrlsInput.value, 10);
+  const maxUrls = Number.isFinite(parsedMax) && parsedMax >= 1 ? parsedMax : DEFAULT_MAX_URLS;
   // Accept 0 as "unbounded" for inventory mode. background.js converts 0 to
-  // Infinity. Multi mode clamps to at least 1 on its side.
+  // Infinity. No upper clamp — the operator picks any depth they want.
   const rawDepth = parseInt(depthInput.value, 10);
-  const crawlDepth = Number.isFinite(rawDepth) && rawDepth >= 0
-    ? Math.min(rawDepth, HARD_MAX_DEPTH)
-    : DEFAULT_DEPTH;
+  const crawlDepth = Number.isFinite(rawDepth) && rawDepth >= 0 ? rawDepth : DEFAULT_DEPTH;
   const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : "wcag21aa";
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
   chrome.storage?.local.set({ maxUrls, crawlDepth, profile }).catch(() => {});
   return { maxUrls, crawlDepth, profile };
 }
-
-function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
 function setStatus(msg, isError = false) {
   if (!msg) { statusEl.hidden = true; statusEl.textContent = ""; return; }
