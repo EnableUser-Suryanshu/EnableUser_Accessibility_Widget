@@ -290,10 +290,30 @@ export async function navSurfacedCollect() {
   }
 
   const byUrl = new Map();
+  // Scheme-less external-domain detector. Catches hrefs like
+  //   "linkedin.com/in/foo"  or  "twitter.com/user"
+  // that are NOT schemed and NOT leading-slash rooted. If we fed those to
+  // `new URL(raw, loc.href)` the browser treats them as relative and
+  // produces garbage like `https://yournest.in/team/linkedin.com/in/foo`.
+  // Strategy: if the raw href has no scheme, no leading slash, and starts
+  // with a dotted hostname-looking segment, either reject it (external)
+  // or re-parse it as `https://` + raw and then same-hostname-filter.
+  const BARE_DOMAIN_RX = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:[/?#].*)?$/i;
   function tryAdd(raw, el) {
     if (!raw || typeof raw !== "string") return;
     raw = raw.trim();
     if (!raw || raw.startsWith("#") || raw.startsWith("javascript:") || raw.startsWith("mailto:") || raw.startsWith("tel:")) return;
+    // Reject scheme-less bare-domain hrefs before new URL() mis-resolves them
+    // as a relative path under the current page. If it parses as an absolute
+    // URL against just `https://`, and the resulting hostname is different
+    // from loc.hostname, treat as external and drop.
+    if (!/^https?:\/\//i.test(raw) && !raw.startsWith("/") && BARE_DOMAIN_RX.test(raw)) {
+      try {
+        const probe = new URL("https://" + raw);
+        if (probe.hostname !== loc.hostname) return;
+        raw = probe.toString(); // same-hostname: keep the schemed form
+      } catch { return; }
+    }
     try {
       const u = new URL(raw, loc.href);
       if (u.protocol !== "http:" && u.protocol !== "https:") return;

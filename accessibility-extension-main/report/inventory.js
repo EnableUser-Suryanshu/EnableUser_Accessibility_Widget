@@ -63,6 +63,15 @@ function renderStats(inventory) {
   host.appendChild(stat("Manual Tests", testsTotal));
   host.appendChild(stat("Max URLs", inventory.meta?.maxUrls ?? "—"));
   host.appendChild(stat("Crawl Depth", inventory.meta?.crawlDepthLabel ?? inventory.meta?.crawlDepth ?? "—"));
+
+  // Dedup transparency. Shows when multiple queue entries (e.g. /foo?from=x
+  // and /foo?from=y) resolved to the same final URL and got merged into a
+  // single inventory row. Zero on clean crawls; non-zero surfaces the fact
+  // that some queued URLs were client-side-redirected onto an existing row.
+  const d = inventory.dedupSummary;
+  if (d && d.duplicates_collapsed > 0) {
+    host.appendChild(stat("Duplicates Collapsed", d.duplicates_collapsed));
+  }
 }
 
 function renderAuditStats(inventory) {
@@ -498,6 +507,21 @@ function renderPages(inventory) {
       el("div", {}, [el("strong", {}, ["Page type: "]), typeLabel,
         (p.spaMarkers || []).length ? ` — ${p.spaMarkers.join(", ")}` : ""
       ]),
+    ];
+    if (p.finalUrl && p.finalUrl !== p.url) {
+      detailChildren.push(el("div", {}, [
+        el("strong", {}, ["Settled URL: "]), p.finalUrl,
+        " ", el("span", { class: "muted" }, ["(client-side redirect from queued URL)"])
+      ]));
+    }
+    if (p.visit_count && p.visit_count > 1) {
+      const alt = (p.alt_discoveries || []).map(a => `${a.source || "?"}@d${a.depth ?? "?"}`).join(", ");
+      detailChildren.push(el("div", {}, [
+        el("strong", {}, [`Crawled ${p.visit_count}× — `]),
+        `also reached via: ${alt || "unknown"}`
+      ]));
+    }
+    detailChildren.push(
       el("div", {}, [
         el("strong", {}, ["Flags: "]),
         Object.entries(f).filter(([, v]) => v === true).map(([k]) => k).join(", ") || "(none)"
@@ -508,7 +532,7 @@ function renderPages(inventory) {
           .map(([k, v]) => `${k}=${v}`).join(", ") || "(none)"
       ]),
       renderRecommendedTestsDetail(p.recommendedTests)
-    ];
+    );
     const comp = renderComponentsDetail(p.components);
     if (comp) detailChildren.push(comp);
     const auditDetail = renderAuditDetail(p.audit);
