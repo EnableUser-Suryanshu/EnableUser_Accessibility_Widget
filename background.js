@@ -339,25 +339,44 @@ async function scanInventory(tabId, options) {
   while (active.size > 0) { await Promise.race(active); pump(); }
 
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats });
-
-  // Generate both deliverables as blobs.
-  const [docxBlob, xlsxBlob] = await Promise.all([
-    buildScopeDocx(inventory),
-    buildInventoryXlsx(inventory)
-  ]);
-
   const inventoryId = `inv-${Date.now()}`;
-  inventories.set(inventoryId, { inventory, files: { docx: docxBlob, xlsx: xlsxBlob } });
 
-  // Persist inventory + screenshots to chrome.storage.local so the viewer can
-  // recover after MV3 service-worker eviction. Deliverable blobs are NOT
-  // persisted (they can always be regenerated from the inventory). The
-  // "unlimitedStorage" permission lifts the 10MB default cap so large crawls
-  // (hundreds of full-page PNGs) don't hit the quota ceiling.
-  persistInventory(inventoryId, inventory).catch(err =>
-    console.warn("[EU] persistInventory failed", err));
+  // Store the inventory in memory with EMPTY deliverable slots. The .docx /
+  // .xlsx blobs are generated lazily on first download click (see
+  // downloadInventoryFile, which already has the regenerate-from-inventory
+  // fallback path from the Risk-2 fix). This is deliberate:
+  //
+  //   • On large crawls (hundreds of pages), OOXML generation can take
+  //     10-30s. Blocking the viewer tab behind that is user-hostile — the
+  //     HTML report is ready to paint the instant crawling finishes.
+  //   • If blob generation throws (OOM, deep recursion, whatever), we still
+  //     have a working viewer. Previously an exception here killed the whole
+  //     handler and the report never opened.
+  //   • MV3 service-worker eviction during the 10-30s blob-generation window
+  //     was another silent failure mode — the SW could die after the crawl
+  //     completed but before chrome.tabs.create ran. Opening the tab first
+  //     closes that race.
+  inventories.set(inventoryId, { inventory, files: {} });
 
-  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
+  // Persist inventory + screenshots to chrome.storage.local BEFORE opening
+  // the viewer tab. Awaited (not fire-and-forget) so that if the service
+  // worker is evicted the instant after tab.create, the viewer can still
+  // recover the data via the storage fallback in getInventory /
+  // getScreenshot. The "unlimitedStorage" permission lifts the 10MB default
+  // cap so large crawls don't hit the quota ceiling.
+  try {
+    await persistInventory(inventoryId, inventory);
+  } catch (err) {
+    console.warn("[EU] persistInventory failed — continuing without persistence", err);
+  }
+
+  // Open the viewer immediately. Even if chrome.tabs.create somehow fails,
+  // we still return the inventoryId so a caller (or the popup) could retry.
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
+  } catch (err) {
+    console.warn("[EU] failed to open inventory tab", err);
+  }
   return { ok: true, inventoryId };
 }
 
@@ -669,9 +688,12 @@ async function downloadInventoryFile(inventoryId, kind) {
   let inventory = entry?.inventory || null;
   let blob = entry?.files?.[kind] || null;
 
-  // Memory miss → the service worker may have been evicted since the crawl
-  // completed. Reload the inventory from storage.local and regenerate the
-  // deliverable blob on the fly.
+  // Memory miss → two scenarios:
+  //   1. First-ever click since the crawl finished — inventory is in memory
+  //      but blobs were never generated (we defer them to the download click
+  //      so the viewer tab opens instantly after crawling).
+  //   2. Service-worker eviction since the crawl — rebuild inventory from
+  //      chrome.storage.local and regenerate the blob.
   if (!blob) {
     if (!inventory) {
       try {
@@ -686,6 +708,15 @@ async function downloadInventoryFile(inventoryId, kind) {
     blob = kind === "docx"
       ? await buildScopeDocx(inventory)
       : await buildInventoryXlsx(inventory);
+    // Cache the generated blob on the in-memory entry so a second click
+    // doesn't rebuild it. If the entry is missing (storage-recovery path),
+    // re-seat it so subsequent clicks on the other deliverable still hit
+    // the fast path.
+    if (!entry) {
+      entry = { inventory, files: {} };
+      inventories.set(inventoryId, entry);
+    }
+    entry.files[kind] = blob;
   }
 
   const dataUrl = await blobToDataUrl(blob);
