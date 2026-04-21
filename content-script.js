@@ -134,6 +134,27 @@ function safeClone(v) {
 // Self-contained — stays valid even if this file is loaded with minimal env.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Shadow-DOM-aware query. Traverses light DOM + all reachable open shadow
+// roots. Closed shadow roots stay opaque (spec). Bounded walk so hostile
+// pages can't hang the scanner.
+const TMPL_WALK_CAP = 30000;
+function qsaDeep(selector, root) {
+  const out = [];
+  let visited = 0;
+  (function walk(node) {
+    if (!node || visited > TMPL_WALK_CAP) return;
+    if (typeof node.querySelectorAll !== "function") return;
+    try { for (const el of node.querySelectorAll(selector)) out.push(el); } catch {}
+    const children = node.querySelectorAll("*");
+    for (const el of children) {
+      visited++;
+      if (visited > TMPL_WALK_CAP) return;
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  })(root || document);
+  return out;
+}
+
 async function computeTemplateSignals() {
   try {
     const sigItems = extractSignature(document);
@@ -146,14 +167,14 @@ async function computeTemplateSignals() {
     const textHash = await shortHash(text);
 
     const elementCounts = {
-      headings: document.querySelectorAll("h1,h2,h3,h4,h5,h6").length,
-      sections: document.querySelectorAll("section,article,nav,main,aside,footer").length,
-      forms: document.querySelectorAll("form").length,
-      ariaRoles: document.querySelectorAll("[role]").length,
-      links: document.querySelectorAll("a[href]").length,
-      images: document.querySelectorAll("img").length,
-      buttons: document.querySelectorAll("button").length,
-      inputs: document.querySelectorAll("input,select,textarea").length
+      headings: qsaDeep("h1,h2,h3,h4,h5,h6").length,
+      sections: qsaDeep("section,article,nav,main,aside,footer").length,
+      forms: qsaDeep("form").length,
+      ariaRoles: qsaDeep("[role]").length,
+      links: qsaDeep("a[href]").length,
+      images: qsaDeep("img").length,
+      buttons: qsaDeep("button").length,
+      inputs: qsaDeep("input,select,textarea").length
     };
 
     return {
@@ -171,6 +192,8 @@ async function computeTemplateSignals() {
 
 // Collect the same set of signature strings SiteScope's v5.3
 // `_fp_bs4_extract_elements` builds — but from the live DOM, not parsed HTML.
+// Shadow DOM is traversed so the fingerprint is structurally complete for
+// web-component-heavy pages (Lit, Stencil, SFDC Lightning, Polymer).
 function extractSignature(root) {
   const sig = [];
 
@@ -181,16 +204,16 @@ function extractSignature(root) {
     "h1", "h2", "h3", "h4", "h5", "h6"
   ];
   for (const tag of landmarkTags) {
-    for (const el of root.querySelectorAll(tag)) {
+    for (const el of qsaDeep(tag, root)) {
       sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}`);
     }
   }
 
-  for (const el of root.querySelectorAll("[role]")) {
+  for (const el of qsaDeep("[role]", root)) {
     sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}`);
   }
 
-  const hCounts = [1, 2, 3, 4, 5, 6].map(n => root.querySelectorAll(`h${n}`).length);
+  const hCounts = [1, 2, 3, 4, 5, 6].map(n => qsaDeep(`h${n}`, root).length);
   sig.push("H:" + hCounts.join("-"));
 
   const LAYOUT_PATTERNS = [
@@ -199,7 +222,7 @@ function extractSignature(root) {
   ];
   const seen = new Set();
   for (const pattern of LAYOUT_PATTERNS) {
-    for (const el of root.querySelectorAll(`[class*="${pattern}" i]`)) {
+    for (const el of qsaDeep(`[class*="${pattern}" i]`, root)) {
       const key = `${el.tagName.toLowerCase()}::${firstClasses(el, 3)}`;
       if (seen.has(key)) continue;
       seen.add(key);

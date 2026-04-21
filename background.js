@@ -542,7 +542,9 @@ async function collectTemplateSignature(tabId) {
 }
 
 // Serialisable standalone function (no imports) — executeScript ships it as
-// text to the page. Mirrors what content-script.js does for template signals.
+// text to the page. Mirrors what content-script.js does for template signals,
+// including shadow-DOM traversal so audit-mode and inventory-mode fingerprints
+// stay comparable on web-component-heavy pages.
 function computeTemplateFingerprintInline() {
   const CSS_IN_JS_HASH = /^(?:jsx-|css-|sc-|emotion-|mui-|tw-|chakra-|_[a-zA-Z0-9]+_)[A-Za-z0-9]{4,}$/;
   const STATE_PREFIXES = /^(?:is-|has-|active$|open$|closed$|selected$|hover$|focus$|disabled$|js-)/;
@@ -558,22 +560,39 @@ function computeTemplateFingerprintInline() {
       .filter(c => !UTILITY_NOISE.test(c))
       .slice(0, n).join(" ");
   };
+  const WALK_CAP = 30000;
+  function qsaDeep(selector) {
+    const out = [];
+    let visited = 0;
+    (function walk(node) {
+      if (!node || visited > WALK_CAP) return;
+      if (typeof node.querySelectorAll !== "function") return;
+      try { for (const el of node.querySelectorAll(selector)) out.push(el); } catch {}
+      const children = node.querySelectorAll("*");
+      for (const el of children) {
+        visited++;
+        if (visited > WALK_CAP) return;
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    })(document);
+    return out;
+  }
   const sig = [];
   const landmarkTags = ["header","nav","main","article","aside","footer","section","form","dialog","details","summary","figure","figcaption","table","thead","tbody","tfoot","h1","h2","h3","h4","h5","h6"];
   for (const tag of landmarkTags) {
-    for (const el of document.querySelectorAll(tag)) {
+    for (const el of qsaDeep(tag)) {
       sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
     }
   }
-  for (const el of document.querySelectorAll("[role]")) {
+  for (const el of qsaDeep("[role]")) {
     sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}`);
   }
-  const hCounts = [1,2,3,4,5,6].map(n => document.querySelectorAll(`h${n}`).length);
+  const hCounts = [1,2,3,4,5,6].map(n => qsaDeep(`h${n}`).length);
   sig.push("H:" + hCounts.join("-"));
   const LAYOUT = ["layout","template","container","wrapper","grid","flex","row","col-","block","module","widget","component","page-","content"];
   const seen = new Set();
   for (const p of LAYOUT) {
-    for (const el of document.querySelectorAll(`[class*="${p}" i]`)) {
+    for (const el of qsaDeep(`[class*="${p}" i]`)) {
       const k = `${el.tagName.toLowerCase()}::${firstClasses(el,3)}`;
       if (!seen.has(k)) { seen.add(k); sig.push(k); }
     }
