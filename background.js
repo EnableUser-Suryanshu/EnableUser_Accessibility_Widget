@@ -25,7 +25,14 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // We floor at 1 to prevent a zero-URL crawl, and let the operator set any
 // upper number they're willing to wait for. Concurrency + rate-limiter keep
 // the target site safe regardless of total URL count.
-const CONCURRENT_TABS = 5;
+// CONCURRENT_TABS governs how many tabs run axe in parallel. Each tab
+// spins up its own Chromium renderer + axe context so memory cost is real
+// (~100–200 MB per tab on content-heavy pages). 50 is aggressive but the
+// operator explicitly asked for "open 50 at once" so a 50-URL run finishes
+// in one batch rather than ten sequential waves. The RateLimiter still
+// governs per-site pacing (backoff on 429/503, same-host politeness) so
+// the target site doesn't get hammered regardless of tab count.
+const CONCURRENT_TABS = 50;
 const TAB_TIMEOUT_MS = 60_000;
 const SETTLE_MS = 2_500;
 
@@ -261,6 +268,29 @@ async function scanInventory(tabId, options) {
 
   console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth}`);
 
+  // Reset live-progress state. Written to chrome.storage.local so the popup
+  // can show it even if the popup was closed while the scan ran. Updated
+  // after every tab finishes. Cleared with { active:false } when scanInventory
+  // returns. See progressUpdate() below.
+  await chrome.storage.local.set({
+    "scan-progress": {
+      mode: "inventory",
+      active: true,
+      done: 0,
+      total: Number.isFinite(maxUrls) ? maxUrls : 0,
+      currentUrl: startUrl,
+      startedAt: Date.now(),
+      seedUrl: startUrl
+    }
+  }).catch(() => {});
+  async function progressUpdate(patch) {
+    try {
+      const got = await chrome.storage.local.get("scan-progress");
+      const prev = got?.["scan-progress"] || {};
+      await chrome.storage.local.set({ "scan-progress": { ...prev, ...patch } });
+    } catch {}
+  }
+
   const pages = [];
   const depthStats = {};
 
@@ -313,6 +343,10 @@ async function scanInventory(tabId, options) {
   } catch (err) {
     pages.push({ url: startUrl, depth: 0, source: "seed", error: String(err?.message || err) });
   }
+  // Seed page is done — tick progress. "done" counts every finished URL
+  // whether the fetch succeeded or errored, because the operator cares about
+  // completion state, not just successes.
+  await progressUpdate({ done: pages.length, currentUrl: startUrl });
 
   // Same discovery pipeline as scanMulti — seedDiscovery() runs sitemap,
   // homepage <link rel=…>, RSS/Atom feeds, and in-page nav harvest in
@@ -378,6 +412,10 @@ async function scanInventory(tabId, options) {
       rateLimiter.reportFailure(req.url, { status: err?.status || 0 });
       pages.push({ url: req.url, depth: req.depth, source: req.source, error: String(err?.message || err) });
     }
+    // Progress tick after every launched URL (success or error). Don't
+    // await — fire-and-forget so a slow chrome.storage write can't block
+    // the next tab from launching. Popup polls via storage.onChanged.
+    progressUpdate({ done: pages.length, currentUrl: req.url });
   }
 
   function pump() {
@@ -390,6 +428,11 @@ async function scanInventory(tabId, options) {
   }
   pump();
   while (active.size > 0) { await Promise.race(active); pump(); }
+
+  // Mark the crawl as inactive so the popup's progress banner disappears.
+  // Keep the final done/total for one refresh so the user sees "done" before
+  // it clears.
+  await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile });

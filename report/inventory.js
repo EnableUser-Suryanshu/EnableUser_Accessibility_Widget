@@ -11,6 +11,36 @@ function send(msg) {
   return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
 }
 
+// Direct chrome.storage.local readers. The inventory payload for a full
+// scope scan routinely exceeds Chrome's 64 MiB runtime-messaging ceiling
+// (large screenshots + full audit results for dozens of pages), which used
+// to blow up the GET_INVENTORY sendResponse in background.js and leave the
+// report showing a misleading "scope data expired" message — the data was
+// never expired, it was just unreachable through the messaging channel.
+// The extension has `unlimitedStorage` permission, so storage.local has no
+// size cap; reading from it directly from this page (it's an extension
+// page with full chrome.* access) sidesteps the ceiling entirely.
+async function readInventoryFromStorage(id) {
+  try {
+    const key = `inv:${id}`;
+    const got = await chrome.storage.local.get(key);
+    return got?.[key] || null;
+  } catch (err) {
+    console.warn("[EU] storage.local read failed for inventory", err);
+    return null;
+  }
+}
+async function readScreenshotFromStorage(id) {
+  try {
+    const key = `shot:${id}`;
+    const got = await chrome.storage.local.get(key);
+    return got?.[key] || null; // { dataUrl, ... }
+  } catch (err) {
+    console.warn("[EU] storage.local read failed for screenshot", err);
+    return null;
+  }
+}
+
 function el(tag, props = {}, children = []) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
@@ -317,23 +347,33 @@ const screenshotObserver = ("IntersectionObserver" in window)
     }, { rootMargin: "400px 0px" })
   : null;
 
-function loadScreenshot(img) {
+async function loadScreenshot(img) {
   const id = img.getAttribute("data-shot-id");
   if (!id || img.getAttribute("data-loaded") === "1") return;
   img.setAttribute("data-loaded", "loading");
-  send({ type: "GET_SCREENSHOT", id }).then(res => {
-    if (res?.ok && res.dataUrl) {
-      img.src = res.dataUrl;
+  // Direct storage.local read — individual screenshots can be multi-MB,
+  // which the runtime-message path still handles, but a tall full-page
+  // capture can still bump against the ceiling, so be consistent with
+  // the inventory load path.
+  try {
+    let entry = await readScreenshotFromStorage(id);
+    if (!entry?.dataUrl) {
+      // Fallback: SW may still have it in memory (hot path, just-finished crawl)
+      const res = await send({ type: "GET_SCREENSHOT", id });
+      if (res?.ok && res.dataUrl) entry = { dataUrl: res.dataUrl };
+    }
+    if (entry?.dataUrl) {
+      img.src = entry.dataUrl;
       img.setAttribute("data-loaded", "1");
     } else {
       img.setAttribute("data-loaded", "error");
-      img.alt = "screenshot unavailable (expired)";
+      img.alt = "screenshot unavailable";
       img.classList.add("screenshot-missing");
     }
-  }).catch(err => {
+  } catch (err) {
     console.warn("[EU] screenshot fetch failed", err);
     img.setAttribute("data-loaded", "error");
-  });
+  }
 }
 
 function renderScreenshot(shot, caption) {
@@ -838,13 +878,22 @@ async function main() {
       '<main class="wrap"><h2>Missing inventory id</h2><p>Open this page via the extension popup (Inventory / Scope Mode).</p></main>';
     return;
   }
-  const res = await send({ type: "GET_INVENTORY", inventoryId });
-  if (!res?.ok || !res.inventory) {
+  // Read the inventory directly from chrome.storage.local. Falling back to
+  // the SW's in-memory Map (GET_INVENTORY) only when storage didn't have it
+  // yet — that can happen if the user navigates here during the crawl but
+  // before the final persistInventory write. For completed scans the SW
+  // has already persisted to storage, so this path never hits the 64 MiB
+  // message ceiling that used to make the report falsely claim expiry.
+  let inventory = await readInventoryFromStorage(inventoryId);
+  if (!inventory) {
+    const res = await send({ type: "GET_INVENTORY", inventoryId });
+    if (res?.ok && res.inventory) inventory = res.inventory;
+  }
+  if (!inventory) {
     document.body.innerHTML =
-      '<main class="wrap"><h2>Inventory unavailable</h2><p>The scope data has expired. Re-run the scope scan from the popup.</p></main>';
+      '<main class="wrap"><h2>Inventory unavailable</h2><p>No inventory data was found for this scan id. Re-run the scope scan from the popup.</p></main>';
     return;
   }
-  const inventory = res.inventory;
   renderMeta(inventory);
   renderStats(inventory);
   renderAuditStats(inventory);

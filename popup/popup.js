@@ -42,6 +42,44 @@ function setStatus(msg, isError = false) {
   statusEl.classList.toggle("error", isError);
 }
 
+// ── Live progress wiring ────────────────────────────────────────────────
+// background.js writes { "scan-progress": { active, done, total, currentUrl }}
+// into chrome.storage.local after every URL finishes. The popup reflects
+// this back to the user so they can see the crawl is making progress
+// (instead of staring at a blank "this may take a while" message for ten
+// minutes wondering if it's hung). Works even when the popup was closed
+// during the crawl — re-opening the extension picks up the live state.
+function shortenUrl(u, max = 60) {
+  if (!u) return "";
+  try {
+    const url = new URL(u);
+    const s = url.pathname + (url.search || "");
+    return (s.length <= max ? s : s.slice(0, max - 1) + "…") || url.hostname;
+  } catch { return u.length <= max ? u : u.slice(0, max - 1) + "…"; }
+}
+function renderProgress(p) {
+  if (!p || !p.active) {
+    // Only clear the status line if it was showing progress — don't wipe
+    // out the "Opening report…" final message that the button handlers set.
+    if (statusEl.dataset.mode === "progress") setStatus(null);
+    return;
+  }
+  const { done = 0, total = 0, currentUrl = "" } = p;
+  const totalLabel = total > 0 ? total : "?";
+  const line = `Scanning ${done}/${totalLabel}${currentUrl ? ` — ${shortenUrl(currentUrl)}` : ""}`;
+  statusEl.hidden = false;
+  statusEl.textContent = line;
+  statusEl.classList.remove("error");
+  statusEl.dataset.mode = "progress";
+}
+// Initial paint from whatever's in storage (popup was just opened).
+chrome.storage?.local.get("scan-progress").then(got => renderProgress(got?.["scan-progress"])).catch(() => {});
+// Live updates while the popup is open.
+chrome.storage?.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes["scan-progress"]) return;
+  renderProgress(changes["scan-progress"].newValue);
+});
+
 function setBusy(busy) {
   btnCurrent.disabled = busy;
   btnMulti.disabled = busy;
