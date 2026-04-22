@@ -267,10 +267,14 @@ async function scanInventory(tabId, options) {
     // spreading so it can't override the canonical queued URL. Keep it as
     // `finalUrl` for the audit trail (useful when the page client-side
     // redirects, adds a trailing slash, or drops query params post-load).
-    const { url: seedFinalUrl, ...seedSignals } = signals || {};
+    // Also pull `canonicalUrl` (from <link rel="canonical">) out as a
+    // top-level dedup hint — many sites serve multiple URL variants that
+    // self-declare the same canonical copy.
+    const { url: seedFinalUrl, canonicalUrl: seedCanonical, ...seedSignals } = signals || {};
     pages.push({
       url: startUrl,
       finalUrl: seedFinalUrl || startUrl,
+      canonicalUrl: seedCanonical || "",
       title: auditPayload?.title || tab.title || "", depth: 0, source: "seed",
       template_id: tmpl.fingerprint || "unknown",
       url_cluster: tmpl.urlCluster || "unknown",
@@ -318,16 +322,16 @@ async function scanInventory(tabId, options) {
       await rateLimiter.wait(req.url);
       const result = await inventoryInNewTab(req.url, req.depth < crawlDepth);
       rateLimiter.reportSuccess(req.url);
-      // Strip `url` out of result before spreading. inventoryInNewTab ->
-      // collectContentSignals returns `url: location.href` which, when spread
-      // here, would overwrite our canonical req.url and cause two enqueues
-      // (e.g. /foo?from=a vs /foo?from=b, both canonical, both SPAs strip to
-      // /foo on settle) to end up as two rows with identical p.url. Keep the
-      // post-settle URL as finalUrl for the audit trail.
-      const { links = [], url: finalUrl, ...rest } = result;
+      // Strip `url` and `canonicalUrl` out of result before spreading.
+      // inventoryInNewTab -> collectContentSignals returns both; if we
+      // let them spread-override, we'd lose our canonical queued URL AND
+      // we'd lose the ability to use the site's self-declared canonical
+      // as a post-crawl dedup hint.
+      const { links = [], url: finalUrl, canonicalUrl, ...rest } = result;
       pages.push({
         url: req.url,
         finalUrl: finalUrl || req.url,
+        canonicalUrl: canonicalUrl || "",
         depth: req.depth, source: req.source,
         ...rest
       });
@@ -562,20 +566,29 @@ function buildInventory(pages, meta) {
     }
   }
 
-  // ── Canonical URL dedup ────────────────────────────────────────────
-  // Even with the queue's canonical dedup, two different queued URLs can
-  // end up on the same page after the SPA settles (e.g. /foo?from=home
-  // and /foo?from=footer both redirect client-side to /foo; or a link
-  // is discovered once through nav and again through body with a
-  // different query param). Before this pass those produced two rows
-  // with identical p.url, differing only in depth/source/template_id
-  // (the latter when the page renders non-deterministically on each
-  // visit — carousels, random featured items).
+  // ── User-journey URL dedup ─────────────────────────────────────────
+  // A normal browsing user doesn't care that /foo, /foo/, http://…/foo,
+  // https://…/foo, and /foo?utm=x are technically distinct URLs. From
+  // their perspective that's ONE page. Collapse accordingly, using the
+  // strongest dedup signal available for each record:
   //
-  // Merge duplicates by canonical URL. Keep the record with the richest
-  // signal (most violations captured, screenshot present, most components),
-  // fold the others into a `duplicate_of` facet so the audit trail isn't
-  // lost.
+  //   1. canonicalUrl — site-declared via <link rel="canonical">. If
+  //      present, it's the author's own "this is the real URL" statement,
+  //      and any other URL carrying the same canonical is an alias.
+  //      Catches AMP pages, print views, tracking-tagged variants, and
+  //      case-insensitive path aliases.
+  //
+  //   2. finalUrl — the post-redirect URL Chrome actually settled on.
+  //      Catches http→https upgrades, trailing-slash server redirects,
+  //      hostname normalisation (www → non-www or vice versa), and any
+  //      301/302 server-side alias chain.
+  //
+  //   3. p.url — the canonical queued URL. Final fallback for cases
+  //      where the page didn't declare a canonical AND didn't redirect.
+  //
+  // When two pages collapse, we keep the richer one (more audit signal,
+  // screenshot present, more components detected) and fold the other
+  // into alt_discoveries so the audit trail isn't lost.
   function scoreRecord(p) {
     if (p.error) return -1;
     let s = 0;
@@ -587,31 +600,48 @@ function buildInventory(pages, meta) {
     if (p.counts) s += Object.values(p.counts).filter(v => Number(v) > 0).length;
     return s;
   }
+  function dedupKey(p) {
+    if (p.error) return `__err_${p.url || Math.random()}`;
+    return p.canonicalUrl || p.finalUrl || p.url || `__noid`;
+  }
   const byUrl = new Map();
+  const dedupReason = { by_canonical: 0, by_final_url: 0, by_queued_url: 0 };
   for (const p of realPagesRaw) {
-    const key = p.error ? `__err_${byUrl.size}` : (p.url || `__noid_${byUrl.size}`);
+    const key = dedupKey(p);
     const existing = byUrl.get(key);
     if (!existing) {
       byUrl.set(key, { record: p, alt: [], visits: 1 });
       continue;
     }
     existing.visits++;
-    // Preserve the alternate discovery context
+    // Which dedup signal actually collapsed this record? Useful for
+    // the operator to understand the discovery pipeline (and to spot
+    // sites that over-declare canonicals or have bad redirects).
+    if (p.canonicalUrl && p.canonicalUrl === existing.record.canonicalUrl) {
+      dedupReason.by_canonical++;
+    } else if (p.finalUrl && p.finalUrl === existing.record.finalUrl && p.finalUrl !== p.url) {
+      dedupReason.by_final_url++;
+    } else {
+      dedupReason.by_queued_url++;
+    }
     existing.alt.push({
       depth: p.depth,
       source: p.source,
       template_id: p.template_id,
       text_hash: p.text_hash,
-      finalUrl: p.finalUrl
+      url: p.url,
+      finalUrl: p.finalUrl,
+      canonicalUrl: p.canonicalUrl
     });
-    // If this visit scored higher, promote it and push the previous into alt
     if (scoreRecord(p) > scoreRecord(existing.record)) {
       existing.alt.push({
         depth: existing.record.depth,
         source: existing.record.source,
         template_id: existing.record.template_id,
         text_hash: existing.record.text_hash,
-        finalUrl: existing.record.finalUrl
+        url: existing.record.url,
+        finalUrl: existing.record.finalUrl,
+        canonicalUrl: existing.record.canonicalUrl
       });
       existing.record = p;
     }
@@ -627,7 +657,10 @@ function buildInventory(pages, meta) {
   const dedupSummary = {
     raw_page_count: realPagesRaw.length,
     unique_urls: realPages.length,
-    duplicates_collapsed: realPagesRaw.length - realPages.length
+    duplicates_collapsed: realPagesRaw.length - realPages.length,
+    by_canonical: dedupReason.by_canonical,
+    by_final_url: dedupReason.by_final_url,
+    by_queued_url: dedupReason.by_queued_url
   };
 
   // Group by template fingerprint ALONE. Previously the key was
