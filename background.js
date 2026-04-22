@@ -743,13 +743,73 @@ function buildInventory(pages, meta) {
     }
     realPages.push(record);
   }
+
+  // ── Fingerprint-based dedup (second pass) ─────────────────────────
+  // After URL dedup, some URL-distinct rows may still be rendering
+  // identical content — e.g. a site that redirects many URLs to the
+  // same landing page, a popup-builder plugin whose "open on these
+  // URLs" config rewrites every configured URL to the same target,
+  // disclosure-gate walls. The URL dedup misses these because each
+  // lands on a different settled URL (the redirected-to URL is
+  // unique per source).
+  //
+  // Key: (template_id, text_hash). BOTH must match — same template
+  // alone isn't enough (two blog posts share template but have
+  // different content → different text_hash → not collapsed).
+  //
+  // Winner selection: scoreRecord (more violations/components/
+  // screenshot = richer audit), ties broken by shallower depth
+  // (closer to the homepage = more likely the canonical page the
+  // site intends humans to arrive at).
+  dedupReason.by_fingerprint = 0;
+  const byFp = new Map();
+  const noFp = [];
+  for (const rec of realPages) {
+    const fp = rec.template_id && rec.text_hash
+      ? `${rec.template_id}::${rec.text_hash}`
+      : null;
+    if (!fp) { noFp.push(rec); continue; }
+    const existing = byFp.get(fp);
+    if (!existing) { byFp.set(fp, rec); continue; }
+    // Pick winner
+    const recScore = scoreRecord(rec);
+    const exScore = scoreRecord(existing);
+    const recWins = recScore > exScore ||
+      (recScore === exScore && (rec.depth || 0) < (existing.depth || 0));
+    const winner = recWins ? rec : existing;
+    const loser  = recWins ? existing : rec;
+    const alt = (winner.alt_discoveries || []).slice();
+    alt.push({
+      depth: loser.depth,
+      source: loser.source,
+      template_id: loser.template_id,
+      text_hash: loser.text_hash,
+      url: loser.url,
+      finalUrl: loser.finalUrl,
+      canonicalUrl: loser.canonicalUrl,
+      dedup_reason: "fingerprint"
+    });
+    if (Array.isArray(loser.alt_discoveries)) alt.push(...loser.alt_discoveries);
+    winner.alt_discoveries = alt;
+    winner.visit_count = (winner.visit_count || 1) + (loser.visit_count || 1);
+    byFp.set(fp, winner);
+    dedupReason.by_fingerprint++;
+  }
+  const fpDeduped = [...byFp.values(), ...noFp];
+  const preFpCount = realPages.length;
+  realPages.length = 0;
+  realPages.push(...fpDeduped);
+
   const dedupSummary = {
     raw_page_count: realPagesRaw.length,
     unique_urls: realPages.length,
     duplicates_collapsed: realPagesRaw.length - realPages.length,
     by_canonical: dedupReason.by_canonical,
     by_final_url: dedupReason.by_final_url,
-    by_queued_url: dedupReason.by_queued_url
+    by_queued_url: dedupReason.by_queued_url,
+    by_fingerprint: dedupReason.by_fingerprint,
+    // Diagnostic: how many fp-collapsed rows had already survived URL dedup.
+    fp_collapsed_after_url_dedup: preFpCount - realPages.length
   };
 
   // Group by template fingerprint ALONE. Previously the key was
