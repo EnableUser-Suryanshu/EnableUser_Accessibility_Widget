@@ -800,6 +800,104 @@ function buildInventory(pages, meta) {
   realPages.length = 0;
   realPages.push(...fpDeduped);
 
+  // ── Secondary-shell dedup (third pass) ────────────────────────────
+  // Fingerprint dedup collapses rows whose (template_id, text_hash)
+  // both match. On some WP themes (notably "The Gem" and related CPT
+  // plugins) the URL slug is injected into the <title> tag and/or the
+  // breadcrumb trail — so two pages with IDENTICAL visible body content
+  // produce text_hashes that differ by exactly those few bytes. The
+  // fingerprint pass then keeps them all as "distinct".
+  //
+  // The symptom in an inventory: 50–100+ rows sharing the same
+  // template_id, where the audit result (violations, incomplete, and
+  // structural element counts) is byte-for-byte identical across every
+  // row. A real content page cannot produce the same axe rule IDs AND
+  // the same counts object AND the same template fingerprint as another
+  // real content page unless they are actually the same shell page —
+  // axe's checks bind to node identity + attributes, so any meaningful
+  // content variance would shift node counts or trip a new rule on
+  // some node somewhere.
+  //
+  // Strategy:
+  //   1. Group by template_id.
+  //   2. Within each template group of size ≥ 3, sub-cluster by
+  //      audit_signature = sort(violation rule IDs) + sort(incomplete
+  //      rule IDs) + sorted non-zero `counts` entries.
+  //   3. Collapse any sub-cluster of size ≥ 3 to one representative
+  //      (shallowest depth wins, ties by higher scoreRecord).
+  //   4. Never touch groups smaller than the thresholds — avoids
+  //      accidentally collapsing pages whose identicality is
+  //      coincidence rather than shell-page leakage.
+  function auditSignature(p) {
+    if (p.error || !p.audit) return null;
+    const vIds = Array.from(new Set((p.audit.violations || []).map(v => v.id))).sort();
+    const iIds = Array.from(new Set((p.audit.incomplete || []).map(v => v.id))).sort();
+    const cPairs = p.counts
+      ? Object.entries(p.counts)
+          .filter(([, v]) => Number(v) > 0)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([k, v]) => `${k}=${v}`)
+      : [];
+    return `v:${vIds.join(",")}::i:${iIds.join(",")}::c:${cPairs.join(",")}`;
+  }
+
+  dedupReason.by_secondary_shell = 0;
+  const byTemplate = new Map();
+  for (const p of realPages) {
+    if (!p.template_id) continue;
+    const arr = byTemplate.get(p.template_id) || [];
+    arr.push(p);
+    byTemplate.set(p.template_id, arr);
+  }
+  const secondaryShellLosers = new Set();
+  for (const [, group] of byTemplate) {
+    if (group.length < 3) continue;
+    const bySig = new Map();
+    for (const p of group) {
+      const sig = auditSignature(p);
+      if (!sig) continue;
+      const arr = bySig.get(sig) || [];
+      arr.push(p);
+      bySig.set(sig, arr);
+    }
+    for (const [, cluster] of bySig) {
+      if (cluster.length < 3) continue;
+      // Winner: shallowest depth; ties broken by higher scoreRecord.
+      cluster.sort((a, b) => {
+        const da = a.depth || 0, db = b.depth || 0;
+        if (da !== db) return da - db;
+        return scoreRecord(b) - scoreRecord(a);
+      });
+      const winner = cluster[0];
+      const alt = (winner.alt_discoveries || []).slice();
+      let extraVisits = 0;
+      for (let i = 1; i < cluster.length; i++) {
+        const loser = cluster[i];
+        secondaryShellLosers.add(loser);
+        alt.push({
+          depth: loser.depth,
+          source: loser.source,
+          template_id: loser.template_id,
+          text_hash: loser.text_hash,
+          url: loser.url,
+          finalUrl: loser.finalUrl,
+          canonicalUrl: loser.canonicalUrl,
+          dedup_reason: "secondary_shell"
+        });
+        if (Array.isArray(loser.alt_discoveries)) alt.push(...loser.alt_discoveries);
+        extraVisits += (loser.visit_count || 1);
+        dedupReason.by_secondary_shell++;
+      }
+      winner.alt_discoveries = alt;
+      winner.visit_count = (winner.visit_count || 1) + extraVisits;
+    }
+  }
+  if (secondaryShellLosers.size > 0) {
+    const survivors = realPages.filter(p => !secondaryShellLosers.has(p));
+    realPages.length = 0;
+    realPages.push(...survivors);
+  }
+
   const dedupSummary = {
     raw_page_count: realPagesRaw.length,
     unique_urls: realPages.length,
@@ -808,8 +906,9 @@ function buildInventory(pages, meta) {
     by_final_url: dedupReason.by_final_url,
     by_queued_url: dedupReason.by_queued_url,
     by_fingerprint: dedupReason.by_fingerprint,
+    by_secondary_shell: dedupReason.by_secondary_shell,
     // Diagnostic: how many fp-collapsed rows had already survived URL dedup.
-    fp_collapsed_after_url_dedup: preFpCount - realPages.length
+    fp_collapsed_after_url_dedup: preFpCount - realPages.length - dedupReason.by_secondary_shell
   };
 
   // Group by template fingerprint ALONE. Previously the key was
