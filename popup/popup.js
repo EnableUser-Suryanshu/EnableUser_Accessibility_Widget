@@ -12,7 +12,7 @@ const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
 // No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
 // operator decides the size of the crawl. background.js enforces only a
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
-const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "en301549", "section508", "ada"];
+const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "combined_in", "en301549", "section508", "ada"];
 
 chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;

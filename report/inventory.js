@@ -3,6 +3,8 @@
 // stats / content-type / templates / sample / pages tables. Wires up the two
 // download buttons that produce the scope.docx + inventory.xlsx deliverables.
 
+import { deriveFromTags } from "../lib/wcag-tags.js";
+
 const inventoryId = new URLSearchParams(location.search).get("id");
 
 function send(msg) {
@@ -68,9 +70,14 @@ function renderStats(inventory) {
   // and /foo?from=y) resolved to the same final URL and got merged into a
   // single inventory row. Zero on clean crawls; non-zero surfaces the fact
   // that some queued URLs were client-side-redirected onto an existing row.
+  // The by_* breakdown (when present) attributes each collapse to the
+  // signal that caused it: canonical link, settled URL, or queued URL.
   const d = inventory.dedupSummary;
   if (d && d.duplicates_collapsed > 0) {
     host.appendChild(stat("Duplicates Collapsed", d.duplicates_collapsed));
+    if (d.by_canonical > 0) host.appendChild(stat("… by canonical link", d.by_canonical));
+    if (d.by_final_url > 0) host.appendChild(stat("… by settled URL", d.by_final_url));
+    if (d.by_queued_url > 0) host.appendChild(stat("… by queued URL", d.by_queued_url));
   }
 }
 
@@ -571,8 +578,258 @@ function wireDownloads() {
     }
   }
 
+  const btnClusters = document.getElementById("btn-download-clusters");
+  const btnAudit = document.getElementById("btn-download-audit");
+
   btnDocx?.addEventListener("click", () => download("DOWNLOAD_SCOPE_DOCX", btnDocx));
   btnXlsx?.addEventListener("click", () => download("DOWNLOAD_INVENTORY_XLSX", btnXlsx));
+  btnClusters?.addEventListener("click", () => download("DOWNLOAD_CLUSTERS_XLSX", btnClusters));
+  btnAudit?.addEventListener("click", () => download("DOWNLOAD_AUDIT_XLSX", btnAudit));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tab bar — APG-pattern tablist. Click + arrow-key navigation.
+// ─────────────────────────────────────────────────────────────────────
+function wireTabs() {
+  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+  if (!tabs.length) return;
+
+  function activate(tab) {
+    for (const t of tabs) {
+      const selected = t === tab;
+      t.setAttribute("aria-selected", selected ? "true" : "false");
+      t.setAttribute("tabindex", selected ? "0" : "-1");
+      t.classList.toggle("active", selected);
+      const panel = document.getElementById(t.getAttribute("aria-controls"));
+      if (panel) panel.hidden = !selected;
+    }
+  }
+
+  tabs.forEach((tab, idx) => {
+    tab.addEventListener("click", () => { activate(tab); tab.focus(); });
+    tab.addEventListener("keydown", e => {
+      let next = null;
+      if (e.key === "ArrowRight") next = tabs[(idx + 1) % tabs.length];
+      else if (e.key === "ArrowLeft") next = tabs[(idx - 1 + tabs.length) % tabs.length];
+      else if (e.key === "Home") next = tabs[0];
+      else if (e.key === "End") next = tabs[tabs.length - 1];
+      if (next) { e.preventDefault(); activate(next); next.focus(); }
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Findings tab — one row per violation-node instance across every crawled
+// page. Columns: Rule · Impact · Target · Compliance · Standards · SC ·
+// Code Snippet · Failure Summary · Help. Grouped by page URL.
+// ─────────────────────────────────────────────────────────────────────
+
+// Flatten the inventory into a sortable/filterable finding list. Each
+// finding = one (page, rule, node) triple.
+function collectFindings(inventory) {
+  const findings = [];
+  for (const p of inventory.pages || []) {
+    if (p.error) continue;
+    for (const v of (p.audit?.violations || [])) {
+      const derived = deriveFromTags(v.tags || []);
+      const nodes = v.nodes && v.nodes.length ? v.nodes : [{}];
+      for (const n of nodes) {
+        findings.push({
+          url: p.url,
+          ruleId: v.id || "",
+          impact: (v.impact || "").toLowerCase(),
+          description: v.description || v.help || "",
+          help: v.help || "",
+          helpUrl: v.helpUrl || "",
+          target: (n.target || []).join(" ") || "",
+          html: n.html || "",
+          failureSummary: n.failureSummary || "",
+          compliance: derived.compliance,
+          standards: derived.standards,
+          successCriteria: derived.successCriteria
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+const IMPACT_ORDER = { critical: 0, serious: 1, moderate: 2, minor: 3, "": 4 };
+
+function renderFindings(inventory) {
+  const host = document.getElementById("findings-list");
+  const countEl = document.getElementById("findings-count");
+  const searchInput = document.getElementById("findings-search");
+  const impactInputs = Array.from(document.querySelectorAll(".impact-filter"));
+  if (!host) return;
+
+  const findings = collectFindings(inventory);
+
+  function render() {
+    const q = (searchInput?.value || "").toLowerCase().trim();
+    const allowedImpacts = new Set(
+      impactInputs.filter(i => i.checked).map(i => i.value)
+    );
+
+    const filtered = findings.filter(f => {
+      if (!allowedImpacts.has(f.impact)) {
+        // Unknown/unset impact shows only if ALL impact chips are on (treat as "everything").
+        if (allowedImpacts.size !== impactInputs.length) return false;
+      }
+      if (!q) return true;
+      return (
+        f.ruleId.toLowerCase().includes(q) ||
+        f.description.toLowerCase().includes(q) ||
+        f.target.toLowerCase().includes(q) ||
+        f.failureSummary.toLowerCase().includes(q) ||
+        f.url.toLowerCase().includes(q) ||
+        f.successCriteria.toLowerCase().includes(q)
+      );
+    });
+
+    if (countEl) {
+      countEl.textContent = filtered.length === findings.length
+        ? `${findings.length} finding${findings.length === 1 ? "" : "s"}`
+        : `${filtered.length} of ${findings.length} findings`;
+    }
+
+    // Group by URL.
+    const byUrl = new Map();
+    for (const f of filtered) {
+      if (!byUrl.has(f.url)) byUrl.set(f.url, []);
+      byUrl.get(f.url).push(f);
+    }
+
+    host.innerHTML = "";
+    if (!filtered.length) {
+      host.appendChild(el("p", { class: "muted" }, [
+        findings.length === 0
+          ? "No violations detected across the crawled pages."
+          : "No findings match the current filters."
+      ]));
+      return;
+    }
+
+    for (const [url, group] of byUrl) {
+      // Sort within a page by impact severity, then rule id.
+      group.sort((a, b) => {
+        const ia = IMPACT_ORDER[a.impact] ?? 5;
+        const ib = IMPACT_ORDER[b.impact] ?? 5;
+        if (ia !== ib) return ia - ib;
+        return a.ruleId.localeCompare(b.ruleId);
+      });
+
+      const section = el("section", { class: "finding-group" });
+      const header = el("h3", { class: "finding-group-head" }, [
+        el("a", { href: url, target: "_blank", rel: "noopener" }, [url]),
+        el("span", { class: "muted" }, [` — ${group.length} finding${group.length === 1 ? "" : "s"}`])
+      ]);
+      section.appendChild(header);
+
+      const tbl = el("table", { class: "findings-table" });
+      tbl.appendChild(el("thead", {}, [
+        el("tr", {}, [
+          el("th", {}, ["Impact"]),
+          el("th", {}, ["Target"]),
+          el("th", {}, ["Compliance"]),
+          el("th", {}, ["Standards"]),
+          el("th", {}, ["Success Criteria"]),
+          el("th", {}, ["Code Snippet"]),
+          el("th", {}, ["Failure Summary"]),
+          el("th", {}, ["Help"])
+        ])
+      ]));
+      const tb = el("tbody");
+      for (const f of group) {
+        const helpCell = el("td", {});
+        if (f.helpUrl) {
+          helpCell.appendChild(el("a", { href: f.helpUrl, target: "_blank", rel: "noopener" },
+            [f.help || "Learn more"]));
+        } else {
+          helpCell.textContent = f.help || "";
+        }
+        tb.appendChild(el("tr", { class: `impact-${f.impact || "none"}` }, [
+          el("td", {}, [el("span", { class: `impact-badge impact-${f.impact || "none"}` }, [f.impact || "—"])]),
+          el("td", { class: "mono wrap-anywhere" }, [f.target || "—"]),
+          el("td", {}, [f.compliance]),
+          el("td", {}, [f.standards]),
+          el("td", {}, [f.successCriteria]),
+          el("td", {}, [el("pre", { class: "code-snippet" }, [f.html || "—"])]),
+          el("td", {}, [f.failureSummary || "—"]),
+          helpCell
+        ]));
+      }
+      tbl.appendChild(tb);
+      section.appendChild(tbl);
+      host.appendChild(section);
+    }
+  }
+
+  searchInput?.addEventListener("input", render);
+  for (const i of impactInputs) i.addEventListener("change", render);
+  render();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Screenshots tab — grid of every crawled page that has a screenshot.
+// Reuses renderScreenshot() so each thumbnail lazy-loads via the shared
+// IntersectionObserver (same path used inside the Templates tab).
+// ─────────────────────────────────────────────────────────────────────
+function renderScreenshotsTab(inventory) {
+  const host = document.getElementById("screenshots-grid");
+  const countEl = document.getElementById("screenshots-count");
+  const searchInput = document.getElementById("screenshots-search");
+  if (!host) return;
+
+  const withShot = (inventory.pages || []).filter(p => !p.error && p.screenshot?.id);
+
+  function render() {
+    const q = (searchInput?.value || "").toLowerCase().trim();
+    const filtered = q
+      ? withShot.filter(p =>
+          (p.url || "").toLowerCase().includes(q) ||
+          (p.title || "").toLowerCase().includes(q)
+        )
+      : withShot;
+
+    if (countEl) {
+      countEl.textContent = filtered.length === withShot.length
+        ? `${withShot.length} screenshot${withShot.length === 1 ? "" : "s"}`
+        : `${filtered.length} of ${withShot.length} screenshots`;
+    }
+
+    host.innerHTML = "";
+    if (!filtered.length) {
+      host.appendChild(el("p", { class: "muted" }, [
+        withShot.length === 0
+          ? "No screenshots were captured during this crawl."
+          : "No screenshots match the current search."
+      ]));
+      return;
+    }
+
+    for (const p of filtered) {
+      const card = el("figure", { class: "screenshot-card" });
+      card.appendChild(el("figcaption", { class: "screenshot-caption" }, [
+        el("div", { class: "screenshot-title" }, [p.title || "(untitled)"]),
+        el("a", {
+          href: p.url, target: "_blank", rel: "noopener",
+          class: "screenshot-url"
+        }, [p.url])
+      ]));
+      const shot = renderScreenshot(p.screenshot, "");
+      if (shot) {
+        // renderScreenshot adds its own caption div; we don't need it here.
+        const caption = shot.querySelector(".check-group-label");
+        if (caption) caption.remove();
+        card.appendChild(shot);
+      }
+      host.appendChild(card);
+    }
+  }
+
+  searchInput?.addEventListener("input", render);
+  render();
 }
 
 async function main() {
@@ -596,6 +853,9 @@ async function main() {
   renderTemplates(inventory);
   renderSample(inventory);
   renderPages(inventory);
+  renderFindings(inventory);
+  renderScreenshotsTab(inventory);
+  wireTabs();
   wireDownloads();
 }
 

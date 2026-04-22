@@ -78,6 +78,21 @@
         </table>
       </section>
 
+      <section id="media-section">
+        <h2>Media &amp; Documents <span class="muted" id="media-count"></span></h2>
+        <p class="hint">Every &lt;video&gt;, &lt;audio&gt;, embedded YouTube / Vimeo / Wistia player, and linked PDF / Excel / Word / PowerPoint detected on the scanned pages. Captions, audio-description, autoplay, accessible name, link-purpose, file-type and size hints are validated automatically. Each linked document is also flagged as requiring a manual audit of its own content (tagging, alt text, table headers, reading order) — a web crawler cannot audit the file itself.</p>
+        <div class="media-tiles" id="media-tiles"></div>
+        <div class="media-filters" id="media-filters"></div>
+        <table id="media-table">
+          <thead>
+            <tr>
+              <th>Type</th><th>URL / Source</th><th>Name / Link text</th><th>Page</th><th>Issues</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
       <section>
         <h2>Violations</h2>
         <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and the complete any/all/none check results with messages and related nodes.</p>

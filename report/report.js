@@ -172,6 +172,8 @@ function renderNodeDetails(i) {
   stats.appendChild(makeStat("Passes (node-level)", passNodeCount));
   stats.appendChild(makeStat("Incomplete", incompleteNodeCount));
   stats.appendChild(makeStat("Inapplicable rules", inapplicableRuleCount));
+  const mediaTotal = (report.mediaRows || []).length;
+  if (mediaTotal > 0) stats.appendChild(makeStat("Media & docs", mediaTotal));
   stats.appendChild(makeStat("Criteria passed", passedCriteria));
   stats.appendChild(makeStat("Criteria failed", failedCriteria, "fail"));
   stats.appendChild(makeStat("Critical", byImpact.critical, "critical"));
@@ -284,6 +286,9 @@ function renderNodeDetails(i) {
     templatesBody.appendChild(mainRow);
     templatesBody.appendChild(detailRow);
   }
+
+  // ── Media & Documents ──
+  renderMediaSection(report);
 
   // ── Pages table (expand to show scan metadata) ──
   const pagesBody = document.querySelector("#pages-table tbody");
@@ -483,4 +488,229 @@ function kv(label, value) {
   v.className = "kv-cell-value"; v.textContent = String(value ?? "");
   wrap.appendChild(l); wrap.appendChild(v);
   return wrap;
+}
+
+// ── Media & Documents ────────────────────────────────────────────────────
+// Every <video>, <audio>, embedded video iframe, and linked PDF/Excel/Word/
+// PowerPoint with its detected issues. Per-item rows expand to show the
+// full issue list, WCAG mapping, and context excerpt.
+
+const MEDIA_RULE_META = {
+  "media-video-captions":         { wcag: "1.2.2", level: "A",  title: "Captions missing",             impact: "serious" },
+  "media-video-audio-description":{ wcag: "1.2.5", level: "AA", title: "Audio description (review)",   impact: "moderate" },
+  "media-video-autoplay":         { wcag: "1.4.2", level: "A",  title: "Autoplay without pause",       impact: "serious" },
+  "media-video-controls":         { wcag: "2.1.1", level: "A",  title: "No controls (review)",         impact: "moderate" },
+  "media-video-name":             { wcag: "4.1.2", level: "A",  title: "Missing accessible name",      impact: "serious" },
+  "media-audio-transcript":       { wcag: "1.2.1", level: "A",  title: "Transcript not found (review)",impact: "moderate" },
+  "media-audio-autoplay":         { wcag: "1.4.2", level: "A",  title: "Audio autoplays",              impact: "serious" },
+  "media-audio-name":             { wcag: "4.1.2", level: "A",  title: "Missing accessible name",      impact: "serious" },
+  "media-iframe-video-title":     { wcag: "4.1.2", level: "A",  title: "Iframe missing title",         impact: "serious" },
+  "media-iframe-video-title-generic": { wcag: "4.1.2", level: "A", title: "Generic vendor title",      impact: "moderate" },
+  "media-doc-link-purpose":       { wcag: "2.4.4", level: "A",  title: "Link purpose unclear",         impact: "serious" },
+  "media-doc-type-hint":          { wcag: "2.4.4", level: "A",  title: "File type not declared",       impact: "minor" },
+  "media-doc-size-hint":          { wcag: "—",     level: "—",  title: "File size not declared",       impact: "minor" },
+  "media-doc-new-tab-notice":     { wcag: "3.2.2", level: "AA", title: "Opens new tab without notice", impact: "minor" },
+  "media-pdf-manual-audit":       { wcag: "1.3.1", level: "A",  title: "PDF needs manual audit",       impact: "review" },
+  "media-spreadsheet-manual-audit":{ wcag: "1.3.1", level: "A", title: "Spreadsheet needs manual audit",impact: "review" },
+  "media-document-manual-audit":  { wcag: "1.3.1", level: "A",  title: "Document needs manual audit",  impact: "review" },
+  "media-presentation-manual-audit":{ wcag: "1.3.1", level: "A",title: "Presentation needs manual audit",impact: "review" }
+};
+
+function ruleMeta(id) {
+  return MEDIA_RULE_META[id] || { wcag: "—", level: "—", title: id, impact: "minor" };
+}
+
+function kindIcon(kind, subtype) {
+  if (kind === "video")        return "▶";
+  if (kind === "audio")        return "♪";
+  if (kind === "iframe-video") return "▶";
+  if (kind === "document") {
+    if (subtype === "pdf") return "PDF";
+    if (/^xls/.test(subtype) || subtype === "csv" || subtype === "ods") return "XLS";
+    if (/^doc/.test(subtype) || subtype === "odt" || subtype === "rtf") return "DOC";
+    if (/^ppt/.test(subtype) || subtype === "odp") return "PPT";
+  }
+  return "•";
+}
+
+function renderMediaSection(report) {
+  const rows = report.mediaRows || [];
+  const summary = report.mediaSummary || {};
+  document.getElementById("media-count").textContent = `(${rows.length})`;
+
+  const tiles = document.getElementById("media-tiles");
+  const tileDefs = [
+    ["Videos (HTML5)",    summary.videos || 0],
+    ["Audio elements",    summary.audios || 0],
+    ["Embedded players",  summary.iframeVideos || 0],
+    ["Linked documents",  summary.documents || 0],
+    ["PDFs",              summary.pdf || 0],
+    ["Spreadsheets",      summary.spreadsheet || 0],
+    ["Word docs",         summary.document || 0],
+    ["Presentations",     summary.presentation || 0]
+  ];
+  const totalIssues =
+    (summary.videoIssues || 0) + (summary.audioIssues || 0) +
+    (summary.iframeIssues || 0) + (summary.documentIssues || 0);
+  for (const [label, value] of tileDefs) {
+    tiles.appendChild(makeStat(label, value));
+  }
+  tiles.appendChild(makeStat("Findings raised", totalIssues, totalIssues > 0 ? "fail" : ""));
+
+  if (!rows.length) {
+    const tbody = document.querySelector("#media-table tbody");
+    tbody.appendChild(el("tr", {}, [
+      el("td", { colspan: "5", class: "muted", style: "text-align:center;padding:24px" }, [
+        "No media or document links detected on the scanned pages."
+      ])
+    ]));
+    return;
+  }
+
+  // ── Kind filter chips ──
+  const filtersEl = document.getElementById("media-filters");
+  const kinds = Array.from(new Set(rows.map(r => r.kind)));
+  const allChip = el("button", { class: "media-chip active", "data-kind": "__all" }, [`All (${rows.length})`]);
+  filtersEl.appendChild(allChip);
+  for (const k of kinds) {
+    const count = rows.filter(r => r.kind === k).length;
+    const label = k === "iframe-video" ? "Embedded players" : k.charAt(0).toUpperCase() + k.slice(1) + "s";
+    filtersEl.appendChild(el("button", { class: "media-chip", "data-kind": k }, [`${label} (${count})`]));
+  }
+
+  const tbody = document.querySelector("#media-table tbody");
+  const mainRows = [];
+
+  for (const r of rows) {
+    const kindCell = el("td", { class: "media-kind-cell" }, [
+      el("span", { class: `media-badge media-badge-${r.kind}` }, [kindIcon(r.kind, r.subtype)]),
+      el("span", { class: "media-type-label" }, [r.type_label || r.kind])
+    ]);
+    const urlDisplay = r.media_url || "(inline)";
+    const urlCell = el("td", { class: "url", title: urlDisplay });
+    if (r.media_url) {
+      urlCell.appendChild(el("a", { href: r.media_url, target: "_blank", rel: "noopener" }, [urlDisplay]));
+    } else {
+      urlCell.appendChild(document.createTextNode(urlDisplay));
+    }
+    const nameText = r.accessible_name || r.link_text || r.title_attr || "(no accessible name)";
+    const nameCell = el("td", { class: r.accessible_name || r.link_text ? "" : "muted" }, [nameText]);
+    const pageCell = el("td", { class: "url small", title: r.url }, [
+      el("a", { href: r.url, target: "_blank", rel: "noopener" }, [r.url])
+    ]);
+    const issueCount = (r.issues || []).length;
+    const issueCell = el("td", {
+      class: issueCount ? (r.issues.some(id => /autoplay|captions|purpose|name|title$/.test(id)) ? "fail" : "warn") : "pass"
+    }, [issueCount ? `${issueCount} issue${issueCount === 1 ? "" : "s"}` : "None"]);
+
+    const mainRow = el("tr", { class: `media-row media-row-${r.kind}` }, [
+      kindCell, urlCell, nameCell, pageCell, issueCell
+    ]);
+    const detailRow = el("tr", { class: "media-detail-row" });
+    const detailCell = el("td", { colspan: "5" });
+    detailCell.appendChild(renderMediaDetails(r));
+    detailRow.appendChild(detailCell);
+
+    mainRow.addEventListener("click", () => mainRow.classList.toggle("expanded"));
+    mainRows.push({ mainRow, detailRow, kind: r.kind });
+    tbody.appendChild(mainRow);
+    tbody.appendChild(detailRow);
+  }
+
+  filtersEl.addEventListener("click", (e) => {
+    const btn = e.target.closest(".media-chip");
+    if (!btn) return;
+    const kind = btn.getAttribute("data-kind");
+    for (const c of filtersEl.querySelectorAll(".media-chip")) c.classList.remove("active");
+    btn.classList.add("active");
+    for (const { mainRow, detailRow, kind: rk } of mainRows) {
+      const show = kind === "__all" || rk === kind;
+      mainRow.style.display = show ? "" : "none";
+      if (!show) {
+        mainRow.classList.remove("expanded");
+        detailRow.style.display = "none";
+      } else {
+        detailRow.style.display = "";
+      }
+    }
+  });
+}
+
+function renderMediaDetails(r) {
+  const box = el("div", { class: "issue-details" });
+
+  // Attributes grid — presence/absence tiles for the fields that matter.
+  const grid = el("div", { class: "kv-grid" });
+  const addIf = (label, value) => { if (value !== "" && value !== null && value !== undefined) grid.appendChild(kv(label, value)); };
+  addIf("Kind", r.type_label || r.kind);
+  addIf("Source URL", r.media_url);
+  addIf("On page", r.url);
+  addIf("Accessible name", r.accessible_name);
+  if (r.kind === "document") {
+    addIf("Link text", r.link_text);
+    addIf("Context", r.context);
+    addIf("Format declared", formatBool(r.has_type_hint));
+    addIf("Size declared", formatBool(r.has_size_hint));
+    addIf("Opens new tab", formatBool(r.opens_in_new_tab));
+    if (r.opens_in_new_tab) addIf("New-tab notice", formatBool(r.has_new_tab_notice));
+  }
+  if (r.kind === "video") {
+    addIf("Captions", formatBool(r.has_captions));
+    addIf("Audio description", formatBool(r.has_descriptions));
+    addIf("Controls", formatBool(r.has_controls));
+    addIf("Autoplay", formatBool(r.autoplay));
+    addIf("Muted", formatBool(r.muted));
+    if (r.duration_seconds) addIf("Duration (s)", r.duration_seconds);
+    if (Array.isArray(r.tracks) && r.tracks.length) {
+      const trackList = r.tracks.map(t => `${t.kind}${t.srclang ? " (" + t.srclang + ")" : ""}${t.label ? ": " + t.label : ""}`).join(", ");
+      addIf("Tracks", trackList);
+    }
+  }
+  if (r.kind === "audio") {
+    addIf("Transcript nearby", formatBool(r.has_transcript));
+    addIf("Controls", formatBool(r.has_controls));
+    addIf("Autoplay", formatBool(r.autoplay));
+    if (r.duration_seconds) addIf("Duration (s)", r.duration_seconds);
+  }
+  if (r.kind === "iframe-video") {
+    addIf("Vendor", r.vendor_label);
+    addIf("Title attribute", r.title_attr);
+    addIf("aria-label", r.aria_label);
+  }
+  box.appendChild(grid);
+
+  // Findings — one card per rule id that was raised on this item.
+  const issues = Array.isArray(r.issues) ? r.issues : [];
+  if (issues.length) {
+    box.appendChild(el("h4", { class: "media-findings-title" }, [`Findings (${issues.length})`]));
+    const list = el("div", { class: "media-findings" });
+    for (const id of issues) {
+      const m = ruleMeta(id);
+      list.appendChild(el("div", { class: "media-finding" }, [
+        el("div", { class: "media-finding-head" }, [
+          el("span", { class: `impact-${m.impact} pill` }, [m.impact]),
+          el("span", { class: "media-finding-title" }, [m.title]),
+          el("span", { class: "muted media-finding-wcag" }, [`WCAG ${m.wcag}${m.level && m.level !== "—" ? " (" + m.level + ")" : ""}`])
+        ]),
+        el("div", { class: "media-finding-rule mono muted" }, [id])
+      ]));
+    }
+    box.appendChild(list);
+  } else {
+    box.appendChild(el("p", { class: "muted" }, ["No issues detected — automated checks passed. Note: for linked documents, a manual audit of the file itself is still required."]));
+  }
+
+  if (r.html_snippet) {
+    box.appendChild(el("div", { class: "k" }, ["HTML:"]));
+    box.appendChild(el("pre", { class: "html-snippet" }, [r.html_snippet]));
+  }
+
+  return box;
+}
+
+function formatBool(v) {
+  if (v === true || v === "true") return "Yes";
+  if (v === false || v === "false") return "No";
+  if (v === "" || v == null) return "—";
+  return String(v);
 }

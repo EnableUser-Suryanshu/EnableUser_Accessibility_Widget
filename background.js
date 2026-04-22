@@ -10,11 +10,13 @@ import {
 } from "./lib/request-queue.js";
 import {
   discoverSeedsFromOrigin,
-  discoverHreflang,
+  discoverHomepageLinks,
+  discoverFeeds,
+  sampleByPathBucket,
   navSurfacedCollect
 } from "./lib/discovery.js";
 import { buildScopeDocx } from "./lib/docx-writer.js";
-import { buildInventoryXlsx } from "./lib/xlsx-writer.js";
+import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -59,6 +61,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "DOWNLOAD_CSV") sendResponse(await downloadCsv(msg.reportId));
       else if (msg.type === "DOWNLOAD_SCOPE_DOCX") sendResponse(await downloadInventoryFile(msg.inventoryId, "docx"));
       else if (msg.type === "DOWNLOAD_INVENTORY_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "xlsx"));
+      else if (msg.type === "DOWNLOAD_CLUSTERS_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "clusters"));
+      else if (msg.type === "DOWNLOAD_AUDIT_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "audit"));
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (err) {
       console.error("[EU]", err);
@@ -134,46 +138,53 @@ async function scanMulti(tabId, options) {
 
   const queue = new RequestQueue({ scopeUrl: startUrl, maxUrls, maxDepth: crawlDepth, scope: "same-hostname" });
   queue.enqueue(startUrl, { depth: 0, priority: 100, source: "seed" });
+  queue.markSettled(startUrl);
 
   const results = [];
   const depthStats = {};
-  const discoveryStats = { nav: 0, body: 0, sitemap: 0, hreflang: 0, commonPaths: 0 };
+  const discoveryStats = {
+    nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0,
+    sitemapRaw: 0, feedRaw: 0, commonPaths: 0
+  };
 
   queue.next();
   depthStats[0] = 1;
   const startScan = await scanInExistingTab(tabId);
   results.push({ url: startUrl, title: tab.title, depth: 0, source: "seed", ...startScan });
 
-  // Evidence-based discovery only. NO speculative common-path probing —
-  // on SPAs every path returns 200 (server ships the shell, client routes
-  // internally) so probing produces 40 false positives per site. Real pages
-  // come from the sitemap, hreflang alternates, or in-page links.
-  let sitemapUrls = [], hreflangUrls = [];
-  if (seedOrigin) {
-    [sitemapUrls, hreflangUrls] = await Promise.all([
-      discoverSeedsFromOrigin(seedOrigin).catch(() => []),
-      discoverHreflang(startUrl).catch(() => [])
-    ]);
-  }
-  discoveryStats.sitemap = queue.enqueueMany(sitemapUrls, { depth: 1, priority: 3, source: "sitemap" });
-  discoveryStats.hreflang = queue.enqueueMany(hreflangUrls, { depth: 1, priority: 5, source: "hreflang" });
+  // Seed tab may have redirected during the scan. Mark the current URL as
+  // settled so workers dedup against it.
+  try {
+    const liveSeed = await chrome.tabs.get(tabId);
+    if (liveSeed?.url) queue.markSettled(liveSeed.url);
+  } catch {}
 
-  const seedLinks = await collectNavLinks(tabId);
-  const navOnly = seedLinks.filter(l => l.priority >= 10).map(l => l.url);
-  const bodyOnly = seedLinks.filter(l => l.priority < 10).map(l => l.url);
-  discoveryStats.nav = queue.enqueueMany(navOnly, { depth: 1, priority: 8, source: "nav" });
-  discoveryStats.body = queue.enqueueMany(bodyOnly, { depth: 1, priority: 2, source: "body" });
+  await seedDiscovery({
+    tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats
+  });
 
-  console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap} hreflang:${discoveryStats.hreflang} | pending:${queue.pending}`);
+  console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap}/${discoveryStats.sitemapRaw} hreflang:${discoveryStats.hreflang} feed:${discoveryStats.feed}/${discoveryStats.feedRaw} linkRels:${discoveryStats.linkRels} | pending:${queue.pending}`);
 
   const active = new Set();
 
   async function launch(req) {
     try {
       await rateLimiter.wait(req.url);
-      const r = await scanInNewTab(req.url, req.depth < crawlDepth);
-      const { links = [], ...scan } = r;
+      const r = await scanInNewTab(req.url, req.depth < crawlDepth, { queue });
       rateLimiter.reportSuccess(req.url);
+
+      // Settled-URL dedup: tab landed on a URL another worker already scanned.
+      if (r.__skipped === "redirect-to-duplicate") {
+        results.push({
+          url: req.url, depth: req.depth, source: req.source,
+          error: `redirected to already-scanned URL: ${r.settledUrl}`,
+          violations: [], passes: [], incomplete: [], inapplicable: []
+        });
+        depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+        return;
+      }
+
+      const { links = [], ...scan } = r;
       results.push({ url: req.url, depth: req.depth, source: req.source, ...scan });
       depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
       if (req.depth < crawlDepth) {
@@ -245,6 +256,10 @@ async function scanInventory(tabId, options) {
 
   const queue = new RequestQueue({ scopeUrl: startUrl, maxUrls, maxDepth: crawlDepth, scope: "same-hostname" });
   queue.enqueue(startUrl, { depth: 0, priority: 100, source: "seed" });
+  // Mark the seed's URL as settled so workers dedup against it.
+  queue.markSettled(startUrl);
+
+  console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth}`);
 
   const pages = [];
   const depthStats = {};
@@ -263,14 +278,17 @@ async function scanInventory(tabId, options) {
     try { screenshot = await captureFullPageScreenshot(tabId); }
     catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
     const tmpl = auditPayload?.template || {};
-    // content-signals.js returns `url: location.href` — strip that out before
-    // spreading so it can't override the canonical queued URL. Keep it as
-    // `finalUrl` for the audit trail (useful when the page client-side
-    // redirects, adds a trailing slash, or drops query params post-load).
-    // Also pull `canonicalUrl` (from <link rel="canonical">) out as a
-    // top-level dedup hint — many sites serve multiple URL variants that
-    // self-declare the same canonical copy.
+    // content-signals.js returns `url: location.href` AND `canonicalUrl`
+    // (from <link rel="canonical">) — strip both out before spreading so
+    // they can't override the top-level fields. finalUrl keeps the settled
+    // URL (post client-side redirect/trailing slash normalisation);
+    // canonicalUrl is the site's self-declared authoritative URL for this
+    // page. Both feed into the user-journey dedup key in buildInventory.
     const { url: seedFinalUrl, canonicalUrl: seedCanonical, ...seedSignals } = signals || {};
+    // If the seed tab redirected during scan (e.g. the user clicked the
+    // extension before a JS-based disclosure gate fired), seedFinalUrl is
+    // the post-redirect URL. Mark it so workers dedup against it.
+    if (seedFinalUrl) queue.markSettled(seedFinalUrl);
     pages.push({
       url: startUrl,
       finalUrl: seedFinalUrl || startUrl,
@@ -296,37 +314,51 @@ async function scanInventory(tabId, options) {
     pages.push({ url: startUrl, depth: 0, source: "seed", error: String(err?.message || err) });
   }
 
-  // Same discovery pipeline as scanMulti: evidence-based only (sitemap +
-  // hreflang + in-page links). No speculative common-path probing — it
-  // fabricates 40 false-positive URLs on every SPA.
-  let sitemapUrls = [], hreflangUrls = [];
-  if (seedOrigin) {
-    [sitemapUrls, hreflangUrls] = await Promise.all([
-      discoverSeedsFromOrigin(seedOrigin).catch(() => []),
-      discoverHreflang(startUrl).catch(() => [])
-    ]);
-  }
-  queue.enqueueMany(sitemapUrls, { depth: 1, priority: 3, source: "sitemap" });
-  queue.enqueueMany(hreflangUrls, { depth: 1, priority: 5, source: "hreflang" });
+  // Same discovery pipeline as scanMulti — seedDiscovery() runs sitemap,
+  // homepage <link rel=…>, RSS/Atom feeds, and in-page nav harvest in
+  // parallel and enqueues them in priority order (nav > canonical/next/prev
+  // > hreflang > feed > sitemap > body) so limited-budget crawls don't get
+  // starved by a 10k-entry sitemap dumped first.
+  await seedDiscovery({
+    tabId, startUrl, seedOrigin, queue, depth: 1,
+    discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 }
+  });
 
-  const seedLinks = await collectNavLinks(tabId);
-  const navOnly = seedLinks.filter(l => l.priority >= 10).map(l => l.url);
-  const bodyOnly = seedLinks.filter(l => l.priority < 10).map(l => l.url);
-  queue.enqueueMany(navOnly, { depth: 1, priority: 8, source: "nav" });
-  queue.enqueueMany(bodyOnly, { depth: 1, priority: 2, source: "body" });
+  console.log(`[EU] post-discovery queue size: ${queue.pending} pending, ${queue.total} total seen`);
 
   const active = new Set();
 
   async function launch(req) {
+    console.log(`[EU] launch: ${req.url} (source=${req.source}, depth=${req.depth})`);
     try {
       await rateLimiter.wait(req.url);
-      const result = await inventoryInNewTab(req.url, req.depth < crawlDepth);
+      const result = await inventoryInNewTab(req.url, req.depth < crawlDepth, { queue });
       rateLimiter.reportSuccess(req.url);
-      // Strip `url` and `canonicalUrl` out of result before spreading.
-      // inventoryInNewTab -> collectContentSignals returns both; if we
-      // let them spread-override, we'd lose our canonical queued URL AND
-      // we'd lose the ability to use the site's self-declared canonical
-      // as a post-crawl dedup hint.
+
+      // Settled-URL dedup: the tab landed on a URL another worker already
+      // scanned (typical of disclosure-gate sites). Record a minimal page
+      // entry noting the redirect and skip further work — no axe run, no
+      // link harvesting, no next-depth enqueue.
+      if (result.__skipped === "redirect-to-duplicate") {
+        pages.push({
+          url: req.url,
+          finalUrl: result.settledUrl || req.url,
+          depth: req.depth, source: req.source,
+          title: result.title || "",
+          error: `redirected to already-scanned URL: ${result.settledUrl}`
+        });
+        depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+        return;
+      }
+
+      // Strip `url` AND `canonicalUrl` out of result before spreading.
+      // inventoryInNewTab -> collectContentSignals returns `url: location.href`
+      // (which, if spread, would overwrite our canonical req.url and cause
+      // two enqueues — e.g. /foo?from=a vs /foo?from=b, both SPAs strip to
+      // /foo on settle — to end up as two rows with identical p.url) and
+      // `canonicalUrl` (the <link rel="canonical"> value, used as the top-
+      // priority dedup key in buildInventory). Keep the post-settle URL as
+      // finalUrl for the audit trail.
       const { links = [], url: finalUrl, canonicalUrl, ...rest } = result;
       pages.push({
         url: req.url,
@@ -427,12 +459,31 @@ async function persistInventory(inventoryId, inventory) {
 // fingerprint, content-type flags, actual component values, and a PNG
 // screenshot blob. This replaces the earlier signals-only path on user
 // direction — inventory mode IS the full audit, not a lightweight preview.
-async function inventoryInNewTab(url, collectNextLinks) {
+async function inventoryInNewTab(url, collectNextLinks, { queue = null } = {}) {
   const tab = await chrome.tabs.create({ url, active: false });
   const tabId = tab.id;
   try {
     await waitForTabComplete(tabId, TAB_TIMEOUT_MS);
     await sleep(SETTLE_MS);
+
+    // Settled-URL dedup — MUST come after SETTLE_MS. waitForTabComplete
+    // resolves on the initial URL's "complete" state, but JavaScript-based
+    // redirects (typical of disclosure-gate / age-gate / session-wall sites)
+    // fire AFTER complete, so we have to give them SETTLE_MS to run. We
+    // also poll briefly once more to catch late redirects.
+    if (queue) {
+      const settledUrl = await waitForUrlSettle(tabId);
+      console.log(`[EU] worker settled: queued=${url}  → settled=${settledUrl}`);
+      if (settledUrl && queue.hasSettled(settledUrl, url)) {
+        console.log(`[EU] dedup skip: ${url} → ${settledUrl} (already scanned)`);
+        return {
+          __skipped: "redirect-to-duplicate",
+          settledUrl,
+          title: ""
+        };
+      }
+      if (settledUrl) queue.markSettled(settledUrl, url);
+    }
 
     // Full audit stack — same code path as scanMulti.
     await injectAxe(tabId);
@@ -567,28 +618,23 @@ function buildInventory(pages, meta) {
   }
 
   // ── User-journey URL dedup ─────────────────────────────────────────
-  // A normal browsing user doesn't care that /foo, /foo/, http://…/foo,
-  // https://…/foo, and /foo?utm=x are technically distinct URLs. From
-  // their perspective that's ONE page. Collapse accordingly, using the
-  // strongest dedup signal available for each record:
+  // Collapses pages that a real human browser-user would consider the
+  // same destination, even if the crawler reached them via different
+  // queued URLs. Priority (highest first):
   //
-  //   1. canonicalUrl — site-declared via <link rel="canonical">. If
-  //      present, it's the author's own "this is the real URL" statement,
-  //      and any other URL carrying the same canonical is an alias.
-  //      Catches AMP pages, print views, tracking-tagged variants, and
-  //      case-insensitive path aliases.
+  //   1. canonicalUrl — site-declared via <link rel="canonical">. If two
+  //      URLs declare the same canonical, they are the same page by the
+  //      site's own claim.
+  //   2. finalUrl — the post-settle URL after client-side redirects /
+  //      server 301/302. Collapses http → https, trailing-slash variants,
+  //      and SPAs that strip tracking params on load (?from=home vs
+  //      ?from=footer both land on /foo).
+  //   3. queued url — the URL the queue actually fetched. Fallback for
+  //      pages whose canonical is absent AND whose finalUrl matches the
+  //      queued url.
   //
-  //   2. finalUrl — the post-redirect URL Chrome actually settled on.
-  //      Catches http→https upgrades, trailing-slash server redirects,
-  //      hostname normalisation (www → non-www or vice versa), and any
-  //      301/302 server-side alias chain.
-  //
-  //   3. p.url — the canonical queued URL. Final fallback for cases
-  //      where the page didn't declare a canonical AND didn't redirect.
-  //
-  // When two pages collapse, we keep the richer one (more audit signal,
-  // screenshot present, more components detected) and fold the other
-  // into alt_discoveries so the audit trail isn't lost.
+  // For each collapse we also record WHY so dedupSummary can explain
+  // itself to the auditor (by_canonical / by_final_url / by_queued_url).
   function scoreRecord(p) {
     if (p.error) return -1;
     let s = 0;
@@ -614,9 +660,7 @@ function buildInventory(pages, meta) {
       continue;
     }
     existing.visits++;
-    // Which dedup signal actually collapsed this record? Useful for
-    // the operator to understand the discovery pipeline (and to spot
-    // sites that over-declare canonicals or have bad redirects).
+    // Attribute the collapse to whichever signal matched.
     if (p.canonicalUrl && p.canonicalUrl === existing.record.canonicalUrl) {
       dedupReason.by_canonical++;
     } else if (p.finalUrl && p.finalUrl === existing.record.finalUrl && p.finalUrl !== p.url) {
@@ -624,6 +668,7 @@ function buildInventory(pages, meta) {
     } else {
       dedupReason.by_queued_url++;
     }
+    // Preserve the alternate discovery context
     existing.alt.push({
       depth: p.depth,
       source: p.source,
@@ -633,6 +678,7 @@ function buildInventory(pages, meta) {
       finalUrl: p.finalUrl,
       canonicalUrl: p.canonicalUrl
     });
+    // If this visit scored higher, promote it and push the previous into alt
     if (scoreRecord(p) > scoreRecord(existing.record)) {
       existing.alt.push({
         depth: existing.record.depth,
@@ -878,9 +924,10 @@ async function downloadInventoryFile(inventoryId, kind) {
       }
     }
     if (!inventory) return { ok: false, error: "Inventory expired" };
-    blob = kind === "docx"
-      ? await buildScopeDocx(inventory)
-      : await buildInventoryXlsx(inventory);
+    if (kind === "docx") blob = await buildScopeDocx(inventory);
+    else if (kind === "clusters") blob = await buildClustersXlsx(inventory);
+    else if (kind === "audit") blob = await buildAuditXlsx(inventory);
+    else blob = await buildInventoryXlsx(inventory);
     // Cache the generated blob on the in-memory entry so a second click
     // doesn't rebuild it. If the entry is missing (storage-recovery path),
     // re-seat it so subsequent clicks on the other deliverable still hit
@@ -897,7 +944,11 @@ async function downloadInventoryFile(inventoryId, kind) {
   const stamp = inventory.meta.generatedAt.replace(/[:.]/g, "-");
   const filename = kind === "docx"
     ? `enableuser-scope-${host}-${stamp}.docx`
-    : `enableuser-inventory-${host}-${stamp}.xlsx`;
+    : kind === "clusters"
+      ? `enableuser-clusters-${host}-${stamp}.xlsx`
+      : kind === "audit"
+        ? `enableuser-audit-${host}-${stamp}.xlsx`
+        : `enableuser-inventory-${host}-${stamp}.xlsx`;
   await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
   return { ok: true };
 }
@@ -933,11 +984,97 @@ async function scanInExistingTab(tabId) {
   return runContentScan(tabId);
 }
 
-async function scanInNewTab(url, collectNextLinks = false) {
+// ─────────────────────────────────────────────────────────────────────────
+// seedDiscovery — runs every discovery source in parallel then enqueues
+// candidates in strict priority order so a single noisy source (typically
+// sitemap with thousands of entries) can't starve higher-value sources
+// (nav, hreflang, rel=next/prev) when maxUrls is tight.
+//
+// Priority ladder (higher = enqueued first):
+//   nav         8   ← from the rendered seed page, navSurfacedCollect
+//   linkRel     7   ← <link rel="canonical"|"next"|"prev">
+//   hreflang    5   ← locale alternates
+//   feed        4   ← RSS / Atom / JSON feed entry URLs
+//   sitemap     3   ← bucket-sampled across path prefixes when > budget
+//   body        2   ← non-nav in-page links (blog thumbnails, card links)
+//
+// Sitemap URLs are bucket-sampled by first path segment so every section
+// of the site gets representation rather than exhausting /news/ while
+// /schemes/ and /contact/ never appear.
+// ─────────────────────────────────────────────────────────────────────────
+async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats }) {
+  // Run all out-of-band discovery + nav-harvest in parallel. navSurfacedCollect
+  // is the slow one (scroll + click-reveal, up to 45s) but it's on a
+  // different resource (tab scripting) from the HTTP fetches, so it doesn't
+  // contend. Failures are tolerated per source — a 404 sitemap shouldn't
+  // kill feed discovery.
+  const [sitemapUrls, homepageLinks, navLinks] = await Promise.all([
+    seedOrigin ? discoverSeedsFromOrigin(seedOrigin).catch(() => []) : Promise.resolve([]),
+    seedOrigin ? discoverHomepageLinks(startUrl).catch(() => ({ hreflang: [], canonical: null, nextPrev: [], feeds: [] })) : Promise.resolve({ hreflang: [], canonical: null, nextPrev: [], feeds: [] }),
+    collectNavLinks(tabId).catch(() => [])
+  ]);
+
+  // Feed discovery depends on the homepage autodiscovery links, so it runs
+  // after the first batch completes. Still cheap — only fires the HTTP
+  // probes if we have an origin, and parseFeedEntries bails fast on HTML.
+  const feedUrls = seedOrigin
+    ? await discoverFeeds(seedOrigin, homepageLinks.feeds || []).catch(() => [])
+    : [];
+
+  const linkRelUrls = [];
+  if (homepageLinks.canonical && homepageLinks.canonical !== startUrl) linkRelUrls.push(homepageLinks.canonical);
+  for (const u of homepageLinks.nextPrev || []) linkRelUrls.push(u);
+
+  const navOnly  = navLinks.filter(l => l.priority >= 10).map(l => l.url);
+  const bodyOnly = navLinks.filter(l => l.priority <  10).map(l => l.url);
+
+  // Enqueue in strict priority order. Each enqueueMany() stops adding once
+  // the seen-set fills (queue.enqueue returns false past maxUrls), so the
+  // first-in wins behaviour correctly biases the crawl.
+  discoveryStats.nav      = queue.enqueueMany(navOnly,           { depth, priority: 8, source: "nav" });
+  discoveryStats.linkRels = queue.enqueueMany(linkRelUrls,       { depth, priority: 7, source: "linkRel" });
+  discoveryStats.hreflang = queue.enqueueMany(homepageLinks.hreflang || [], { depth, priority: 5, source: "hreflang" });
+
+  // Compute remaining budget for the noisy sources (feed + sitemap). We
+  // split the remaining slots roughly 30% to feeds (typically fresh /
+  // chronological) and 70% to sitemap (typically complete site index),
+  // with bucket-sampling on the sitemap so sections aren't starved.
+  const remainingAfterHighPrio = Math.max(0, queue.maxUrls - queue.total);
+  const feedBudget    = Math.min(feedUrls.length, Math.ceil(remainingAfterHighPrio * 0.3));
+  const sitemapBudget = Math.max(0, remainingAfterHighPrio - feedBudget);
+
+  discoveryStats.feedRaw = feedUrls.length;
+  discoveryStats.feed = queue.enqueueMany(feedUrls.slice(0, Math.max(feedBudget, 0)), {
+    depth, priority: 4, source: "feed"
+  });
+
+  discoveryStats.sitemapRaw = sitemapUrls.length;
+  const sitemapSample = sampleByPathBucket(sitemapUrls, Math.max(sitemapBudget, 0));
+  discoveryStats.sitemap = queue.enqueueMany(sitemapSample, { depth, priority: 3, source: "sitemap" });
+
+  // Body-links fill whatever's left. These are low-signal but often the
+  // only way to reach deep-linked detail pages on sites without sitemaps
+  // (e.g. many SPAs that never wrote a sitemap.xml).
+  discoveryStats.body = queue.enqueueMany(bodyOnly, { depth, priority: 2, source: "body" });
+}
+
+async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}) {
   const tab = await chrome.tabs.create({ url, active: false });
   try {
     await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
     await sleep(SETTLE_MS);
+
+    // Settled-URL dedup (post-SETTLE_MS so JS redirects have fired).
+    if (queue) {
+      const settledUrl = await waitForUrlSettle(tab.id);
+      console.log(`[EU] worker settled: queued=${url}  → settled=${settledUrl}`);
+      if (settledUrl && queue.hasSettled(settledUrl, url)) {
+        console.log(`[EU] dedup skip: ${url} → ${settledUrl} (already scanned)`);
+        return { __skipped: "redirect-to-duplicate", settledUrl, title: "" };
+      }
+      if (settledUrl) queue.markSettled(settledUrl, url);
+    }
+
     await injectAxe(tab.id);
     const r = await runContentScan(tab.id);
     if (collectNextLinks) {
@@ -957,11 +1094,12 @@ async function scanInNewTab(url, collectNextLinks = false) {
 
 async function injectAxe(tabId) {
   // Inject axe-core + our custom check bundles together. They attach to
-  // window.EU_IndiaChecks / window.EU_GIGWChecks so the content-script can
-  // merge their output into the axe results.
+  // window.EU_IndiaChecks / window.EU_GIGWChecks / window.EU_MediaChecks so
+  // the content-script can merge their output into the axe results + the
+  // media inventory payload.
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: false },
-    files: ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js"],
+    files: ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js"],
     world: "ISOLATED"
   });
 }
@@ -1133,6 +1271,12 @@ function buildReport(pages, meta) {
   const inapplicableRows = [];
   const checkRows = [];   // one row per {node × check-slot × check} — the deepest detail
   const envRows = [];     // per-page axe test engine / environment / toolOptions
+  const mediaRows = [];   // one row per media / document item detected across the corpus
+  const mediaSummary = {
+    videos: 0, audios: 0, iframeVideos: 0, documents: 0,
+    pdf: 0, spreadsheet: 0, document: 0, presentation: 0,
+    videoIssues: 0, audioIssues: 0, iframeIssues: 0, documentIssues: 0
+  };
 
   const criterionStats = new Map();
   for (const c of ALL_AA_CRITERIA) {
@@ -1287,6 +1431,63 @@ function buildReport(pages, meta) {
         if (st && !p.error) st.pagesPassed.add(pageUrl);
       }
     }
+
+    // Media & document inventory — one flat row per item. Keeps the per-item
+    // issue list (as emitted by media-checks.js) so the renderer can group
+    // findings under the item and the CSV can expose them as a pipe list.
+    const mi = p.mediaInventory;
+    if (mi && typeof mi === "object") {
+      const pushItem = (kindKey, it, extras) => {
+        mediaSummary[kindKey]++;
+        mediaSummary[`${kindKey === "iframeVideos" ? "iframe" : kindKey === "videos" ? "video" : kindKey === "audios" ? "audio" : "document"}Issues`] += (it.issues || []).length;
+        mediaRows.push({
+          url: pageUrl,
+          page_title: p.title || "",
+          kind: extras.kind,
+          subtype: it.subtype || "",
+          type_label: extras.typeLabel,
+          family: it.family || "",
+          media_url: it.url || "",
+          accessible_name: it.accessibleName || "",
+          link_text: it.linkText || "",
+          context: it.context || "",
+          selector: it.selector || "",
+          has_captions: it.hasCaptions ?? "",
+          has_descriptions: it.hasDescriptions ?? "",
+          has_controls: it.hasControls ?? "",
+          autoplay: it.autoplay ?? "",
+          muted: it.muted ?? "",
+          has_transcript: it.hasTranscript ?? "",
+          has_type_hint: it.hasTypeHint ?? "",
+          has_size_hint: it.hasSizeHint ?? "",
+          opens_in_new_tab: it.opensInNewTab ?? "",
+          has_new_tab_notice: it.hasNewTabNotice ?? "",
+          title_attr: it.title || it.titleAttr || "",
+          aria_label: it.ariaLabel || "",
+          duration_seconds: it.durationSeconds ?? "",
+          vendor_label: it.vendorLabel || "",
+          tracks: it.tracks || [],
+          issues: it.issues || [],
+          issue_count: (it.issues || []).length,
+          html_snippet: it.html || ""
+        });
+      };
+      for (const v of mi.videos || []) {
+        pushItem("videos", v, { kind: "video", typeLabel: "HTML5 Video" });
+      }
+      for (const a of mi.audios || []) {
+        pushItem("audios", a, { kind: "audio", typeLabel: "HTML5 Audio" });
+      }
+      for (const f of mi.iframeVideos || []) {
+        pushItem("iframeVideos", f, { kind: "iframe-video", typeLabel: f.vendorLabel || "Embedded Video" });
+      }
+      for (const d of mi.documents || []) {
+        pushItem("documents", d, { kind: "document", typeLabel: d.typeLabel || d.subtype || "Document" });
+        // Per-family rollup count so the summary tile can show "12 PDFs, 3 Excels".
+        const fam = d.family || "document";
+        if (mediaSummary[fam] != null) mediaSummary[fam]++;
+      }
+    }
   }
 
   const summaryRows = ALL_AA_CRITERIA.map(c => {
@@ -1439,6 +1640,8 @@ function buildReport(pages, meta) {
     pagesRows,
     templatesRows,
     profilesRows,
+    mediaRows,
+    mediaSummary,
     pages
   };
 }
@@ -1533,6 +1736,17 @@ async function downloadCsv(reportId) {
   ];
   const envCsv = toCsv(envCols, report.envRows);
 
+  const mediaCols = [
+    "url", "page_title", "kind", "subtype", "type_label", "family",
+    "media_url", "accessible_name", "link_text", "context",
+    "has_captions", "has_descriptions", "has_controls", "autoplay", "muted",
+    "has_transcript", "has_type_hint", "has_size_hint",
+    "opens_in_new_tab", "has_new_tab_notice",
+    "title_attr", "aria_label", "duration_seconds", "vendor_label",
+    "tracks", "issues", "issue_count", "selector", "html_snippet"
+  ];
+  const mediaCsv = toCsv(mediaCols, flatten(report.mediaRows || [], mediaCols));
+
   const combined =
     `# EnableUser Accessibility Report\r\n` +
     `# Generated: ${report.meta.generatedAt}\r\n` +
@@ -1541,7 +1755,7 @@ async function downloadCsv(reportId) {
     `# Pages scanned: ${report.meta.totalPages}\r\n` +
     `# Templates detected: ${report.meta.totalTemplates ?? 0}\r\n` +
     (report.meta.discoveryStats
-      ? `# Discovery: nav=${report.meta.discoveryStats.nav} body=${report.meta.discoveryStats.body} sitemap=${report.meta.discoveryStats.sitemap} hreflang=${report.meta.discoveryStats.hreflang} paths=${report.meta.discoveryStats.commonPaths}\r\n`
+      ? `# Discovery: nav=${report.meta.discoveryStats.nav} linkRels=${report.meta.discoveryStats.linkRels ?? 0} hreflang=${report.meta.discoveryStats.hreflang} feed=${report.meta.discoveryStats.feed ?? 0}/${report.meta.discoveryStats.feedRaw ?? 0} sitemap=${report.meta.discoveryStats.sitemap}/${report.meta.discoveryStats.sitemapRaw ?? 0} body=${report.meta.discoveryStats.body}\r\n`
       : ``) +
     `\r\n## WCAG 2.1 AA Summary\r\n` + summaryCsv +
     `\r\n\r\n## Conformance by Standard (WCAG / IS 17802 / GIGW / EN 301 549 / Section 508 / ADA)\r\n` + profilesCsv +
@@ -1552,6 +1766,7 @@ async function downloadCsv(reportId) {
     `\r\n\r\n## Inapplicable (one row per rule)\r\n` + inapplicableCsv +
     `\r\n\r\n## Check Details (one row per any/all/none check per node, all categories)\r\n` + checksCsv +
     `\r\n\r\n## Pages\r\n` + pagesCsv +
+    `\r\n\r\n## Media & Documents (one row per video / audio / embedded player / linked document)\r\n` + mediaCsv +
     `\r\n\r\n## Scan Environment (one row per page — axe engine + window + UA)\r\n` + envCsv;
 
   const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(combined);
@@ -1570,6 +1785,25 @@ function safeHost(u) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function safeOrigin(u) { try { return new URL(u).origin; } catch { return null; } }
+
+// Poll chrome.tabs.get() until the tab's URL has been stable for two
+// consecutive reads. Callers use this AFTER waitForTabComplete + SETTLE_MS,
+// to catch late JavaScript-based redirects (e.g. disclosure gates that
+// check a session cookie client-side and navigate via `location.href`).
+// Returns the stable URL, or null if the tab went away.
+async function waitForUrlSettle(tabId, { maxMs = 2000, pollMs = 250 } = {}) {
+  let last;
+  try { last = (await chrome.tabs.get(tabId))?.url || null; } catch { return null; }
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    await sleep(pollMs);
+    let cur;
+    try { cur = (await chrome.tabs.get(tabId))?.url || null; } catch { return last; }
+    if (cur === last) return cur;
+    last = cur;
+  }
+  return last;
+}
 
 function waitForTabComplete(tabId, timeoutMs) {
   return new Promise((resolve, reject) => {
