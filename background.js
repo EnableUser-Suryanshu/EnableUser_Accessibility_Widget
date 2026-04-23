@@ -1299,11 +1299,48 @@ async function injectAxe(tabId) {
   // window.EU_IndiaChecks / window.EU_GIGWChecks / window.EU_MediaChecks so
   // the content-script can merge their output into the axe results + the
   // media inventory payload.
-  await chrome.scripting.executeScript({
-    target: { tabId, allFrames: false },
-    files: ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js"],
-    world: "ISOLATED"
-  });
+  //
+  // Retry wrapper around executeScript. MV3 raises
+  //   "Couldn't load preload assets: [object ProgressEvent]"
+  // when the internal preload fetch races a tab state change — common when
+  // the site redirects every URL to the same landing page (disclosure gate,
+  // consent wall, login wall) so 50 concurrent workers settle on the same
+  // URL at the same instant, OR when the SW is under eviction pressure,
+  // OR when the tab is in back/forward cache. It's a transient that almost
+  // always clears with a short pause and a retry. Final failure is re-thrown
+  // so the caller can record an error row rather than silently losing the
+  // page.
+  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js"];
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        files,
+        world: "ISOLATED"
+      });
+      return;
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || err || "");
+      // Preload / frame-removed / tab-closed — retry. Permission errors
+      // (chrome://, restricted URLs) are terminal, skip retry.
+      const transient =
+        /preload assets|frame was removed|No tab with id|Cannot access contents|target is no longer in the tab/i.test(msg);
+      const terminal =
+        /Cannot access a chrome:\/\/|Cannot access contents of url "chrome/i.test(msg);
+      if (terminal || !transient || attempt === 2) throw err;
+      // Wait for tab to stabilise. First retry ~120ms, second ~360ms.
+      await sleep(120 * Math.pow(3, attempt));
+      // Bail if the tab is gone.
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        throw lastErr;
+      }
+    }
+  }
+  throw lastErr;
 }
 
 // Inventory mode: no axe — just content-signals. Runs in the same isolated
