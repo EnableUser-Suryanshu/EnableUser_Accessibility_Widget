@@ -1126,7 +1126,7 @@ function buildInventory(pages, meta) {
     // Paste-mode: every page goes to realPagesRaw. No shell sidelining.
     for (const p of pages) realPagesRaw.push(p);
   } else {
-    // v0.2.3 — shell detection runs in two passes:
+    // v0.2.5 — shell detection runs in two passes:
     //
     //   Pass A (seed-shell): any non-seed page whose (template_id,
     //   text_hash) matches the seed's is a soft-404 to the home route.
@@ -1135,17 +1135,23 @@ function buildInventory(pages, meta) {
     //   doesn't have a matching route.
     //
     //   Pass B (cluster-shell): group non-seed non-error pages by
-    //   (template_id, text_hash). Any cluster of ≥2 pages sharing the
-    //   same structural fingerprint AND the same text hash is almost
-    //   certainly rendering the identical error page. Canonical example:
+    //   (template_id, text_hash). A cluster is treated as a phantom
+    //   (identical-shell-cluster) ONLY IF it has ≥2 distinct URL PATHS
+    //   (ignoring query string + fragment). Canonical phantom example:
     //   Metronic / admin-template sites where the sidebar has dozens of
     //   demo links (/crafted/*, /apps/chat/*, /error/*) that all 404 in
-    //   production to the same "page not found" template. The (fp, text)
-    //   key cannot collapse legitimate template clusters because real
-    //   template pages have DIFFERENT text_hash values (their content
-    //   differs), so they end up in separate clusters of 1 and stay in
-    //   realPagesRaw. Only pages that render the literal identical DOM
-    //   AND identical text collapse here.
+    //   production to the same "page not found" template — those have
+    //   different paths, so they collapse. But a blog listing page
+    //   (/blog, /blog?tag=insights, /blog?tag=newsletters) that all
+    //   render the same pre-filter DOM shares ONE path and is a
+    //   legitimate filter-variant pattern — those stay in realPagesRaw.
+    //   The (fp, text) key cannot collapse legitimate template clusters
+    //   because real template pages have DIFFERENT text_hash values
+    //   (their content differs), so they end up in separate clusters of
+    //   1 and stay in realPagesRaw.
+    const pathOf = (url) => {
+      try { return new URL(url).pathname || "/"; } catch { return url || ""; }
+    };
     const groups = new Map(); // `${fp}::${textHash}` → [page, …]
     for (const p of pages) {
       if (p.error) { realPagesRaw.push(p); continue; }
@@ -1162,12 +1168,19 @@ function buildInventory(pages, meta) {
       const matchesSeed =
         seedFp && sample.template_id === seedFp &&
         seedTextHash && sample.text_hash === seedTextHash;
-      const isPhantomCluster = group.length >= 2;
+      // Distinct URL paths in the cluster (ignoring ?query and #frag).
+      // Filter-variant pattern (same path, different query) is NOT a
+      // phantom — it's legitimate filter views of one real page.
+      const distinctPaths = new Set(group.map(p => pathOf(p.url)));
+      const isPhantomCluster = group.length >= 2 && distinctPaths.size >= 2;
       if (matchesSeed) {
         for (const p of group) { p.isShell = true; p.shellReason = "matches-seed-shell"; shellPages.push(p); }
       } else if (isPhantomCluster) {
         for (const p of group) { p.isShell = true; p.shellReason = "identical-shell-cluster"; shellPages.push(p); }
       } else {
+        // Either a solo cluster (normal page) or a same-path filter-variant
+        // cluster (/foo, /foo?tag=x, /foo?tag=y). Keep all in realPagesRaw
+        // — URL dedup downstream can collapse query-variants if desired.
         for (const p of group) realPagesRaw.push(p);
       }
     }
