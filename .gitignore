@@ -1,0 +1,4 @@
+node_modules/
+lib/axe.min.js
+*.log
+.DS_Store

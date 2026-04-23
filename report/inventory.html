@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Inventory — Scope Document</title>
+    <link rel="stylesheet" href="report.css" />
+  </head>
+  <body>
+    <header>
+      <div class="wrap">
+        <h1>EnableUser — Scope & Inventory</h1>
+        <p class="meta" id="meta"></p>
+        <div class="actions">
+          <button id="btn-download-docx" class="primary">Download Scope (.docx)</button>
+          <button id="btn-download-xlsx">Download Inventory (.xlsx)</button>
+          <button id="btn-download-html">Download Standalone HTML</button>
+          <button id="btn-download-shots-zip">Download Screenshots (ZIP)</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <div class="tabs" role="tablist" aria-label="Report sections">
+        <button type="button" role="tab" id="tab-btn-summary" aria-selected="true" aria-controls="tabpanel-summary" class="tab active">Summary</button>
+        <button type="button" role="tab" id="tab-btn-templates" aria-selected="false" aria-controls="tabpanel-templates" tabindex="-1" class="tab">Templates</button>
+        <button type="button" role="tab" id="tab-btn-findings" aria-selected="false" aria-controls="tabpanel-findings" tabindex="-1" class="tab">Findings</button>
+        <button type="button" role="tab" id="tab-btn-screenshots" aria-selected="false" aria-controls="tabpanel-screenshots" tabindex="-1" class="tab">Screenshots</button>
+      </div>
+
+      <div role="tabpanel" id="tabpanel-summary" aria-labelledby="tab-btn-summary" class="tabpanel">
+        <section>
+          <h2>Crawl Summary</h2>
+          <div class="stats" id="stats"></div>
+        </section>
+
+        <section>
+          <h2>Audit Totals</h2>
+          <p class="hint">Aggregated across all crawled pages — axe-core + IS 17802 + GIGW 3.0 custom checks.</p>
+          <div class="stats" id="audit-stats"></div>
+        </section>
+
+        <section>
+          <h2>Content Types Detected</h2>
+          <p class="hint">What kind of manual testing each template will need is derived from this table. "Pages" = how many crawled URLs contain the content type.</p>
+          <table id="content-types-table">
+            <thead><tr><th>Content Type</th><th>Pages</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section id="shell-section" hidden>
+          <h2>Shell / Soft-404 Pages</h2>
+          <p class="hint" id="shell-hint"></p>
+          <ul id="shell-list"></ul>
+        </section>
+
+        <section>
+          <h2>All Pages</h2>
+          <p class="hint">Full inventory. Click a row to expand element counts, actual component values (form fields, modal titles, tab labels, menu items), audit findings, and the full-page screenshot.</p>
+          <table id="pages-table">
+            <thead>
+              <tr>
+                <th>URL</th><th>Template</th><th>Type</th>
+                <th>Depth</th><th>Source</th>
+                <th>Violations</th><th>Incomplete</th>
+                <th>Forms</th><th>Tables</th><th>Modals</th>
+                <th>Carousels</th><th>PDFs</th><th>Login</th><th>Shot</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="tabpanel-templates" aria-labelledby="tab-btn-templates" class="tabpanel" hidden>
+        <section>
+          <div class="section-head">
+            <h2>Templates</h2>
+            <button id="btn-download-clusters" class="section-action" type="button">Download Clusters (.xlsx)</button>
+          </div>
+          <p class="hint">Pages sharing the same DOM fingerprint. A single template may span multiple URL paths — the "URL Cluster" column shows the primary one plus the count of additional clusters rolled into the same template. The "Download Clusters" button above exports one sheet per URL cluster, with a summary sheet at the front.</p>
+          <table id="templates-table">
+            <thead>
+              <tr>
+                <th>Template ID</th><th>URL Cluster</th><th>Pages</th>
+                <th>Sample URL</th><th>Content Signals</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>Proposed Audit Sample</h2>
+          <p class="hint">One URL per template + critical-path pages. This is what we recommend auditing in full. Edit in the .xlsx if needed.</p>
+          <table id="sample-table">
+            <thead>
+              <tr><th>#</th><th>URL</th><th>Template</th><th>Reason</th><th>Manual Tests</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="tabpanel-findings" aria-labelledby="tab-btn-findings" class="tabpanel" hidden>
+        <section>
+          <div class="section-head">
+            <div class="section-head-left">
+              <h2>Findings</h2>
+              <span class="muted" id="findings-count" aria-live="polite"></span>
+            </div>
+            <button id="btn-download-audit" class="section-action" type="button">Download Audit Report</button>
+          </div>
+          <p class="hint">Every violation instance across every crawled page. Grouped by page URL. Use the filter bar to narrow by impact, rule, or free-text search.</p>
+
+          <div class="findings-filter" role="group" aria-label="Filter findings">
+            <label class="filter-search">
+              <span class="sr-only">Search findings</span>
+              <input type="search" id="findings-search" placeholder="Search rule, target, failure summary…" autocomplete="off" />
+            </label>
+            <div class="filter-chips" role="group" aria-label="Filter by impact">
+              <label class="chip"><input type="checkbox" class="impact-filter" value="critical" checked /> Critical</label>
+              <label class="chip"><input type="checkbox" class="impact-filter" value="serious" checked /> Serious</label>
+              <label class="chip"><input type="checkbox" class="impact-filter" value="moderate" checked /> Moderate</label>
+              <label class="chip"><input type="checkbox" class="impact-filter" value="minor" checked /> Minor</label>
+            </div>
+          </div>
+
+          <div id="findings-list"></div>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="tabpanel-screenshots" aria-labelledby="tab-btn-screenshots" class="tabpanel" hidden>
+        <section>
+          <div class="section-head">
+            <h2>Screenshots</h2>
+            <span class="muted" id="screenshots-count" aria-live="polite"></span>
+          </div>
+          <p class="hint">Full-page screenshots captured during the crawl. Click a thumbnail to expand. Screenshots also appear inline inside the Templates tab's expanded rows.</p>
+
+          <div class="findings-filter" role="group" aria-label="Filter screenshots">
+            <label class="filter-search">
+              <span class="sr-only">Search screenshots</span>
+              <input type="search" id="screenshots-search" placeholder="Search by URL or title…" autocomplete="off" />
+            </label>
+          </div>
+
+          <div class="screenshots-grid" id="screenshots-grid"></div>
+        </section>
+      </div>
+    </main>
+
+    <script type="module" src="inventory.js"></script>
+  </body>
+</html>
