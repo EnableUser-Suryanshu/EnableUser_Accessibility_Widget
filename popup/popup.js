@@ -2,6 +2,8 @@ const $ = (id) => document.getElementById(id);
 const btnCurrent = $("btn-scan-current");
 const btnMulti = $("btn-scan-multi");
 const btnInventory = $("btn-scan-inventory");
+const btnList = $("btn-scan-list");
+const urlListInput = $("opt-url-list");
 const statusEl = $("status");
 const maxUrlsInput = $("opt-max-urls");
 const depthInput = $("opt-depth");
@@ -84,6 +86,7 @@ function setBusy(busy) {
   btnCurrent.disabled = busy;
   btnMulti.disabled = busy;
   if (btnInventory) btnInventory.disabled = busy;
+  if (btnList) btnList.disabled = busy;
 }
 
 function send(msg) {
@@ -160,5 +163,62 @@ btnInventory?.addEventListener("click", async () => {
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scope failed.", true); return; }
   setStatus("Scope document opening…");
+  window.close();
+});
+
+// ── Template Check (paste URL list) ──────────────────────────────────────
+// No discovery, no link following, no filter. The operator pastes URLs;
+// we visit each, compute the template fingerprint, and render every URL
+// as its own row in the inventory (with template clustering shown
+// separately). Host permission is requested per-origin across the entire
+// pasted list so a single prompt covers every domain in one go.
+btnList?.addEventListener("click", async () => {
+  setStatus(null);
+  const raw = (urlListInput?.value || "").trim();
+  if (!raw) {
+    setStatus("Paste at least one URL into the list box.", true);
+    return;
+  }
+  // Parse locally so we can (a) build the permission origin set and
+  // (b) surface parse errors before spinning up a scan.
+  const lines = raw.split(/\r?\n/);
+  const urls = [];
+  const origins = new Set();
+  for (const line of lines) {
+    const s = String(line || "").trim();
+    if (!s || s.startsWith("#")) continue;
+    let parsed = null;
+    try { parsed = new URL(s); } catch {}
+    if (!parsed && !/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+      try { parsed = new URL(`https://${s}`); } catch {}
+    }
+    if (!parsed) continue; // background will emit it as an error row
+    if (!/^https?:$/.test(parsed.protocol)) continue;
+    urls.push(parsed.href);
+    origins.add(parsed.origin);
+  }
+  if (urls.length === 0) {
+    setStatus("No valid http(s) URLs found in the list.", true);
+    return;
+  }
+
+  // Batch all origins into one permission request to minimize prompts.
+  const wantOrigins = [...origins].map(o => `${o}/*`);
+  const hasAll = await chrome.permissions.contains({ origins: wantOrigins }).catch(() => false);
+  if (!hasAll) {
+    const granted = await chrome.permissions.request({ origins: wantOrigins }).catch(() => false);
+    if (!granted) { setStatus("Permission denied for one or more origins in the list.", true); return; }
+  }
+
+  const opts = readScanOptions();
+  setBusy(true);
+  setStatus(`Template check — scanning ${urls.length} URL${urls.length === 1 ? "" : "s"} (${opts.profile}). Axe + screenshot + fingerprint per URL.`);
+  const res = await send({
+    type: "SCAN_LIST",
+    options: { urls, profile: opts.profile }
+  });
+  setBusy(false);
+  if (!res?.ok) { setStatus(res?.error || "Template check failed.", true); return; }
+  setStatus("Template report opening…");
   window.close();
 });

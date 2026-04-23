@@ -73,6 +73,22 @@ hr { border: 0; border-top: 1px solid #e5e7eb; margin: 0 22px; }
 }
 .opt.wide { grid-column: 1 / -1; }
 
+.opt textarea {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #111827;
+  background: #fff;
+  width: 100%;
+  resize: vertical;
+}
+.opt textarea:focus {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+  border-color: #2563eb;
+}
+
 .opt input,
 .opt select {
   border: 1px solid #cbd5e1;

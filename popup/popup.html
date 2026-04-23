@@ -62,6 +62,31 @@
         <button id="btn-scan-inventory" class="scan">Scope</button>
       </section>
 
+      <hr />
+
+      <section class="row">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7"></rect>
+            <rect x="14" y="3" width="7" height="7"></rect>
+            <rect x="3" y="14" width="7" height="7"></rect>
+            <rect x="14" y="14" width="7" height="7"></rect>
+          </svg>
+        </div>
+        <div class="text">
+          <div class="title">Template Check (paste URL list)</div>
+          <div class="sub">Skip discovery. Visit each pasted URL, compute its template fingerprint, and cluster the list so you can see which URLs share a shell (uniform) vs. which are distinct (varied). Every pasted URL appears as its own row — no dedup collapse.</div>
+        </div>
+        <button id="btn-scan-list" class="scan">Check</button>
+      </section>
+
+      <section class="options" id="list-options">
+        <label class="opt wide">
+          <span>Paste URLs (one per line — blank lines and #comments ignored)</span>
+          <textarea id="opt-url-list" rows="6" placeholder="https://example.com/team/alice&#10;https://example.com/team/bob&#10;https://example.com/about"></textarea>
+        </label>
+      </section>
+
       <section class="options">
         <label class="opt">
           <span>Max URLs</span>

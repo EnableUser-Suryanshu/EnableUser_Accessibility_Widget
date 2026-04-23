@@ -78,6 +78,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId, msg.options));
       else if (msg.type === "SCAN_MULTI") sendResponse(await scanMulti(msg.tabId, msg.options));
       else if (msg.type === "SCAN_INVENTORY") sendResponse(await scanInventory(msg.tabId, msg.options));
+      else if (msg.type === "SCAN_LIST") sendResponse(await scanList(msg.options));
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
       else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: reports.get(msg.reportId) || null });
@@ -532,6 +533,173 @@ async function persistInventory(inventoryId, inventory) {
   console.log(`[EU] persisted inventory ${inventoryId} + ${seen.size} screenshot(s) to storage.local`);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Template-check mode — the operator pastes a list of URLs. We skip ALL
+// discovery (no sitemap, no nav harvest, no link following), skip the
+// BLOCKED_PATH_PREFIXES filter (the operator pasted these URLs deliberately),
+// skip the settled-URL dedup (every pasted URL is its own row), and run the
+// full audit + content-signals + screenshot on each. The inventory is
+// rendered with noDedup:true so every pasted URL shows up as its own row in
+// the all-pages view. Template clustering is still computed and surfaced in
+// the Templates section so the operator can see which pasted URLs share a
+// shell — the clustering answer is the whole point of this mode.
+//
+// Per-origin concurrency cap (PER_ORIGIN_TABS) still applies: pasting 200
+// URLs from a single host won't slam the server — only 8 tabs per origin
+// are in-flight at once.
+// ─────────────────────────────────────────────────────────────────────────
+async function scanList(options) {
+  // Parse the pasted text into a URL array. We accept either a pre-split
+  // array (msg.options.urls) or a raw blob (msg.options.text) that the
+  // popup didn't bother parsing. Normalization:
+  //   - trim each line
+  //   - drop empty lines and lines starting with "#" (comments)
+  //   - accept anything `new URL(x)` will parse; reject the rest as
+  //     error rows so the operator sees their typo instead of silently
+  //     dropping the entry.
+  let rawLines;
+  if (Array.isArray(options?.urls)) {
+    rawLines = options.urls;
+  } else {
+    rawLines = String(options?.text || "").split(/\r?\n/);
+  }
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+
+  const parsed = [];
+  const seenExact = new Set();
+  const invalidRows = []; // {url, error} records emitted straight to pages
+  for (const raw of rawLines) {
+    const s = String(raw || "").trim();
+    if (!s) continue;
+    if (s.startsWith("#")) continue;
+    // Try as-is. If that fails, try prepending https://.
+    let parsedUrl = null;
+    try { parsedUrl = new URL(s); } catch {}
+    if (!parsedUrl && !/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+      try { parsedUrl = new URL(`https://${s}`); } catch {}
+    }
+    if (!parsedUrl) {
+      invalidRows.push({ url: s, error: "invalid URL — could not parse" });
+      continue;
+    }
+    const href = parsedUrl.href;
+    // Exact-string dedup only. If the operator pasted the same URL twice,
+    // that's almost always a typo; one row is less confusing than two.
+    // We do NOT canonicalize or normalize beyond parse-and-stringify.
+    if (seenExact.has(href)) continue;
+    seenExact.add(href);
+    parsed.push(href);
+  }
+
+  if (parsed.length === 0 && invalidRows.length === 0) {
+    return { ok: false, error: "no URLs provided" };
+  }
+
+  const seedUrl = parsed[0] || "about:blank";
+  const seedHost = safeHost(seedUrl);
+
+  console.log(`[EU] template-check start — ${parsed.length} URLs (+ ${invalidRows.length} invalid)`);
+
+  // Reset progress state so the popup banner renders.
+  await chrome.storage.local.set({
+    "scan-progress": {
+      mode: "template-check",
+      active: true,
+      done: 0,
+      total: parsed.length,
+      currentUrl: seedUrl,
+      startedAt: Date.now(),
+      seedUrl
+    }
+  }).catch(() => {});
+  async function progressUpdate(patch) {
+    try {
+      const got = await chrome.storage.local.get("scan-progress");
+      const prev = got?.["scan-progress"] || {};
+      await chrome.storage.local.set({ "scan-progress": { ...prev, ...patch } });
+    } catch {}
+  }
+
+  const pages = [];
+  // Emit invalid URLs as error rows up front so the operator sees exactly
+  // which of their pasted lines failed parsing.
+  for (const ir of invalidRows) {
+    pages.push({ url: ir.url, depth: 0, source: "pasted", error: ir.error });
+  }
+
+  const active = new Set();
+  const toScan = parsed.slice(); // FIFO; preserves paste order
+
+  async function launch(url) {
+    console.log(`[EU] template-check launch: ${url}`);
+    let acquired = false;
+    try {
+      const token = await rateLimiter.wait(url);
+      acquired = token != null;
+      // queue=null disables the settled-URL dedup branch in inventoryInNewTab.
+      // collectNextLinks=false because we are not following links in this mode.
+      const result = await inventoryInNewTab(url, false, { queue: null });
+      rateLimiter.reportSuccess(url);
+
+      const { links: _links, url: finalUrl, canonicalUrl, ...rest } = result || {};
+      pages.push({
+        url,
+        finalUrl: finalUrl || url,
+        canonicalUrl: canonicalUrl || "",
+        depth: 0, source: "pasted",
+        ...rest
+      });
+    } catch (err) {
+      rateLimiter.reportFailure(url, { status: err?.status || 0 });
+      console.warn(`[EU] template-check failed: ${url}`, err?.message || err);
+      pages.push({ url, depth: 0, source: "pasted", error: String(err?.message || err) });
+    } finally {
+      if (acquired) rateLimiter.release(url);
+    }
+    progressUpdate({ done: pages.length, currentUrl: url });
+  }
+
+  function pump() {
+    while (active.size < CONCURRENT_TABS && toScan.length > 0) {
+      const url = toScan.shift();
+      const p = launch(url).finally(() => active.delete(p));
+      active.add(p);
+    }
+  }
+  pump();
+  while (active.size > 0) { await Promise.race(active); pump(); }
+
+  await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
+
+  // Build the inventory with noDedup:true so every pasted URL renders as its
+  // own row. Template clustering is still computed the same way — the
+  // Templates section will group these rows by template_id so the operator
+  // can see which pasted URLs share a shell (uniform) vs. span multiple
+  // templates (varied).
+  const inventory = buildInventory(pages, {
+    seedUrl,
+    seedHost,
+    maxUrls: parsed.length,
+    crawlDepth: 0,
+    depthStats: { 0: pages.length },
+    profile,
+    mode: "template-check",
+    noDedup: true
+  });
+  const inventoryId = `inv-${Date.now()}`;
+  inventories.set(inventoryId, { inventory, files: {} });
+
+  try { await persistInventory(inventoryId, inventory); }
+  catch (err) { console.warn("[EU] persistInventory failed", err); }
+
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
+  } catch (err) {
+    console.warn("[EU] failed to open inventory tab", err);
+  }
+  return { ok: true, inventoryId, scanned: pages.length };
+}
+
 // Inventory mode per-page worker. Runs the FULL audit stack (axe + india +
 // gigw) + content-signals + full-page screenshot. The result is a complete
 // per-page record: violations/passes/incomplete/inapplicable, template
@@ -677,22 +845,38 @@ function buildInventory(pages, meta) {
   // We keep them in a separate bucket for transparency but exclude from
   // the main pages / templates tables so the inventory reflects real
   // distinct pages.
+  //
+  // meta.noDedup: paste-mode (scanList). The operator handed us the exact
+  // URL set — every pasted URL MUST render as its own row, with no shell
+  // bucketing, no canonical/finalUrl collapse, nothing hidden. Template
+  // clustering is still computed and shown in the Templates section so the
+  // operator can see which pasted URLs share a shell, but every page stays
+  // in the main table. The v6 principle (never hide rows the operator
+  // explicitly asked to see) applies with extra force here because the
+  // operator hand-picked the list.
+  const noDedup = !!meta?.noDedup;
+
   const seedPage = pages.find(p => p.source === "seed" && !p.error) || null;
   const seedFp = seedPage?.template_id || null;
   const seedTextHash = seedPage?.text_hash || null;
   const shellPages = [];
   const realPagesRaw = [];
-  for (const p of pages) {
-    if (p.error) { realPagesRaw.push(p); continue; }
-    if (p === seedPage) { realPagesRaw.push(p); continue; }
-    const isShell =
-      seedFp && p.template_id === seedFp &&
-      seedTextHash && p.text_hash === seedTextHash;
-    if (isShell) {
-      p.isShell = true;
-      shellPages.push(p);
-    } else {
-      realPagesRaw.push(p);
+  if (noDedup) {
+    // Paste-mode: every page goes to realPagesRaw. No shell sidelining.
+    for (const p of pages) realPagesRaw.push(p);
+  } else {
+    for (const p of pages) {
+      if (p.error) { realPagesRaw.push(p); continue; }
+      if (p === seedPage) { realPagesRaw.push(p); continue; }
+      const isShell =
+        seedFp && p.template_id === seedFp &&
+        seedTextHash && p.text_hash === seedTextHash;
+      if (isShell) {
+        p.isShell = true;
+        shellPages.push(p);
+      } else {
+        realPagesRaw.push(p);
+      }
     }
   }
 
@@ -729,55 +913,61 @@ function buildInventory(pages, meta) {
     if (p.error) return `__err_${p.url || Math.random()}`;
     return p.canonicalUrl || p.finalUrl || p.url || `__noid`;
   }
-  const byUrl = new Map();
   const dedupReason = { by_canonical: 0, by_final_url: 0, by_queued_url: 0 };
-  for (const p of realPagesRaw) {
-    const key = dedupKey(p);
-    const existing = byUrl.get(key);
-    if (!existing) {
-      byUrl.set(key, { record: p, alt: [], visits: 1 });
-      continue;
-    }
-    existing.visits++;
-    // Attribute the collapse to whichever signal matched.
-    if (p.canonicalUrl && p.canonicalUrl === existing.record.canonicalUrl) {
-      dedupReason.by_canonical++;
-    } else if (p.finalUrl && p.finalUrl === existing.record.finalUrl && p.finalUrl !== p.url) {
-      dedupReason.by_final_url++;
-    } else {
-      dedupReason.by_queued_url++;
-    }
-    // Preserve the alternate discovery context
-    existing.alt.push({
-      depth: p.depth,
-      source: p.source,
-      template_id: p.template_id,
-      text_hash: p.text_hash,
-      url: p.url,
-      finalUrl: p.finalUrl,
-      canonicalUrl: p.canonicalUrl
-    });
-    // If this visit scored higher, promote it and push the previous into alt
-    if (scoreRecord(p) > scoreRecord(existing.record)) {
+  let realPages;
+  if (noDedup) {
+    // Paste-mode: one row per scanned page, preserving input order.
+    realPages = realPagesRaw.slice();
+  } else {
+    const byUrl = new Map();
+    for (const p of realPagesRaw) {
+      const key = dedupKey(p);
+      const existing = byUrl.get(key);
+      if (!existing) {
+        byUrl.set(key, { record: p, alt: [], visits: 1 });
+        continue;
+      }
+      existing.visits++;
+      // Attribute the collapse to whichever signal matched.
+      if (p.canonicalUrl && p.canonicalUrl === existing.record.canonicalUrl) {
+        dedupReason.by_canonical++;
+      } else if (p.finalUrl && p.finalUrl === existing.record.finalUrl && p.finalUrl !== p.url) {
+        dedupReason.by_final_url++;
+      } else {
+        dedupReason.by_queued_url++;
+      }
+      // Preserve the alternate discovery context
       existing.alt.push({
-        depth: existing.record.depth,
-        source: existing.record.source,
-        template_id: existing.record.template_id,
-        text_hash: existing.record.text_hash,
-        url: existing.record.url,
-        finalUrl: existing.record.finalUrl,
-        canonicalUrl: existing.record.canonicalUrl
+        depth: p.depth,
+        source: p.source,
+        template_id: p.template_id,
+        text_hash: p.text_hash,
+        url: p.url,
+        finalUrl: p.finalUrl,
+        canonicalUrl: p.canonicalUrl
       });
-      existing.record = p;
+      // If this visit scored higher, promote it and push the previous into alt
+      if (scoreRecord(p) > scoreRecord(existing.record)) {
+        existing.alt.push({
+          depth: existing.record.depth,
+          source: existing.record.source,
+          template_id: existing.record.template_id,
+          text_hash: existing.record.text_hash,
+          url: existing.record.url,
+          finalUrl: existing.record.finalUrl,
+          canonicalUrl: existing.record.canonicalUrl
+        });
+        existing.record = p;
+      }
     }
-  }
-  const realPages = [];
-  for (const { record, alt, visits } of byUrl.values()) {
-    if (visits > 1) {
-      record.visit_count = visits;
-      record.alt_discoveries = alt;
+    realPages = [];
+    for (const { record, alt, visits } of byUrl.values()) {
+      if (visits > 1) {
+        record.visit_count = visits;
+        record.alt_discoveries = alt;
+      }
+      realPages.push(record);
     }
-    realPages.push(record);
   }
 
   // Dedup is URL-exact only (canonical → finalUrl → queued URL). See the
