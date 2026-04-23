@@ -108,8 +108,6 @@ function renderStats(inventory) {
     if (d.by_canonical > 0) host.appendChild(stat("… by canonical link", d.by_canonical));
     if (d.by_final_url > 0) host.appendChild(stat("… by settled URL", d.by_final_url));
     if (d.by_queued_url > 0) host.appendChild(stat("… by queued URL", d.by_queued_url));
-    if (d.by_fingerprint > 0) host.appendChild(stat("… by rendered fingerprint", d.by_fingerprint));
-    if (d.by_secondary_shell > 0) host.appendChild(stat("… by shell template match", d.by_secondary_shell));
   }
 }
 

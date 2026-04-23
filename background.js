@@ -744,171 +744,24 @@ function buildInventory(pages, meta) {
     realPages.push(record);
   }
 
-  // ── Fingerprint-based dedup (second pass) ─────────────────────────
-  // After URL dedup, some URL-distinct rows may still be rendering
-  // identical content — e.g. a site that redirects many URLs to the
-  // same landing page, a popup-builder plugin whose "open on these
-  // URLs" config rewrites every configured URL to the same target,
-  // disclosure-gate walls. The URL dedup misses these because each
-  // lands on a different settled URL (the redirected-to URL is
-  // unique per source).
+  // Dedup is URL-exact only (canonical → finalUrl → queued URL). See the
+  // first-pass loop above for the merge logic. Template-based and audit-
+  // signature-based collapses have been removed: two audit-distinct pages
+  // that happen to share a shell (team profiles, portfolio entries, news
+  // posts) are SEPARATE URLs in the inventory, because they are separate
+  // URLs a visitor could reach and land on.
   //
-  // Key: (template_id, text_hash). BOTH must match — same template
-  // alone isn't enough (two blog posts share template but have
-  // different content → different text_hash → not collapsed).
-  //
-  // Winner selection: scoreRecord (more violations/components/
-  // screenshot = richer audit), ties broken by shallower depth
-  // (closer to the homepage = more likely the canonical page the
-  // site intends humans to arrive at).
-  dedupReason.by_fingerprint = 0;
-  const byFp = new Map();
-  const noFp = [];
-  for (const rec of realPages) {
-    const fp = rec.template_id && rec.text_hash
-      ? `${rec.template_id}::${rec.text_hash}`
-      : null;
-    if (!fp) { noFp.push(rec); continue; }
-    const existing = byFp.get(fp);
-    if (!existing) { byFp.set(fp, rec); continue; }
-    // Pick winner
-    const recScore = scoreRecord(rec);
-    const exScore = scoreRecord(existing);
-    const recWins = recScore > exScore ||
-      (recScore === exScore && (rec.depth || 0) < (existing.depth || 0));
-    const winner = recWins ? rec : existing;
-    const loser  = recWins ? existing : rec;
-    const alt = (winner.alt_discoveries || []).slice();
-    alt.push({
-      depth: loser.depth,
-      source: loser.source,
-      template_id: loser.template_id,
-      text_hash: loser.text_hash,
-      url: loser.url,
-      finalUrl: loser.finalUrl,
-      canonicalUrl: loser.canonicalUrl,
-      dedup_reason: "fingerprint"
-    });
-    if (Array.isArray(loser.alt_discoveries)) alt.push(...loser.alt_discoveries);
-    winner.alt_discoveries = alt;
-    winner.visit_count = (winner.visit_count || 1) + (loser.visit_count || 1);
-    byFp.set(fp, winner);
-    dedupReason.by_fingerprint++;
-  }
-  const fpDeduped = [...byFp.values(), ...noFp];
-  const preFpCount = realPages.length;
-  realPages.length = 0;
-  realPages.push(...fpDeduped);
-
-  // ── Secondary-shell dedup (third pass) ────────────────────────────
-  // Fingerprint dedup collapses rows whose (template_id, text_hash)
-  // both match. On some WP themes (notably "The Gem" and related CPT
-  // plugins) the URL slug is injected into the <title> tag and/or the
-  // breadcrumb trail — so two pages with IDENTICAL visible body content
-  // produce text_hashes that differ by exactly those few bytes. The
-  // fingerprint pass then keeps them all as "distinct".
-  //
-  // The symptom in an inventory: 50–100+ rows sharing the same
-  // template_id, where the audit result (violations, incomplete, and
-  // structural element counts) is byte-for-byte identical across every
-  // row. A real content page cannot produce the same axe rule IDs AND
-  // the same counts object AND the same template fingerprint as another
-  // real content page unless they are actually the same shell page —
-  // axe's checks bind to node identity + attributes, so any meaningful
-  // content variance would shift node counts or trip a new rule on
-  // some node somewhere.
-  //
-  // Strategy:
-  //   1. Group by template_id.
-  //   2. Within each template group of size ≥ 3, sub-cluster by
-  //      audit_signature = sort(violation rule IDs) + sort(incomplete
-  //      rule IDs) + sorted non-zero `counts` entries.
-  //   3. Collapse any sub-cluster of size ≥ 3 to one representative
-  //      (shallowest depth wins, ties by higher scoreRecord).
-  //   4. Never touch groups smaller than the thresholds — avoids
-  //      accidentally collapsing pages whose identicality is
-  //      coincidence rather than shell-page leakage.
-  function auditSignature(p) {
-    if (p.error || !p.audit) return null;
-    const vIds = Array.from(new Set((p.audit.violations || []).map(v => v.id))).sort();
-    const iIds = Array.from(new Set((p.audit.incomplete || []).map(v => v.id))).sort();
-    const cPairs = p.counts
-      ? Object.entries(p.counts)
-          .filter(([, v]) => Number(v) > 0)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([k, v]) => `${k}=${v}`)
-      : [];
-    return `v:${vIds.join(",")}::i:${iIds.join(",")}::c:${cPairs.join(",")}`;
-  }
-
-  dedupReason.by_secondary_shell = 0;
-  const byTemplate = new Map();
-  for (const p of realPages) {
-    if (!p.template_id) continue;
-    const arr = byTemplate.get(p.template_id) || [];
-    arr.push(p);
-    byTemplate.set(p.template_id, arr);
-  }
-  const secondaryShellLosers = new Set();
-  for (const [, group] of byTemplate) {
-    if (group.length < 3) continue;
-    const bySig = new Map();
-    for (const p of group) {
-      const sig = auditSignature(p);
-      if (!sig) continue;
-      const arr = bySig.get(sig) || [];
-      arr.push(p);
-      bySig.set(sig, arr);
-    }
-    for (const [, cluster] of bySig) {
-      if (cluster.length < 3) continue;
-      // Winner: shallowest depth; ties broken by higher scoreRecord.
-      cluster.sort((a, b) => {
-        const da = a.depth || 0, db = b.depth || 0;
-        if (da !== db) return da - db;
-        return scoreRecord(b) - scoreRecord(a);
-      });
-      const winner = cluster[0];
-      const alt = (winner.alt_discoveries || []).slice();
-      let extraVisits = 0;
-      for (let i = 1; i < cluster.length; i++) {
-        const loser = cluster[i];
-        secondaryShellLosers.add(loser);
-        alt.push({
-          depth: loser.depth,
-          source: loser.source,
-          template_id: loser.template_id,
-          text_hash: loser.text_hash,
-          url: loser.url,
-          finalUrl: loser.finalUrl,
-          canonicalUrl: loser.canonicalUrl,
-          dedup_reason: "secondary_shell"
-        });
-        if (Array.isArray(loser.alt_discoveries)) alt.push(...loser.alt_discoveries);
-        extraVisits += (loser.visit_count || 1);
-        dedupReason.by_secondary_shell++;
-      }
-      winner.alt_discoveries = alt;
-      winner.visit_count = (winner.visit_count || 1) + extraVisits;
-    }
-  }
-  if (secondaryShellLosers.size > 0) {
-    const survivors = realPages.filter(p => !secondaryShellLosers.has(p));
-    realPages.length = 0;
-    realPages.push(...survivors);
-  }
-
+  // template_id and text_hash are still computed per-record and carried
+  // through — the report renders "template cluster" groupings from them
+  // so an auditor can see which pages share a shell without those pages
+  // being dropped from the inventory.
   const dedupSummary = {
     raw_page_count: realPagesRaw.length,
     unique_urls: realPages.length,
     duplicates_collapsed: realPagesRaw.length - realPages.length,
     by_canonical: dedupReason.by_canonical,
     by_final_url: dedupReason.by_final_url,
-    by_queued_url: dedupReason.by_queued_url,
-    by_fingerprint: dedupReason.by_fingerprint,
-    by_secondary_shell: dedupReason.by_secondary_shell,
-    // Diagnostic: how many fp-collapsed rows had already survived URL dedup.
-    fp_collapsed_after_url_dedup: preFpCount - realPages.length - dedupReason.by_secondary_shell
+    by_queued_url: dedupReason.by_queued_url
   };
 
   // Group by template fingerprint ALONE. Previously the key was
