@@ -1310,7 +1310,22 @@ function buildInventory(pages, meta) {
   }
   function dedupKey(p) {
     if (p.error) return `__err_${p.url || Math.random()}`;
-    return p.canonicalUrl || p.finalUrl || p.url || `__noid`;
+    // v0.2.7 — Anchor the canonical-based key to text_hash. Sites
+    // (especially SPAs) frequently bake ONE <link rel="canonical"> tag
+    // into the HTML shell and never update it as the user navigates, so
+    // every route reports the same canonical. Trusting that tag blindly
+    // collapses legitimate separate pages together — on greysky.capital
+    // this folded the homepage into an unrelated page because they
+    // shared a canonical but had clearly different text. The fix: two
+    // URLs dedup by canonical ONLY when their rendered-text hash also
+    // matches. Same canonical + same text = legitimate duplicate. Same
+    // canonical + different text = misconfigured canonical tag; trust
+    // the content. If text_hash is missing (couldn't compute), fall
+    // back to canonical-only so at least pre-v0.2.7 behaviour is kept.
+    if (p.canonicalUrl) {
+      return p.text_hash ? `${p.canonicalUrl}||${p.text_hash}` : p.canonicalUrl;
+    }
+    return p.finalUrl || p.url || `__noid`;
   }
   const dedupReason = { by_canonical: 0, by_final_url: 0, by_queued_url: 0 };
   let realPages;
@@ -1345,8 +1360,22 @@ function buildInventory(pages, meta) {
         finalUrl: p.finalUrl,
         canonicalUrl: p.canonicalUrl
       });
-      // If this visit scored higher, promote it and push the previous into alt
-      if (scoreRecord(p) > scoreRecord(existing.record)) {
+      // v0.2.7 — Seed protection. The seed URL is the user's entry point;
+      // dropping it in favour of a higher-scoring collision (common when
+      // many SPA routes share one canonical tag) hides the homepage from
+      // the inventory entirely. If either record is the seed, keep the
+      // seed as primary regardless of score — the other URL still lands
+      // in alt_discoveries so nothing is lost.
+      const existingIsSeed = existing.record.source === "seed";
+      const newIsSeed = p.source === "seed";
+      const shouldPromote = newIsSeed
+        ? true
+        : existingIsSeed
+          ? false
+          : scoreRecord(p) > scoreRecord(existing.record);
+      // If this visit scored higher (or is the seed), promote it and
+      // push the previous into alt.
+      if (shouldPromote) {
         existing.alt.push({
           depth: existing.record.depth,
           source: existing.record.source,
