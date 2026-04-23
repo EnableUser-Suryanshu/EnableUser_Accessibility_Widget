@@ -4,6 +4,7 @@
 // download buttons that produce the scope.docx + inventory.xlsx deliverables.
 
 import { deriveFromTags } from "../lib/wcag-tags.js";
+import { createZip } from "../lib/zip-writer.js";
 
 const inventoryId = new URLSearchParams(location.search).get("id");
 
@@ -597,7 +598,7 @@ function renderPages(inventory) {
   });
 }
 
-function wireDownloads() {
+function wireDownloads(inventory) {
   const btnDocx = document.getElementById("btn-download-docx");
   const btnXlsx = document.getElementById("btn-download-xlsx");
 
@@ -620,11 +621,264 @@ function wireDownloads() {
 
   const btnClusters = document.getElementById("btn-download-clusters");
   const btnAudit = document.getElementById("btn-download-audit");
+  const btnHtml = document.getElementById("btn-download-html");
+  const btnShotsZip = document.getElementById("btn-download-shots-zip");
 
   btnDocx?.addEventListener("click", () => download("DOWNLOAD_SCOPE_DOCX", btnDocx));
   btnXlsx?.addEventListener("click", () => download("DOWNLOAD_INVENTORY_XLSX", btnXlsx));
   btnClusters?.addEventListener("click", () => download("DOWNLOAD_CLUSTERS_XLSX", btnClusters));
   btnAudit?.addEventListener("click", () => download("DOWNLOAD_AUDIT_XLSX", btnAudit));
+  btnHtml?.addEventListener("click", () => exportStandaloneHtml(btnHtml, inventory));
+  btnShotsZip?.addEventListener("click", () => exportScreenshotsZip(btnShotsZip, inventory));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Standalone HTML export — produces one self-contained .html file with:
+//   • report.css inlined into a <style> block (so the page renders
+//     identically when opened from Google Drive / SharePoint / disk with
+//     no extension context)
+//   • every screenshot already baked in as a data: URI (no lazy loading,
+//     no storage.local access, no service worker dependency)
+//   • all tabs unhidden and all detail rows pre-expanded (since scripts
+//     are stripped — no JS runs in the exported file, so the interactive
+//     tab switcher wouldn't work)
+//   • all <script> tags removed
+//   • the header's download buttons removed (they can't function outside
+//     the extension)
+// The result is one file the user can drop into Google Drive → Share →
+// "Anyone with the link can view", and send the public link to the client
+// as a read-only copy of the full scope report with every page captured
+// visually. This is the deliverable the user asked for: a hostable,
+// shareable HTML snapshot.
+// ─────────────────────────────────────────────────────────────────────
+async function exportStandaloneHtml(button, inventory) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Loading screenshots…";
+  try {
+    // Force-load every screenshot on the page so the cloned DOM has actual
+    // data: URIs in the <img src=…> attribute. The lazy-load IntersectionObserver
+    // only fires as the user scrolls, so un-rendered tabs (Templates,
+    // Screenshots) will have placeholders unless we load them now.
+    const thumbs = Array.from(document.querySelectorAll("img[data-shot-id]"));
+    const pending = thumbs
+      .filter(img => img.getAttribute("data-loaded") !== "1")
+      .map(img => loadScreenshot(img));
+    await Promise.all(pending);
+
+    button.textContent = "Building HTML…";
+
+    // Fetch report.css so we can inline it. fetch() on an extension page
+    // with a relative URL resolves against chrome-extension://…/report/ so
+    // this Just Works.
+    const cssRes = await fetch("report.css");
+    const cssText = await cssRes.text();
+
+    // Deep clone the document so we don't mutate what the user is looking at.
+    const docClone = document.documentElement.cloneNode(true);
+
+    // Inline CSS: replace every <link rel="stylesheet"> with a <style> block
+    // containing the fetched CSS text.
+    docClone.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+      const style = document.createElement("style");
+      style.textContent = cssText;
+      link.replaceWith(style);
+    });
+
+    // Remove every script. The standalone file is static — no JS runs.
+    docClone.querySelectorAll("script").forEach(s => s.remove());
+
+    // Remove the header action buttons — they rely on the extension runtime
+    // and can't work in a static file. Replace with a small "Exported …" note.
+    const actions = docClone.querySelector(".actions");
+    if (actions) {
+      const note = document.createElement("p");
+      note.className = "meta";
+      note.textContent =
+        `Static export — interactive controls disabled. Generated ${new Date().toISOString()}.`;
+      actions.replaceWith(note);
+    }
+
+    // Tabs don't work without JS, so:
+    //   1. Remove the tab bar entirely
+    //   2. Un-hide every <tabpanel hidden> so all sections stack vertically
+    //   3. Add a simple header above each panel so the user can see which
+    //      tab's content they're reading
+    const tabBar = docClone.querySelector(".tabs");
+    if (tabBar) {
+      // Preserve the tab titles so we can inject them as section headers.
+      const tabs = Array.from(tabBar.querySelectorAll('[role="tab"]'));
+      const titleById = new Map(tabs.map(t => [t.getAttribute("aria-controls"), (t.textContent || "").trim()]));
+      tabBar.remove();
+
+      docClone.querySelectorAll(".tabpanel").forEach(panel => {
+        panel.removeAttribute("hidden");
+        const title = titleById.get(panel.id) || "";
+        if (title) {
+          const h = document.createElement("h2");
+          h.className = "exported-tab-heading";
+          h.textContent = title;
+          panel.insertBefore(h, panel.firstChild);
+        }
+      });
+    }
+
+    // Pre-expand every detail row (page rows and template rows) so users
+    // don't have to click anything — the file is static, clicks wouldn't
+    // do anything anyway.
+    docClone.querySelectorAll("tr.page-row, tr.template-row").forEach(tr => {
+      tr.classList.add("expanded");
+    });
+
+    // Strip download-only affordances inside sections (e.g., the
+    // "Download Clusters (.xlsx)" button in the Templates tab).
+    docClone.querySelectorAll(".section-action").forEach(b => b.remove());
+
+    // Strip filter UI — without JS it's non-functional.
+    docClone.querySelectorAll(".findings-filter").forEach(f => f.remove());
+
+    // Serialize to HTML string.
+    const serializer = new XMLSerializer();
+    const bodyHtml = serializer.serializeToString(docClone);
+    const fullHtml = `<!doctype html>\n${bodyHtml}`;
+
+    // Trigger download via blob URL.
+    const blob = new Blob([fullHtml], { type: "text/html;charset=utf-8" });
+    const host = inventory?.meta?.seedHost || "inventory";
+    const stamp = (inventory?.meta?.generatedAt || new Date().toISOString())
+      .replace(/[:.]/g, "-");
+    const filename = `enableuser-inventory-${host}-${stamp}.html`;
+    await triggerBlobDownload(blob, filename);
+  } catch (err) {
+    console.error("[EU] standalone HTML export failed", err);
+    alert(`HTML export failed: ${err?.message || err}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+// Download every crawled screenshot as raw PNG files inside a single .zip.
+// Named by a slug derived from each page's URL so the auditor can cross-
+// reference them with the inventory row. Uses lib/zip-writer.js with a
+// plain "application/zip" mime — that writer was originally written for
+// OOXML containers but produces a valid PKZIP archive with stored-mode
+// (no compression) entries, which any unzip tool reads fine.
+async function exportScreenshotsZip(button, inventory) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Collecting…";
+  try {
+    const pages = (inventory?.pages || []).filter(p => !p.error && p.screenshot?.id);
+    if (!pages.length) {
+      alert("No screenshots were captured during this crawl.");
+      return;
+    }
+
+    const z = createZip();
+    const used = new Set();
+    let ok = 0, miss = 0;
+
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+      button.textContent = `Collecting ${i + 1}/${pages.length}…`;
+      const shot = await readScreenshotFromStorage(p.screenshot.id);
+      let dataUrl = shot?.dataUrl;
+      if (!dataUrl) {
+        // SW in-memory fallback.
+        const res = await send({ type: "GET_SCREENSHOT", id: p.screenshot.id });
+        if (res?.ok && res.dataUrl) dataUrl = res.dataUrl;
+      }
+      if (!dataUrl) { miss++; continue; }
+      const bytes = dataUrlToBytes(dataUrl);
+      if (!bytes) { miss++; continue; }
+      const name = uniqueZipName(p, used);
+      z.addBytes(name, bytes);
+      ok++;
+    }
+
+    if (ok === 0) {
+      alert("Could not load any screenshot bytes to include in the zip.");
+      return;
+    }
+
+    button.textContent = "Finalizing…";
+    const blob = await z.finalize("application/zip");
+    const host = inventory?.meta?.seedHost || "screenshots";
+    const stamp = (inventory?.meta?.generatedAt || new Date().toISOString())
+      .replace(/[:.]/g, "-");
+    const filename = `enableuser-screenshots-${host}-${stamp}.zip`;
+    await triggerBlobDownload(blob, filename);
+    if (miss > 0) {
+      console.warn(`[EU] exportScreenshotsZip: ${miss} screenshot(s) could not be loaded`);
+    }
+  } catch (err) {
+    console.error("[EU] screenshots zip export failed", err);
+    alert(`Screenshots zip failed: ${err?.message || err}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+// Decode a `data:image/png;base64,...` URL to its raw bytes.
+function dataUrlToBytes(dataUrl) {
+  if (typeof dataUrl !== "string") return null;
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return null;
+  const meta = dataUrl.slice(0, comma);
+  const payload = dataUrl.slice(comma + 1);
+  if (!/;base64$/.test(meta)) return null;
+  try {
+    const binary = atob(payload);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// Build a filesystem-safe, unique zip entry name from a page URL. Format:
+//   <NN>-<host>-<path-slug>.png  where NN is a 1-based index padded to the
+// list's digit count. Prefixing with the index guarantees uniqueness even
+// for URLs that would slugify to identical strings (e.g., /index.html and /).
+function uniqueZipName(page, used) {
+  let base;
+  try {
+    const u = new URL(page.url);
+    const host = u.hostname.replace(/[^a-z0-9.-]+/gi, "_");
+    let path = (u.pathname + u.search).replace(/^\/+/, "") || "index";
+    path = path.replace(/[^a-z0-9._-]+/gi, "_").replace(/_+/g, "_").slice(0, 120);
+    base = `${host}-${path}`;
+  } catch {
+    base = String(page.url || "screenshot").replace(/[^a-z0-9._-]+/gi, "_").slice(0, 120);
+  }
+  let name = `${base}.png`;
+  let i = 2;
+  while (used.has(name)) {
+    name = `${base}-${i}.png`;
+    i++;
+  }
+  used.add(name);
+  return name;
+}
+
+// Create a hidden anchor, click it, release the object URL. chrome.downloads
+// would also work here (extension page has access) but blob-URL + anchor is
+// dependency-free and keeps this path purely in the page context.
+async function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  // Give the browser a tick to start the download before we revoke.
+  await new Promise(r => setTimeout(r, 0));
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -905,7 +1159,7 @@ async function main() {
   renderFindings(inventory);
   renderScreenshotsTab(inventory);
   wireTabs();
-  wireDownloads();
+  wireDownloads(inventory);
 }
 
 function renderShellPages(inventory) {

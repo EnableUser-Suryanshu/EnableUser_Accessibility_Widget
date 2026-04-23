@@ -1208,7 +1208,22 @@ async function downloadInventoryFile(inventoryId, kind) {
     if (kind === "docx") blob = await buildScopeDocx(inventory);
     else if (kind === "clusters") blob = await buildClustersXlsx(inventory);
     else if (kind === "audit") blob = await buildAuditXlsx(inventory);
-    else blob = await buildInventoryXlsx(inventory);
+    else {
+      // Inventory .xlsx — embed screenshot thumbnails in the Pages sheet.
+      // buildThumbnailMap walks every page's screenshot, resizes it to a
+      // modest preview (max 300px wide, 400px tall) using OffscreenCanvas,
+      // and hands the resulting PNG bytes to the xlsx writer which wires
+      // them into an OOXML drawing part. Failures on individual
+      // screenshots are swallowed — a missing thumbnail just means that
+      // row has no preview image; it does NOT fail the download.
+      let thumbnails = null;
+      try {
+        thumbnails = await buildThumbnailMap(inventory);
+      } catch (err) {
+        console.warn("[EU] thumbnail pipeline failed — emitting xlsx without previews", err);
+      }
+      blob = await buildInventoryXlsx(inventory, { thumbnails });
+    }
     // Cache the generated blob on the in-memory entry so a second click
     // doesn't rebuild it. If the entry is missing (storage-recovery path),
     // re-seat it so subsequent clicks on the other deliverable still hit
@@ -1232,6 +1247,81 @@ async function downloadInventoryFile(inventoryId, kind) {
         : `enableuser-inventory-${host}-${stamp}.xlsx`;
   await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
   return { ok: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Thumbnail pipeline — produces a Map<shotId, { bytes, width, height }>
+// for the Pages sheet's embedded preview column. For each page with a
+// screenshot we:
+//   1. Resolve the full-size data: URL (in-memory Map first, then
+//      chrome.storage.local — mirrors getScreenshot()).
+//   2. Decode it into an ImageBitmap (fetch → blob → createImageBitmap;
+//      all three APIs are available inside a service worker).
+//   3. Scale to fit within 300px wide (aspect-preserving) and crop from
+//      the top to 400px tall. Full-page screenshots are frequently
+//      multi-thousand px tall; cropping the top gives a recognizable
+//      "fold" preview without making every spreadsheet row 5000px tall.
+//   4. Convert to PNG via OffscreenCanvas.convertToBlob → arrayBuffer.
+//   5. Close the bitmap to release transferable memory.
+//
+// Failures on individual screenshots are swallowed — a missing thumbnail
+// just means that row has no preview. We never throw from this function
+// unless the caller's crawl had zero screenshots to begin with.
+// ─────────────────────────────────────────────────────────────────────
+async function buildThumbnailMap(inventory) {
+  const pages = (inventory?.pages || []).filter(p => !p.error && p.screenshot?.id);
+  if (!pages.length) return null;
+
+  const out = new Map();
+  const seen = new Set();
+  const MAX_W = 300;
+  const MAX_H = 400;
+
+  for (const p of pages) {
+    const id = p.screenshot.id;
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    let dataUrl = inventoryScreenshots.get(id)?.dataUrl || null;
+    if (!dataUrl) {
+      try {
+        const stored = await chrome.storage.local.get(`shot:${id}`);
+        dataUrl = stored[`shot:${id}`]?.dataUrl || null;
+      } catch (err) {
+        console.warn("[EU] thumbnail: storage lookup failed for", id, err);
+      }
+    }
+    if (!dataUrl) continue;
+
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      const bitmap = await createImageBitmap(blob);
+
+      // Width is scaled to fit MAX_W; height is scaled by the same factor.
+      const scale = bitmap.width > MAX_W ? (MAX_W / bitmap.width) : 1;
+      const scaledW = Math.max(1, Math.round(bitmap.width * scale));
+      const scaledH = Math.max(1, Math.round(bitmap.height * scale));
+      // Canvas height clamps to MAX_H — drawImage above MAX_H is clipped by
+      // the canvas bounds, so we effectively crop the top region.
+      const finalW = scaledW;
+      const finalH = Math.min(scaledH, MAX_H);
+
+      const canvas = new OffscreenCanvas(finalW, finalH);
+      const ctx = canvas.getContext("2d");
+      // Draw the full bitmap into the canvas scaled to (scaledW, scaledH);
+      // any pixels past finalH are clipped.
+      ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, 0, 0, scaledW, scaledH);
+      bitmap.close?.();
+
+      const pngBlob = await canvas.convertToBlob({ type: "image/png" });
+      const bytes = new Uint8Array(await pngBlob.arrayBuffer());
+      out.set(id, { bytes, width: finalW, height: finalH });
+    } catch (err) {
+      console.warn("[EU] thumbnail resize failed for", id, err);
+    }
+  }
+
+  return out;
 }
 
 async function blobToDataUrl(blob) {
