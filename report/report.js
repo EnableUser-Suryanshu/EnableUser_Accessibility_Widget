@@ -513,7 +513,12 @@ const MEDIA_RULE_META = {
   "media-pdf-manual-audit":       { wcag: "1.3.1", level: "A",  title: "PDF needs manual audit",       impact: "review" },
   "media-spreadsheet-manual-audit":{ wcag: "1.3.1", level: "A", title: "Spreadsheet needs manual audit",impact: "review" },
   "media-document-manual-audit":  { wcag: "1.3.1", level: "A",  title: "Document needs manual audit",  impact: "review" },
-  "media-presentation-manual-audit":{ wcag: "1.3.1", level: "A",title: "Presentation needs manual audit",impact: "review" }
+  "media-presentation-manual-audit":{ wcag: "1.3.1", level: "A",title: "Presentation needs manual audit",impact: "review" },
+  // v13.1 — structural PDF audit findings emitted by lib/pdf-audit.js.
+  "pdf-untagged":                 { wcag: "1.3.1", level: "A",  title: "PDF not tagged",               impact: "serious" },
+  "pdf-missing-struct-tree":      { wcag: "1.3.1", level: "A",  title: "No PDF structure tree",        impact: "serious" },
+  "pdf-missing-lang":             { wcag: "3.1.1", level: "A",  title: "PDF missing /Lang",            impact: "moderate" },
+  "pdf-missing-title":            { wcag: "2.4.2", level: "A",  title: "PDF missing /Title",           impact: "moderate" }
 };
 
 function ruleMeta(id) {
@@ -653,6 +658,17 @@ function renderMediaDetails(r) {
     addIf("Size declared", formatBool(r.has_size_hint));
     addIf("Opens new tab", formatBool(r.opens_in_new_tab));
     if (r.opens_in_new_tab) addIf("New-tab notice", formatBool(r.has_new_tab_notice));
+    // v13.1 — PDF structural audit (if this is a PDF and auditing ran).
+    if (r.pdfAudit && r.pdfAudit.ok) {
+      const a = r.pdfAudit;
+      addIf("PDF tagged", formatBool(a.tagged));
+      addIf("Structure tree", formatBool(a.hasStructTree));
+      addIf("PDF language", a.lang || "—");
+      addIf("PDF title", a.title || "—");
+      if (a.size) addIf("PDF size (bytes)", a.size);
+    } else if (r.pdfAudit && !r.pdfAudit.ok) {
+      addIf("PDF audit", `not performed — ${r.pdfAudit.error || "fetch failed"}`);
+    }
   }
   if (r.kind === "video") {
     addIf("Captions", formatBool(r.has_captions));

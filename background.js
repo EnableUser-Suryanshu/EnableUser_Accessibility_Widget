@@ -18,6 +18,7 @@ import {
 import { buildScopeDocx } from "./lib/docx-writer.js";
 import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
 import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
+import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -380,7 +381,7 @@ async function scanInventory(tabId, options) {
   const depthStats = {};
 
   // Seed page runs the SAME full audit stack as every other crawled URL —
-  // axe + india + gigw + content-signals + full-page screenshot. Runs in the
+  // axe + india + is17802 + media + content-signals + full-page screenshot. Runs in the
   // existing tab (no new tab open) so the user's session/cookies/scroll
   // state is preserved for the seed.
   queue.next();
@@ -533,6 +534,13 @@ async function scanInventory(tabId, options) {
 
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile });
+
+  // v13.1 — audit every discovered PDF for structural accessibility
+  // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
+  // in mediaRows with an `pdfAudit` object and appends ruleset findings
+  // so the report renders them alongside media-checks.js findings.
+  await enrichPdfRowsWithAudit(inventory);
+
   const inventoryId = `inv-${Date.now()}`;
 
   // Store the inventory in memory with EMPTY deliverable slots. The .docx /
@@ -746,6 +754,11 @@ async function scanList(options) {
     mode: "template-check",
     noDedup: true
   });
+
+  // v13.1 PDF audit for the pasted URL list path too — every PDF linked
+  // from any pasted page gets inspected.
+  await enrichPdfRowsWithAudit(inventory);
+
   const inventoryId = `inv-${Date.now()}`;
   inventories.set(inventoryId, { inventory, files: {} });
 
@@ -761,7 +774,7 @@ async function scanList(options) {
 }
 
 // Inventory mode per-page worker. Runs the FULL audit stack (axe + india +
-// gigw) + content-signals + full-page screenshot. The result is a complete
+// is17802 + media) + content-signals + full-page screenshot. The result is a complete
 // per-page record: violations/passes/incomplete/inapplicable, template
 // fingerprint, content-type flags, actual component values, and a PNG
 // screenshot blob. This replaces the earlier signals-only path on user
@@ -953,6 +966,69 @@ function isCriticalPath(url) {
     }
     return null;
   } catch { return null; }
+}
+
+// v13.1 — enrich PDF media rows with a structural audit pass. Fetches
+// each unique PDF URL discovered during crawl and inspects it for the
+// four structural markers a tagged, AT-friendly PDF must declare:
+// /MarkInfo, /StructTreeRoot, /Lang, /Title. Issues are appended to the
+// per-item `issues` array so the report renders them alongside existing
+// media-checks.js findings; full audit result is attached as
+// `mediaRow.pdfAudit` for the report to surface the positive values
+// (detected language, title, size) as well.
+async function enrichPdfRowsWithAudit(inventory) {
+  const rows = inventory?.mediaRows;
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const pdfRows = rows.filter(r => r && (r.family === "pdf" || r.subtype === "pdf"));
+  if (pdfRows.length === 0) return;
+
+  // De-duplicate by media_url — same PDF linked from 50 pages should
+  // only be fetched once, then the result mirrored across every row.
+  const urls = [...new Set(pdfRows.map(r => r.media_url).filter(Boolean))];
+  if (urls.length === 0) return;
+
+  console.log(`[EU] PDF audit — inspecting ${urls.length} unique PDF(s) across ${pdfRows.length} link(s)`);
+  let results;
+  try {
+    results = await auditPdfUrls(urls, {
+      concurrency: 4,
+      timeoutMs: 12000,
+      progress: (done, total, url) => {
+        if (done % 5 === 0 || done === total) {
+          console.log(`[EU] PDF audit ${done}/${total} — ${url}`);
+        }
+      }
+    });
+  } catch (err) {
+    console.warn("[EU] PDF audit batch failed", err);
+    return;
+  }
+
+  let totalIssues = 0;
+  for (const row of pdfRows) {
+    const r = results.get(row.media_url);
+    if (!r) continue;
+    row.pdfAudit = r;
+    if (!r.ok) continue;
+    const issues = pdfAuditToIssues(r);
+    if (issues.length === 0) continue;
+    row.issues = Array.isArray(row.issues) ? row.issues : [];
+    for (const iss of issues) {
+      row.issues.push(iss.id);
+      totalIssues++;
+    }
+    row.pdfAuditIssues = issues;
+    row.issue_count = (row.issues || []).length;
+  }
+
+  // Roll up into mediaSummary so the summary tile shows "documentIssues"
+  // reflecting the new PDF structural findings.
+  if (inventory.mediaSummary) {
+    inventory.mediaSummary.documentIssues = (inventory.mediaSummary.documentIssues || 0) + totalIssues;
+    inventory.mediaSummary.pdfsAudited = results.size;
+    inventory.mediaSummary.pdfAuditIssues = totalIssues;
+  }
+  console.log(`[EU] PDF audit — ${totalIssues} structural issue(s) across ${results.size} PDF(s)`);
 }
 
 function buildInventory(pages, meta) {
@@ -1691,10 +1767,9 @@ async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}
 
 async function injectAxe(tabId) {
   // Inject axe-core + our custom check bundles together. They attach to
-  // window.EU_IndiaChecks / window.EU_GIGWChecks / window.EU_MediaChecks /
-  // window.EU_Is17802Checks so the content-script can merge their output
-  // into the axe results + the media inventory + the IS 17802 site-
-  // governance snapshot payload.
+  // window.EU_IndiaChecks / window.EU_MediaChecks / window.EU_Is17802Checks
+  // so the content-script can merge their output into the axe results +
+  // the media inventory + the IS 17802 site-governance snapshot payload.
   //
   // Retry wrapper around executeScript. MV3 raises
   //   "Couldn't load preload assets: [object ProgressEvent]"
@@ -1706,7 +1781,7 @@ async function injectAxe(tabId) {
   // always clears with a short pause and a retry. Final failure is re-thrown
   // so the caller can record an error row rather than silently losing the
   // page.
-  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js", "lib/is17802-checks.js"];
+  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/media-checks.js", "lib/is17802-checks.js"];
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -2004,7 +2079,7 @@ function buildReport(pages, meta) {
     // Violations: also drive the WCAG criterion pass/fail tally and issueRows.
     for (const v of p.violations || []) {
       const crits = extractCriteriaFromTags(v.tags || []);
-      // Custom rules (india-checks / gigw-checks) may not carry wcagXXX tags
+      // Custom rules (india-checks / is17802-checks / media-checks) may not carry wcagXXX tags
       // but still reference a WCAG criterion via their rule id. If the
       // tag-extractor produced no criteria, we synthesise a single row with
       // empty WCAG fields so the violation still appears.
@@ -2025,7 +2100,6 @@ function buildReport(pages, meta) {
             wcag_name: crit.name,
             // Cross-framework clause references (null when SC isn't covered
             // by that framework — Section 508 pre-WCAG-2.1 carve-outs etc).
-            gigw_clause:      xref?.gigw       || "",
             is17802_clause:   xref?.is17802    || "",
             en301549_clause:  xref?.en301549   || "",
             section508_ref:   xref?.section508 || "",
@@ -2035,7 +2109,7 @@ function buildReport(pages, meta) {
             rule_description: v.description || "",
             rule_help: v.help || "",
             rule_tags: (v.tags || []).join(" "),
-            rule_source: v.ruleId && (v.ruleId.startsWith("india-") || v.ruleId.startsWith("gigw-")) ? "custom" : "axe-core",
+            rule_source: v.ruleId && (v.ruleId.startsWith("india-") || v.ruleId.startsWith("media-") || v.ruleId.startsWith("is17802-")) ? "custom" : "axe-core",
             impact: n.impact || v.impact || "minor",
             selector: (n.target || []).join(" "),
             target_array: n.target || [],
@@ -2220,7 +2294,7 @@ function buildReport(pages, meta) {
     .sort((a, b) => (b.page_count - a.page_count) || (b.total_violations - a.total_violations));
 
   // ── Per-profile conformance ─────────────────────────────────────────────
-  // For each compliance profile (WCAG 2.1 AA, IS 17802, GIGW 3.0, EN 301 549,
+  // For each compliance profile (WCAG 2.1 AA, IS 17802, EN 301 549,
   // Section 508, ADA), compute: which in-scope SCs have failures across the
   // corpus. Produces a compact table the report can render as "Conformance
   // by Standard" and the ACR / VPAT generator can consume directly.
@@ -2310,7 +2384,7 @@ async function downloadCsv(reportId) {
   const issueCols = [
     "url", "page_title",
     "wcag_criterion", "wcag_level", "wcag_name",
-    "gigw_clause", "is17802_clause", "en301549_clause", "section508_ref", "ada_ref",
+    "is17802_clause", "en301549_clause", "section508_ref", "ada_ref",
     "rule_id", "rule_source", "rule_impact", "rule_description", "rule_help", "rule_tags",
     "impact", "selector", "ancestry", "xpath", "html_snippet",
     "failure_summary", "help_url",
@@ -2378,7 +2452,9 @@ async function downloadCsv(reportId) {
     "has_transcript", "has_type_hint", "has_size_hint",
     "opens_in_new_tab", "has_new_tab_notice",
     "title_attr", "aria_label", "duration_seconds", "vendor_label",
-    "tracks", "issues", "issue_count", "selector", "html_snippet"
+    "tracks", "issues", "issue_count", "selector", "html_snippet",
+    // v13.1 PDF structural audit columns — only populated for PDF rows.
+    "pdfAudit"
   ];
   const mediaCsv = toCsv(mediaCols, flatten(report.mediaRows || [], mediaCols));
 
@@ -2393,7 +2469,7 @@ async function downloadCsv(reportId) {
       ? `# Discovery: nav=${report.meta.discoveryStats.nav} linkRels=${report.meta.discoveryStats.linkRels ?? 0} hreflang=${report.meta.discoveryStats.hreflang} feed=${report.meta.discoveryStats.feed ?? 0}/${report.meta.discoveryStats.feedRaw ?? 0} sitemap=${report.meta.discoveryStats.sitemap}/${report.meta.discoveryStats.sitemapRaw ?? 0} body=${report.meta.discoveryStats.body}\r\n`
       : ``) +
     `\r\n## WCAG 2.1 AA Summary\r\n` + summaryCsv +
-    `\r\n\r\n## Conformance by Standard (WCAG / IS 17802 / GIGW / EN 301 549 / Section 508 / ADA)\r\n` + profilesCsv +
+    `\r\n\r\n## Conformance by Standard (WCAG / IS 17802 / EN 301 549 / Section 508 / ADA)\r\n` + profilesCsv +
     `\r\n\r\n## Templates\r\n` + templatesCsv +
     `\r\n\r\n## Violations (one row per violation × WCAG criterion × node)\r\n` + issuesCsv +
     `\r\n\r\n## Passes (one row per node)\r\n` + passesCsv +

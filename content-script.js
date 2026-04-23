@@ -23,16 +23,13 @@
     });
     const durationMs = Math.round(performance.now() - started);
 
-    // Run our custom India / GIGW / Media checks and merge them into the
+    // Run our custom India / Media / IS 17802 checks and merge them into the
     // violation stream. They produce axe-shaped rule objects so the rest of
     // the pipeline doesn't need to know they came from a different source.
     const customRules = [];
     try {
       if (window.EU_IndiaChecks?.run) customRules.push(...window.EU_IndiaChecks.run(document));
     } catch (e) { console.warn("[EU] india-checks failed", e); }
-    try {
-      if (window.EU_GIGWChecks?.run) customRules.push(...window.EU_GIGWChecks.run(document));
-    } catch (e) { console.warn("[EU] gigw-checks failed", e); }
     // Media checks run collect() so the same pass populates both the rules
     // stream AND the media inventory attached to the payload below.
     let mediaInventory = { videos: [], audios: [], iframeVideos: [], documents: [] };

@@ -10,7 +10,7 @@ const depthInput = $("opt-depth");
 const profileSelect = $("opt-profile");
 
 // First-run defaults — what the operator sees the first time they open the
-// popup with no stored preferences yet. Combined (WCAG + IS 17802 + GIGW)
+// popup with no stored preferences yet. Combined (WCAG 2.1 AA + IS 17802)
 // covers the India-compliance use case most users of this build are here
 // for, and 5000 URLs is a sensible ceiling for mid-size marketing/content
 // sites without being so large it invites runaway crawls. Both are freely
@@ -22,7 +22,7 @@ const DEFAULT_PROFILE = "combined_in";
 // No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
 // operator decides the size of the crawl. background.js enforces only a
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
-const VALID_PROFILES = ["wcag21aa", "is17802", "gigw3", "combined_in", "en301549", "section508", "ada"];
+const VALID_PROFILES = ["wcag21aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
 chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
@@ -166,7 +166,7 @@ btnInventory?.addEventListener("click", async () => {
   const opts = readScanOptions();
   const depthLabel = opts.crawlDepth === 0 ? "unbounded" : String(opts.crawlDepth);
   setBusy(true);
-  setStatus(`Full-audit crawl (up to ${opts.maxUrls} URLs, depth ${depthLabel}) — axe + India + GIGW + screenshots + component inventory per page. This will take a while…`);
+  setStatus(`Full-audit crawl (up to ${opts.maxUrls} URLs, depth ${depthLabel}) — axe + India + IS 17802 + screenshots + component inventory per page. This will take a while…`);
   const res = await send({ type: "SCAN_INVENTORY", tabId: tab.id, options: opts });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scope failed.", true); return; }
