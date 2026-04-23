@@ -518,7 +518,13 @@ const MEDIA_RULE_META = {
   "pdf-untagged":                 { wcag: "1.3.1", level: "A",  title: "PDF not tagged",               impact: "serious" },
   "pdf-missing-struct-tree":      { wcag: "1.3.1", level: "A",  title: "No PDF structure tree",        impact: "serious" },
   "pdf-missing-lang":             { wcag: "3.1.1", level: "A",  title: "PDF missing /Lang",            impact: "moderate" },
-  "pdf-missing-title":            { wcag: "2.4.2", level: "A",  title: "PDF missing /Title",           impact: "moderate" }
+  "pdf-missing-title":            { wcag: "2.4.2", level: "A",  title: "PDF missing /Title",           impact: "moderate" },
+  // v0.2.2 — structural Office audit findings emitted by lib/office-audit.js.
+  "office-missing-title":         { wcag: "2.4.2", level: "A",  title: "Office doc missing title",     impact: "moderate" },
+  "office-missing-language":      { wcag: "3.1.1", level: "A",  title: "Office doc missing language",  impact: "moderate" },
+  "docx-no-headings":             { wcag: "1.3.1", level: "A",  title: "Word doc has no headings",     impact: "serious" },
+  "pptx-no-slides":               { wcag: "1.3.1", level: "A",  title: "PowerPoint has no slides",     impact: "serious" },
+  "xlsx-no-sheets":               { wcag: "1.3.1", level: "A",  title: "Excel has no sheets",          impact: "serious" }
 };
 
 function ruleMeta(id) {
@@ -668,6 +674,25 @@ function renderMediaDetails(r) {
       if (a.size) addIf("PDF size (bytes)", a.size);
     } else if (r.pdfAudit && !r.pdfAudit.ok) {
       addIf("PDF audit", `not performed — ${r.pdfAudit.error || "fetch failed"}`);
+    }
+    // v0.2.2 — structural Office audit (docx/xlsx/pptx).
+    if (r.officeAudit && r.officeAudit.ok) {
+      const a = r.officeAudit;
+      addIf("Office format", (a.format || "").toUpperCase());
+      addIf("Doc title", a.title || "—");
+      addIf("Doc language", a.language || "—");
+      if (a.subject) addIf("Doc subject", a.subject);
+      if (a.creator) addIf("Doc creator", a.creator);
+      if (a.format === "docx") {
+        addIf("Has heading styles", a.hasHeadings === true ? "Yes" : a.hasHeadings === false ? "No" : "—");
+      } else if (a.format === "xlsx") {
+        addIf("Sheet count", a.sheetCount ?? "—");
+      } else if (a.format === "pptx") {
+        addIf("Slide count", a.slideCount ?? "—");
+      }
+      if (a.sizeBytes) addIf("File size (bytes)", a.sizeBytes);
+    } else if (r.officeAudit && !r.officeAudit.ok) {
+      addIf("Office audit", `not performed — ${r.officeAudit.reason || "fetch failed"}`);
     }
   }
   if (r.kind === "video") {

@@ -654,17 +654,77 @@ function wireDownloads(inventory) {
 async function exportStandaloneHtml(button, inventory) {
   const originalText = button.textContent;
   button.disabled = true;
-  button.textContent = "Loading screenshots…";
+  button.textContent = "Preparing export…";
+
+  // v0.2.2 — filter state can leak into the export. If the user had an impact
+  // chip off, or a search string in findings/screenshots, the rendered DOM
+  // only contains matches. Snapshot the state, reset to "everything shown",
+  // trigger re-renders, then restore in the finally block below.
+  const findingsSearch  = document.getElementById("findings-search");
+  const impactInputs    = Array.from(document.querySelectorAll(".impact-filter"));
+  const screenshotsSearch = document.getElementById("screenshots-search");
+  const prevFindingsSearch  = findingsSearch?.value || "";
+  const prevImpactChecked   = impactInputs.map(i => !!i.checked);
+  const prevScreenshotsSearch = screenshotsSearch?.value || "";
+
+  const resetFilters = () => {
+    if (findingsSearch) findingsSearch.value = "";
+    impactInputs.forEach(i => { i.checked = true; });
+    if (screenshotsSearch) screenshotsSearch.value = "";
+    // Synchronously triggers renderFindings() and renderScreenshotsTab()'s
+    // internal render() via the listeners they wired up at init.
+    findingsSearch?.dispatchEvent(new Event("input"));
+    for (const i of impactInputs) i.dispatchEvent(new Event("change"));
+    screenshotsSearch?.dispatchEvent(new Event("input"));
+  };
+  const restoreFilters = () => {
+    if (findingsSearch) findingsSearch.value = prevFindingsSearch;
+    impactInputs.forEach((i, idx) => { i.checked = prevImpactChecked[idx] ?? true; });
+    if (screenshotsSearch) screenshotsSearch.value = prevScreenshotsSearch;
+    findingsSearch?.dispatchEvent(new Event("input"));
+    for (const i of impactInputs) i.dispatchEvent(new Event("change"));
+    screenshotsSearch?.dispatchEvent(new Event("input"));
+  };
+
   try {
-    // Force-load every screenshot on the page so the cloned DOM has actual
-    // data: URIs in the <img src=…> attribute. The lazy-load IntersectionObserver
-    // only fires as the user scrolls, so un-rendered tabs (Templates,
-    // Screenshots) will have placeholders unless we load them now.
+    resetFilters();
+    // Let layout settle so the re-rendered DOM is observable.
+    await new Promise(r => requestAnimationFrame(() => r()));
+
+    // v0.2.2 — concurrency-limited shot load with one retry on error.
+    // The previous Promise.all fired ALL storage.local.get calls at once;
+    // with 50+ multi-MB screenshots that occasionally returned null under
+    // memory pressure, causing some thumbs to ship as BLANK_IMG placeholders.
+    // Capping at 6 in-flight reads + retrying once on error delivers a
+    // complete set even on a large crawl.
     const thumbs = Array.from(document.querySelectorAll("img[data-shot-id]"));
-    const pending = thumbs
-      .filter(img => img.getAttribute("data-loaded") !== "1")
-      .map(img => loadScreenshot(img));
-    await Promise.all(pending);
+    const total = thumbs.length;
+    const MAX_CONCURRENT = 6;
+    let done = 0, missed = 0;
+    let cursor = 0;
+    async function worker() {
+      while (cursor < thumbs.length) {
+        const img = thumbs[cursor++];
+        // Already loaded (visible tab had its IO observer fire) — skip.
+        if (img.getAttribute("data-loaded") === "1") { done++; continue; }
+        // Two attempts max. If loadScreenshot sets "error", we clear the
+        // attribute so a retry re-enters the fetch path instead of bailing.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await loadScreenshot(img);
+          if (img.getAttribute("data-loaded") === "1") break;
+          img.removeAttribute("data-loaded"); // allow retry
+          await new Promise(r => setTimeout(r, 80 + attempt * 120));
+        }
+        if (img.getAttribute("data-loaded") === "1") done++;
+        else missed++;
+        button.textContent = `Loading screenshots… ${done + missed}/${total}`;
+      }
+    }
+    const workerCount = Math.min(MAX_CONCURRENT, Math.max(1, thumbs.length));
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    if (missed > 0) {
+      console.warn(`[EU] HTML export — ${missed}/${total} screenshot(s) could not be loaded`);
+    }
 
     button.textContent = "Building HTML…";
 
@@ -755,6 +815,8 @@ async function exportStandaloneHtml(button, inventory) {
   } finally {
     button.disabled = false;
     button.textContent = originalText;
+    // Restore the user's filter state so the page looks the way they left it.
+    try { restoreFilters(); } catch {}
   }
 }
 

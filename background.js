@@ -19,6 +19,7 @@ import { buildScopeDocx } from "./lib/docx-writer.js";
 import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
 import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
 import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
+import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -541,6 +542,11 @@ async function scanInventory(tabId, options) {
   // so the report renders them alongside media-checks.js findings.
   await enrichPdfRowsWithAudit(inventory);
 
+  // v0.2.2 — same treatment for Office documents. Byte-level zip read of
+  // each docx/xlsx/pptx, extract dc:title / dc:language, verify at least
+  // one heading paragraph style (docx) / sheet (xlsx) / slide (pptx).
+  await enrichOfficeRowsWithAudit(inventory);
+
   const inventoryId = `inv-${Date.now()}`;
 
   // Store the inventory in memory with EMPTY deliverable slots. The .docx /
@@ -758,6 +764,9 @@ async function scanList(options) {
   // v13.1 PDF audit for the pasted URL list path too — every PDF linked
   // from any pasted page gets inspected.
   await enrichPdfRowsWithAudit(inventory);
+
+  // v0.2.2 Office audit for the pasted URL list path as well.
+  await enrichOfficeRowsWithAudit(inventory);
 
   const inventoryId = `inv-${Date.now()}`;
   inventories.set(inventoryId, { inventory, files: {} });
@@ -1029,6 +1038,63 @@ async function enrichPdfRowsWithAudit(inventory) {
     inventory.mediaSummary.pdfAuditIssues = totalIssues;
   }
   console.log(`[EU] PDF audit — ${totalIssues} structural issue(s) across ${results.size} PDF(s)`);
+}
+
+// v0.2.2 — byte-level audit of every crawled Office document (docx/xlsx/
+// pptx). Same plumbing as enrichPdfRowsWithAudit: filter by subtype, de-
+// dup by media_url, call the batch runner, fold each result back onto
+// the row with row.officeAudit + append rule-shaped issues to row.issues,
+// then roll counts up to mediaSummary.documentIssues so the summary tile
+// reflects the Office findings alongside PDF findings.
+async function enrichOfficeRowsWithAudit(inventory) {
+  const rows = inventory?.mediaRows;
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const officeRows = rows.filter(r => r && /^(docx|xlsx|pptx)$/i.test(r.subtype || ""));
+  if (officeRows.length === 0) return;
+
+  const urls = [...new Set(officeRows.map(r => r.media_url).filter(Boolean))];
+  if (urls.length === 0) return;
+
+  console.log(`[EU] Office audit — inspecting ${urls.length} unique Office doc(s) across ${officeRows.length} link(s)`);
+  let results;
+  try {
+    results = await auditOfficeUrls(urls, {
+      concurrency: 4,
+      timeoutMs: 15000,
+      progress: (done, total, url) => {
+        if (done % 5 === 0 || done === total) {
+          console.log(`[EU] Office audit ${done}/${total} — ${url}`);
+        }
+      }
+    });
+  } catch (err) {
+    console.warn("[EU] Office audit batch failed", err);
+    return;
+  }
+
+  let totalIssues = 0;
+  for (const row of officeRows) {
+    const r = results.get(row.media_url);
+    if (!r) continue;
+    row.officeAudit = r;
+    if (!r.ok) continue;
+    const issues = officeAuditToIssues(r);
+    if (issues.length === 0) continue;
+    row.issues = Array.isArray(row.issues) ? row.issues : [];
+    for (const iss of issues) {
+      row.issues.push(iss.id);
+      totalIssues++;
+    }
+    row.officeAuditIssues = issues;
+    row.issue_count = (row.issues || []).length;
+  }
+
+  if (inventory.mediaSummary) {
+    inventory.mediaSummary.documentIssues = (inventory.mediaSummary.documentIssues || 0) + totalIssues;
+    inventory.mediaSummary.officeAudited = results.size;
+    inventory.mediaSummary.officeAuditIssues = totalIssues;
+  }
+  console.log(`[EU] Office audit — ${totalIssues} structural issue(s) across ${results.size} Office doc(s)`);
 }
 
 function buildInventory(pages, meta) {
