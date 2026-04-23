@@ -15,6 +15,7 @@ import {
   sampleByPathBucket,
   navSurfacedCollect
 } from "./lib/discovery.js";
+import { probeAllCmsApis } from "./lib/cms-probes.js";
 import { buildScopeDocx } from "./lib/docx-writer.js";
 import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
 import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
@@ -1895,24 +1896,35 @@ async function scanInExistingTab(tabId) {
 // (nav, hreflang, rel=next/prev) when maxUrls is tight.
 //
 // Priority ladder (higher = enqueued first):
-//   nav         8   ← from the rendered seed page, navSurfacedCollect
-//   linkRel     7   ← <link rel="canonical"|"next"|"prev">
-//   hreflang    5   ← locale alternates
-//   feed        4   ← RSS / Atom / JSON feed entry URLs
-//   sitemap     3   ← bucket-sampled across path prefixes when > budget
-//   body        2   ← non-nav in-page links (blog thumbnails, card links)
+//   nav          8   ← from the rendered seed page, navSurfacedCollect
+//   linkRel      7   ← <link rel="canonical"|"next"|"prev">
+//   cms-api      6   ← WordPress /wp-json, Shopify /products.json
+//   htmlSitemap  6   ← /sitemap HTML page (not sitemap.xml)
+//   jsonLd       6   ← schema.org structured-data URLs on the seed page
+//   framework    6   ← Next.js _buildManifest, Gatsby page-data
+//   hreflang     5   ← locale alternates
+//   feed         4   ← RSS / Atom / JSON feed entry URLs
+//   sitemap      3   ← bucket-sampled across path prefixes when > budget
+//   body         2   ← non-nav in-page links (blog thumbnails, card links)
 //
 // Sitemap URLs are bucket-sampled by first path segment so every section
 // of the site gets representation rather than exhausting /news/ while
 // /schemes/ and /contact/ never appear.
+//
+// v0.3.0 additions: WordPress REST API, Shopify products.json, HTML sitemap
+// page auto-detect, Next.js build-manifest, Gatsby page-data, JSON-LD URL
+// harvest. Each runs in parallel and is silently ignored on non-matching
+// sites. Their discovery tags (cmsWordpress, cmsShopify, htmlSitemap,
+// frameworkManifest, jsonLd) surface in discoveryStats so operators can
+// see which source earned which URL on a per-site basis.
 // ─────────────────────────────────────────────────────────────────────────
 async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats }) {
-  // Run all out-of-band discovery + nav-harvest in parallel. navSurfacedCollect
-  // is the slow one (scroll + click-reveal, up to 45s) but it's on a
-  // different resource (tab scripting) from the HTTP fetches, so it doesn't
-  // contend. Failures are tolerated per source — a 404 sitemap shouldn't
-  // kill feed discovery.
-  const [sitemapUrls, homepageLinks, navLinks] = await Promise.all([
+  // Run all out-of-band discovery + nav-harvest + CMS probes in parallel.
+  // navSurfacedCollect is the slow one (scroll + click-reveal, up to 45s);
+  // CMS probes are HTTP-only and finish quickly on non-matching sites.
+  // Failures are tolerated per source — a 404 sitemap shouldn't kill feed
+  // discovery, and a non-WP site shouldn't block the Shopify probe.
+  const [sitemapUrls, homepageLinks, navLinks, cmsApiResults] = await Promise.all([
     seedOrigin ? discoverSeedsFromOrigin(seedOrigin).catch(() => []) : Promise.resolve([]),
     seedOrigin ? discoverHomepageLinks(startUrl).catch(() => ({ hreflang: [], canonical: null, nextPrev: [], feeds: [] })) : Promise.resolve({ hreflang: [], canonical: null, nextPrev: [], feeds: [] }),
     // noScroll: true — the seed tab IS the user's visible tab. We already
@@ -1921,7 +1933,14 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
     // sticky-header / scroll-listener side effects that linger after restore.
     // Static-DOM nav harvest still runs; sitemap / hreflang / feed discovery
     // above cover the routes we'd otherwise have surfaced via scroll.
-    collectNavLinks(tabId, { noScroll: true }).catch(() => [])
+    collectNavLinks(tabId, { noScroll: true }).catch(() => []),
+    // CMS / framework API probes — WordPress REST, Shopify products.json,
+    // HTML sitemap pages, Next.js / Gatsby build manifests, JSON-LD URL
+    // harvest from the seed HTML. Shares ONE seed-URL fetch across the
+    // framework + JSON-LD probes, so HTTP cost is bounded.
+    seedOrigin ? probeAllCmsApis(seedOrigin, startUrl).catch(() => ({
+      wordpress: [], shopify: [], htmlSitemap: [], frameworkManifest: [], jsonLd: []
+    })) : Promise.resolve({ wordpress: [], shopify: [], htmlSitemap: [], frameworkManifest: [], jsonLd: [] })
   ]);
 
   // Feed discovery depends on the homepage autodiscovery links, so it runs
@@ -1943,6 +1962,35 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   // first-in wins behaviour correctly biases the crawl.
   discoveryStats.nav      = queue.enqueueMany(navOnly,           { depth, priority: 8, source: "nav" });
   discoveryStats.linkRels = queue.enqueueMany(linkRelUrls,       { depth, priority: 7, source: "linkRel" });
+
+  // CMS-API tier (priority 6) — structured-data sources that tend to be
+  // comprehensive and high-signal. Recorded before hreflang so the raw
+  // counts are visible even when the queue fills up and later sources
+  // enqueue zero. We record both the raw count (how many the probe found)
+  // and the enqueued count (how many actually made it into the queue), so
+  // operators can see when probes are paying off even if the budget capped
+  // their contribution.
+  discoveryStats.cmsWordpressRaw = cmsApiResults.wordpress.length;
+  discoveryStats.cmsWordpress = queue.enqueueMany(cmsApiResults.wordpress, {
+    depth, priority: 6, source: "cms-wp"
+  });
+  discoveryStats.cmsShopifyRaw = cmsApiResults.shopify.length;
+  discoveryStats.cmsShopify = queue.enqueueMany(cmsApiResults.shopify, {
+    depth, priority: 6, source: "cms-shopify"
+  });
+  discoveryStats.htmlSitemapRaw = cmsApiResults.htmlSitemap.length;
+  discoveryStats.htmlSitemap = queue.enqueueMany(cmsApiResults.htmlSitemap, {
+    depth, priority: 6, source: "html-sitemap"
+  });
+  discoveryStats.frameworkManifestRaw = cmsApiResults.frameworkManifest.length;
+  discoveryStats.frameworkManifest = queue.enqueueMany(cmsApiResults.frameworkManifest, {
+    depth, priority: 6, source: "framework-manifest"
+  });
+  discoveryStats.jsonLdRaw = cmsApiResults.jsonLd.length;
+  discoveryStats.jsonLd = queue.enqueueMany(cmsApiResults.jsonLd, {
+    depth, priority: 6, source: "json-ld"
+  });
+
   discoveryStats.hreflang = queue.enqueueMany(homepageLinks.hreflang || [], { depth, priority: 5, source: "hreflang" });
 
   // Compute remaining budget for the noisy sources (feed + sitemap). We
