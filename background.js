@@ -26,15 +26,25 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // upper number they're willing to wait for. Concurrency + rate-limiter keep
 // the target site safe regardless of total URL count.
 // CONCURRENT_TABS governs how many tabs run axe in parallel. Each tab
-// spins up its own Chromium renderer + axe context so memory cost is real
-// (~100–200 MB per tab on content-heavy pages). 50 is aggressive but the
-// operator explicitly asked for "open 50 at once" so a 50-URL run finishes
-// in one batch rather than ten sequential waves. The RateLimiter still
-// governs per-site pacing (backoff on 429/503, same-host politeness) so
-// the target site doesn't get hammered regardless of tab count.
-const CONCURRENT_TABS = 50;
+// spins up its own Chromium renderer + axe context so memory cost is
+// real (~100–200 MB per tab on content-heavy pages). At 200 tabs that's
+// roughly 20–40 GB of RAM at peak — the operator set this explicitly
+// ("open 200 tabs at once") so a large site finishes in a small number
+// of concurrent waves. The RateLimiter still governs per-site pacing
+// (backoff on 429/503, same-host politeness) and the injectAxe retry
+// wrapper (see lower in file) handles the preload-race the 200-way
+// concurrency will trigger more often.
+//
+// SETTLE_MS is the wait between "tab reported navigation complete" and
+// (a) the settled-URL dedup check, (b) axe injection, (c) the full-page
+// screenshot. 15 s gives cookie-consent banners, GDPR popups, lazy-
+// loaded images, animations, and any client-side redirect JS enough time
+// to fully settle before we take the audit and the screenshot. Shorter
+// waits caused screenshots to miss below-the-fold content that hadn't
+// yet intersection-observer-triggered a lazy load.
+const CONCURRENT_TABS = 200;
 const TAB_TIMEOUT_MS = 60_000;
-const SETTLE_MS = 2_500;
+const SETTLE_MS = 15_000;
 
 const pending = new Map();
 const reports = new Map();
