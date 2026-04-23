@@ -43,6 +43,17 @@
         mediaInventory = mediaResult.inventory || mediaInventory;
       }
     } catch (e) { console.warn("[EU] media-checks failed", e); }
+    // IS 17802 site-governance checks (Ch 10 / Ch 12 / Ch 13). Like
+    // media-checks, collect() returns both rules and a structured `site`
+    // snapshot we attach to the payload for the report UI to render.
+    let is17802Site = null;
+    try {
+      if (window.EU_Is17802Checks?.collect) {
+        const r = window.EU_Is17802Checks.collect();
+        customRules.push(...(r.rules || []));
+        is17802Site = r.site || null;
+      }
+    } catch (e) { console.warn("[EU] is17802-checks failed", e); }
     // Split custom rules by impact + review tag — "review"-tagged rules go
     // to incomplete (auditor needs to confirm), others to violations. The
     // tag-based split replaces the old impact-based one so serious/moderate
@@ -86,7 +97,11 @@
       template: await computeTemplateSignals(),
       // Flat inventory of every video / audio / embedded player / document
       // link found on this page. Feeds the report's Media & Documents section.
-      mediaInventory
+      mediaInventory,
+      // IS 17802 site-governance snapshot — present whenever the page
+      // matched an accessibility-statement URL/title, plus feedback-channel
+      // counts on every page. null if the check module didn't run.
+      is17802Site
     };
 
     chrome.runtime.sendMessage({ type: "SCAN_RESULT", payload });

@@ -1691,9 +1691,10 @@ async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}
 
 async function injectAxe(tabId) {
   // Inject axe-core + our custom check bundles together. They attach to
-  // window.EU_IndiaChecks / window.EU_GIGWChecks / window.EU_MediaChecks so
-  // the content-script can merge their output into the axe results + the
-  // media inventory payload.
+  // window.EU_IndiaChecks / window.EU_GIGWChecks / window.EU_MediaChecks /
+  // window.EU_Is17802Checks so the content-script can merge their output
+  // into the axe results + the media inventory + the IS 17802 site-
+  // governance snapshot payload.
   //
   // Retry wrapper around executeScript. MV3 raises
   //   "Couldn't load preload assets: [object ProgressEvent]"
@@ -1705,7 +1706,7 @@ async function injectAxe(tabId) {
   // always clears with a short pause and a retry. Final failure is re-thrown
   // so the caller can record an error row rather than silently losing the
   // page.
-  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js"];
+  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/gigw-checks.js", "lib/media-checks.js", "lib/is17802-checks.js"];
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
