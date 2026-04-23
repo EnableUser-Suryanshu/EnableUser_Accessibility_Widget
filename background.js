@@ -381,6 +381,20 @@ async function scanInventory(tabId, options) {
   const pages = [];
   const depthStats = {};
 
+  // v0.2.6 — Shared content-hash dedup map for inventory workers. Key =
+  // text_hash (the rendered-text hash computed during the content scan).
+  // Value = the FIRST URL that produced that hash. When a subsequent
+  // worker gets the same hash back from runContentScan, we skip the
+  // full-page screenshot (the biggest skippable per-page cost after axe)
+  // and tag the page record with `duplicate_of` so buildInventory
+  // collapses it into the primary page rather than emitting it as a
+  // distinct row. This catches same-content-different-slug collisions
+  // that the slug-based cross-folder dedup in buildInventory can't see
+  // (e.g. /devang-patel vs /pallavi-deshpande both rendering identical
+  // bio-page content). The seed's hash is populated below once the seed
+  // audit completes.
+  const seenTextHashes = new Map();
+
   // Seed page runs the SAME full audit stack as every other crawled URL —
   // axe + india + is17802 + media + content-signals + full-page screenshot. Runs in the
   // existing tab (no new tab open) so the user's session/cookies/scroll
@@ -427,6 +441,11 @@ async function scanInventory(tabId, options) {
       screenshot,
       ...seedSignals
     });
+    // v0.2.6 — Seed the hash-dedup map so any subsequently-crawled URL
+    // that renders identical text content (classic SPA-shell / soft-404
+    // signature, or a same-content-different-slug alias) is recognised
+    // as a duplicate and spared the screenshot pass.
+    if (tmpl.textHash) seenTextHashes.set(tmpl.textHash, startUrl);
   } catch (err) {
     pages.push({ url: startUrl, depth: 0, source: "seed", error: String(err?.message || err) });
   }
@@ -460,7 +479,7 @@ async function scanInventory(tabId, options) {
       acquired = token != null;
       // v12.2 — hard ceiling so one stuck tab can't stall the whole pool.
       const result = await withTimeout(
-        inventoryInNewTab(req.url, req.depth < crawlDepth, { queue }),
+        inventoryInNewTab(req.url, req.depth < crawlDepth, { queue, seenTextHashes }),
         WORKER_HARD_TIMEOUT_MS,
         `worker ${req.url}`
       );
@@ -788,7 +807,7 @@ async function scanList(options) {
 // fingerprint, content-type flags, actual component values, and a PNG
 // screenshot blob. This replaces the earlier signals-only path on user
 // direction — inventory mode IS the full audit, not a lightweight preview.
-async function inventoryInNewTab(url, collectNextLinks, { queue = null } = {}) {
+async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenTextHashes = null } = {}) {
   const tab = await chrome.tabs.create({ url, active: false });
   const tabId = tab.id;
   let inFlightClaimKey = null; // set if we claim a slot; released in finally
@@ -851,22 +870,48 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null } = {}) {
     // Content signals (with shadow DOM, actual values, static/dynamic class).
     const signals = await collectContentSignals(tabId);
 
-    // Full-page screenshot via chrome.debugger. Falls back gracefully to
-    // visible-viewport capture if debugger attach is refused (e.g. DevTools
-    // already open on this tab, chrome:// URL, policy).
-    let screenshot = null;
-    try {
-      screenshot = await captureFullPageScreenshot(tabId);
-    } catch (err) {
-      console.warn(`[EU] screenshot failed for ${url}:`, err?.message || err);
+    // v0.2.6 — Content-hash dedup check. runContentScan returns the
+    // page's rendered-text hash; if another worker already produced the
+    // same hash, this page is the same content served under a different
+    // URL. Skip the (expensive) full-page screenshot and tag the record
+    // with `duplicate_of` so buildInventory can collapse it into the
+    // primary page. Axe output is retained unchanged — since the content
+    // is identical, the issues will match the primary anyway, and
+    // buildInventory's dedup drops the duplicate's rows. The screenshot
+    // is the only heavy operation we can avoid at this stage without
+    // splitting runContentScan in two.
+    const tmpl = auditPayload?.template || {};
+    const textHash = tmpl.textHash || "";
+    let duplicateOf = null;
+    if (seenTextHashes && textHash) {
+      const firstUrl = seenTextHashes.get(textHash);
+      if (firstUrl && firstUrl !== url) {
+        duplicateOf = firstUrl;
+      } else if (!firstUrl) {
+        seenTextHashes.set(textHash, url);
+      }
     }
 
-    const tmpl = auditPayload?.template || {};
+    // Full-page screenshot via chrome.debugger. Falls back gracefully to
+    // visible-viewport capture if debugger attach is refused (e.g. DevTools
+    // already open on this tab, chrome:// URL, policy). Skipped on
+    // content-hash duplicates (see block above).
+    let screenshot = null;
+    if (!duplicateOf) {
+      try {
+        screenshot = await captureFullPageScreenshot(tabId);
+      } catch (err) {
+        console.warn(`[EU] screenshot failed for ${url}:`, err?.message || err);
+      }
+    } else {
+      console.log(`[EU] content-hash dupe — skipping screenshot for ${url} (duplicate of ${duplicateOf})`);
+    }
+
     const out = {
       title: auditPayload?.title || tab.title || "",
       template_id: tmpl.fingerprint || "unknown",
       url_cluster: tmpl.urlCluster || "unknown",
-      text_hash: tmpl.textHash || "",
+      text_hash: textHash,
       element_counts: tmpl.elementCounts || {},
       // Full audit — same shape as multi-page mode.
       audit: {
@@ -879,6 +924,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null } = {}) {
         inapplicable: auditPayload?.inapplicable || []
       },
       screenshot, // { dataUrl, width, height } | null
+      duplicate_of: duplicateOf, // URL of first page with same text_hash, else null
       ...signals
     };
     if (collectNextLinks) {
@@ -1184,6 +1230,53 @@ function buildInventory(pages, meta) {
         for (const p of group) realPagesRaw.push(p);
       }
     }
+  }
+
+  // ── Content-hash duplicate collapse (v0.2.6) ───────────────────────
+  // Workers populate `duplicate_of` on a page record when its text_hash
+  // matches an earlier-scanned URL's hash (see inventoryInNewTab). This
+  // catches same-content-different-slug collisions that no URL-based
+  // dedup can — e.g. two WordPress pages serving identical body content
+  // under unrelated slugs (bio pages returning the same placeholder,
+  // alias pages mapped to the same template render). The primary URL is
+  // whichever one the worker scanned first; the duplicate gets folded
+  // into the primary's alt_discoveries list and removed from the main
+  // table, matching how shell pages are handled above. Errored records
+  // and paste-mode are exempt — paste-mode must keep every requested row
+  // as its own line regardless of hash collisions.
+  const hashDuplicates = [];
+  if (!noDedup) {
+    const byUrlForHash = new Map();
+    for (const p of realPagesRaw) {
+      if (p.error) continue;
+      const key = p.canonicalUrl || p.finalUrl || p.url;
+      if (key) byUrlForHash.set(key, p);
+    }
+    const kept = [];
+    for (const p of realPagesRaw) {
+      if (p.duplicate_of && !p.error) {
+        const primary = byUrlForHash.get(p.duplicate_of);
+        if (primary && primary !== p) {
+          primary.alt_discoveries = primary.alt_discoveries || [];
+          primary.alt_discoveries.push({
+            depth: p.depth,
+            source: p.source,
+            template_id: p.template_id,
+            text_hash: p.text_hash,
+            url: p.url,
+            finalUrl: p.finalUrl,
+            canonicalUrl: p.canonicalUrl,
+            reason: "same-content-hash"
+          });
+          primary.visit_count = (primary.visit_count || 1) + 1;
+          hashDuplicates.push(p);
+          continue;
+        }
+      }
+      kept.push(p);
+    }
+    realPagesRaw.length = 0;
+    for (const p of kept) realPagesRaw.push(p);
   }
 
   // ── User-journey URL dedup ─────────────────────────────────────────
@@ -1547,6 +1640,15 @@ function buildInventory(pages, meta) {
   // Compact shell-page summary for the viewer. Lets the operator see
   // "these 37 URLs all returned the homepage shell — probably soft-404s or
   // SPA route fallbacks" without these polluting the real inventory.
+  // v0.2.6 — hash-duplicate summary. Lets the operator see which URLs
+  // got folded into an earlier scan by content hash (same rendered text,
+  // different URL) so nothing is silently dropped.
+  const hashDuplicateSummary = hashDuplicates.length ? {
+    count: hashDuplicates.length,
+    sample_urls: hashDuplicates.slice(0, 20).map(p => ({ url: p.url, duplicate_of: p.duplicate_of })),
+    explanation: "These URLs returned the same rendered-text content as another URL scanned earlier in this crawl. They were folded into the primary page's alt_discoveries and excluded from the main pages + templates tables. Screenshot capture was skipped on these to save time."
+  } : null;
+
   const shellSummary = shellPages.length ? {
     count: shellPages.length,
     sample_urls: shellPages.slice(0, 20).map(p => p.url),
@@ -1563,11 +1665,14 @@ function buildInventory(pages, meta) {
       crawlDepthLabel: Number.isFinite(meta.crawlDepth) ? String(meta.crawlDepth) : "unbounded",
       generatedAt: new Date().toISOString()
     },
-    // `pages` is the real set (shell pages excluded). Keep shellPages
-    // addressable separately so nothing is silently dropped.
+    // `pages` is the real set (shell + hash-duplicate pages excluded).
+    // Both sidelined sets are kept addressable so nothing is silently
+    // dropped from the audit trail.
     pages: realPages,
     shellPages,
     shellSummary,
+    hashDuplicates,
+    hashDuplicateSummary,
     dedupSummary,
     templates, proposedSample, contentTypeSummary,
     corpusAudit,
