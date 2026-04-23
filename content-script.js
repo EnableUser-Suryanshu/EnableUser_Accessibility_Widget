@@ -17,10 +17,31 @@
 
     // Run with ALL result types enabled so we can surface the complete picture,
     // not just violations. runOnly keeps us scoped to WCAG 2.1 A/AA tags.
-    const res = await window.axe.run(document, {
+    //
+    // preload:false — axe-core by default preloads CSSOM by fetch()ing every
+    // linked stylesheet. On pages with cross-origin or CSP-blocked stylesheets
+    // (embeds like YouTube/Twitter/analytics/fonts) those fetches fail with a
+    // ProgressEvent and axe surfaces "Couldn't load preload assets:
+    // [object ProgressEvent]". Disabling preload skips that fetch; color-contrast
+    // still evaluates against same-origin + inline styles, which is where
+    // actionable contrast issues live anyway.
+    //
+    // Outer retry — belt-and-braces for the rare case where a navigation race
+    // or DOM mutation throws mid-rule-execution.
+    const runAxe = () => window.axe.run(document, {
       runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"] },
-      resultTypes: ["violations", "passes", "incomplete", "inapplicable"]
+      resultTypes: ["violations", "passes", "incomplete", "inapplicable"],
+      preload: false
     });
+    let res, lastAxeErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { res = await runAxe(); break; }
+      catch (e) {
+        lastAxeErr = e;
+        if (attempt === 2) throw lastAxeErr;
+        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+      }
+    }
     const durationMs = Math.round(performance.now() - started);
 
     // Run our custom India / Media / IS 17802 checks and merge them into the
