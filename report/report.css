@@ -508,3 +508,101 @@ td.warn { color: #a16207; font-weight: 600; }
 .media-finding-rule { font-size: 11px; margin-top: 2px; }
 .pill.impact-review { background: #e0e7ff; color: #3730a3; }
 .impact-review { color: #3730a3; font-weight: 600; }
+
+/* v0.4.0 — System Classification tab (URL-template + DOM similarity). */
+.classification-switcher {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+.classification-tolerance {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 16px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+.classification-tolerance label {
+  font-weight: 600;
+  color: #111827;
+}
+.classification-tolerance input[type=range] {
+  flex: 1;
+  max-width: 320px;
+}
+.classification-summary {
+  margin: 6px 0 14px;
+  font-size: 13px;
+}
+.classification-group {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: #fff;
+}
+.classification-group.muted {
+  background: #f9fafb;
+}
+.classification-group > summary {
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  font-size: 14px;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.classification-group > summary::-webkit-details-marker { display: none; }
+.classification-group > summary::before {
+  content: "▶";
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 10px;
+  color: #6b7280;
+  transition: transform 0.1s;
+}
+.classification-group[open] > summary::before {
+  transform: rotate(90deg);
+}
+.classification-template {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  color: #111827;
+}
+.classification-param {
+  display: inline;
+  padding: 1px 5px;
+  margin: 0 1px;
+  border-radius: 3px;
+  background: #e0e7ff;
+  color: #3730a3;
+  font-weight: 600;
+  font-size: 12px;
+}
+.classification-sublabel {
+  font-size: 12px;
+}
+.classification-url-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 14px 12px 30px;
+  font-size: 13px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.classification-url-list li {
+  padding: 3px 0;
+  border-bottom: 1px solid #f3f4f6;
+  word-break: break-all;
+}
+.classification-url-list li:last-child { border-bottom: none; }
+.classification-url-list a {
+  color: #1d4ed8;
+  text-decoration: none;
+}
+.classification-url-list a:hover { text-decoration: underline; }

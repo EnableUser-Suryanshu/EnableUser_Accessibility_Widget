@@ -23,6 +23,7 @@
       <div class="tabs" role="tablist" aria-label="Report sections">
         <button type="button" role="tab" id="tab-btn-summary" aria-selected="true" aria-controls="tabpanel-summary" class="tab active">Summary</button>
         <button type="button" role="tab" id="tab-btn-templates" aria-selected="false" aria-controls="tabpanel-templates" tabindex="-1" class="tab">Templates</button>
+        <button type="button" role="tab" id="tab-btn-classification" aria-selected="false" aria-controls="tabpanel-classification" tabindex="-1" class="tab">Classification</button>
         <button type="button" role="tab" id="tab-btn-findings" aria-selected="false" aria-controls="tabpanel-findings" tabindex="-1" class="tab">Findings</button>
         <button type="button" role="tab" id="tab-btn-screenshots" aria-selected="false" aria-controls="tabpanel-screenshots" tabindex="-1" class="tab">Screenshots</button>
       </div>
@@ -99,6 +100,30 @@
             </thead>
             <tbody></tbody>
           </table>
+        </section>
+      </div>
+
+      <div role="tabpanel" id="tabpanel-classification" aria-labelledby="tab-btn-classification" class="tabpanel" hidden>
+        <section>
+          <div class="section-head">
+            <h2>System Classification</h2>
+          </div>
+          <p class="hint">Two complementary ways to group crawled pages. <strong>URL templates</strong> (from path shape) show how the site organises its URLs — parametric segments like <code>[id]</code>, <code>[slug]</code>, <code>[date]</code>, <code>[year]</code>, <code>[uuid]</code>, <code>[hash]</code> collapse automatically when ≥3 values share a shape. <strong>DOM similarity</strong> (from 64-bit tag-path simhash) groups pages by structural near-duplication; raise the tolerance slider to catch pages that differ by a few modules.</p>
+
+          <div class="classification-switcher" role="radiogroup" aria-label="Classification view">
+            <label class="chip"><input type="radio" name="classification-view" value="url" checked /> URL template</label>
+            <label class="chip"><input type="radio" name="classification-view" value="dom" /> DOM similarity</label>
+          </div>
+
+          <div id="dom-tolerance-row" class="classification-tolerance" hidden>
+            <label for="dom-tolerance-slider">Hamming tolerance: <span id="dom-tolerance-value">0</span> bits</label>
+            <input type="range" id="dom-tolerance-slider" min="0" max="16" step="1" value="0" />
+            <span class="muted">(0 = exact hash match · higher = looser clustering)</span>
+          </div>
+
+          <p class="classification-summary muted" id="classification-summary" aria-live="polite"></p>
+
+          <div id="classification-groups"></div>
         </section>
       </div>
 

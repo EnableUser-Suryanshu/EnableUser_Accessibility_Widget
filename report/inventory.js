@@ -5,6 +5,8 @@
 
 import { deriveFromTags } from "../lib/wcag-tags.js";
 import { createZip } from "../lib/zip-writer.js";
+import { groupByTemplate } from "../lib/url-trie.js";
+import { clusterByHamming } from "../lib/dom-similarity.js";
 
 const inventoryId = new URLSearchParams(location.search).get("id");
 
@@ -1220,8 +1222,177 @@ async function main() {
   renderPages(inventory);
   renderFindings(inventory);
   renderScreenshotsTab(inventory);
+  renderClassification(inventory);
   wireTabs();
   wireDownloads(inventory);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.4.0 team-merge — System Classification tab.
+// Two views over the same pages array:
+//   • URL template: groupByTemplate() partitions by path-segment shape
+//     (from lib/url-trie.js).
+//   • DOM similarity: clusterByHamming() groups by domHash bit distance
+//     (from lib/dom-similarity.js).
+// Both views render the same collapsible-group UI so a reviewer can
+// eyeball and compare. Pages with no URL/path can't be grouped by URL;
+// pages with no domHash (PDFs, failed loads) fall into an "unhashed"
+// group in the DOM view.
+// ─────────────────────────────────────────────────────────────────────
+function renderClassification(inventory) {
+  const host = document.getElementById("classification-groups");
+  const summaryEl = document.getElementById("classification-summary");
+  const switcher = document.querySelectorAll('input[name="classification-view"]');
+  const tolRow = document.getElementById("dom-tolerance-row");
+  const tolSlider = document.getElementById("dom-tolerance-slider");
+  const tolValue = document.getElementById("dom-tolerance-value");
+  if (!host || !summaryEl) return;
+
+  const pages = (inventory.pages || []).filter(p => p.url && !p.error);
+
+  function render() {
+    const view = Array.from(switcher).find(r => r.checked)?.value || "url";
+    tolRow.hidden = view !== "dom";
+    host.innerHTML = "";
+    if (!pages.length) {
+      summaryEl.textContent = "No pages available to classify.";
+      return;
+    }
+    if (view === "url") renderUrlGroups();
+    else renderDomGroups();
+  }
+
+  function renderUrlGroups() {
+    const { grouped, ungrouped } = groupByTemplate(pages);
+    const totalTemplates = grouped.length + (ungrouped.length ? 1 : 0);
+    summaryEl.textContent =
+      `${grouped.length} URL template${grouped.length === 1 ? "" : "s"} discovered across ${pages.length} pages` +
+      (ungrouped.length ? ` · ${ungrouped.length} ungrouped (pure-parametric or singleton)` : "") +
+      ` · total groupings: ${totalTemplates}.`;
+
+    for (const g of grouped) {
+      host.appendChild(renderGroup({
+        label: formatTemplate(g.template),
+        sublabel: `${g.urls.length} pages`,
+        urls: g.urls
+      }));
+    }
+    if (ungrouped.length) {
+      host.appendChild(renderGroup({
+        label: "Ungrouped URLs",
+        sublabel: `${ungrouped.length} pages — pure-parametric or single-instance paths`,
+        urls: ungrouped,
+        muted: true
+      }));
+    }
+  }
+
+  function renderDomGroups() {
+    const tolerance = parseInt(tolSlider.value, 10) || 0;
+    tolValue.textContent = String(tolerance);
+    const hashed = pages.filter(p => p.dom_hash).map(p => ({
+      url: p.url,
+      title: p.title || "",
+      domHash: p.dom_hash,
+      domPreview: p.dom_preview || "",
+      violations: (p.audit?.violations || []).length
+    }));
+    const unhashed = pages.filter(p => !p.dom_hash);
+    const clusters = clusterByHamming(hashed, tolerance);
+    const multi = clusters.filter(c => c.urls.length >= 2);
+    const single = clusters.filter(c => c.urls.length === 1).flatMap(c => c.urls);
+
+    summaryEl.textContent =
+      `${multi.length} DOM cluster${multi.length === 1 ? "" : "s"} (≥2 pages) at tolerance ${tolerance} bits` +
+      ` · ${single.length} unique-structure page${single.length === 1 ? "" : "s"}` +
+      (unhashed.length ? ` · ${unhashed.length} unhashed (PDFs / failed loads)` : "") +
+      ` · ${pages.length} total.`;
+
+    for (const c of multi) {
+      host.appendChild(renderGroup({
+        label: `simhash ${c.centroid.slice(0, 10)}…`,
+        sublabel: `${c.urls.length} pages · ${c.preview || "(no preview)"}`,
+        urls: c.urls
+      }));
+    }
+    if (single.length) {
+      host.appendChild(renderGroup({
+        label: "Unique structure",
+        sublabel: `${single.length} page${single.length === 1 ? "" : "s"} — each with a DOM hash not matched by any other page at this tolerance`,
+        urls: single,
+        muted: true
+      }));
+    }
+    if (unhashed.length) {
+      const urls = unhashed.map(p => ({ url: p.url, title: p.title || "" }));
+      host.appendChild(renderGroup({
+        label: "Unhashed",
+        sublabel: `${urls.length} page${urls.length === 1 ? "" : "s"} — PDFs, failed loads, or pre-v0.4.0 results without a DOM hash`,
+        urls,
+        muted: true
+      }));
+    }
+  }
+
+  function formatTemplate(tmpl) {
+    // Highlight `[param]` tokens in the template string.
+    if (!tmpl) return "/";
+    return tmpl;
+  }
+
+  function renderGroup({ label, sublabel, urls, muted = false }) {
+    const details = document.createElement("details");
+    details.className = "classification-group" + (muted ? " muted" : "");
+    const summary = document.createElement("summary");
+
+    const tmplEl = document.createElement("span");
+    tmplEl.className = "classification-template";
+    // Split literal segments from [param] tokens so we can style them.
+    const parts = String(label).split(/(\[[a-z]+\])/g);
+    for (const part of parts) {
+      if (/^\[[a-z]+\]$/.test(part)) {
+        const span = document.createElement("span");
+        span.className = "classification-param";
+        span.textContent = part;
+        tmplEl.appendChild(span);
+      } else if (part) {
+        tmplEl.appendChild(document.createTextNode(part));
+      }
+    }
+    summary.appendChild(tmplEl);
+
+    const sub = document.createElement("span");
+    sub.className = "classification-sublabel muted";
+    sub.textContent = " · " + sublabel;
+    summary.appendChild(sub);
+
+    details.appendChild(summary);
+
+    const ul = document.createElement("ul");
+    ul.className = "classification-url-list";
+    for (const u of urls) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = u.url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = u.url;
+      li.appendChild(a);
+      if (u.title) {
+        const t = document.createElement("span");
+        t.className = "muted";
+        t.textContent = " — " + u.title;
+        li.appendChild(t);
+      }
+      ul.appendChild(li);
+    }
+    details.appendChild(ul);
+    return details;
+  }
+
+  switcher.forEach(r => r.addEventListener("change", render));
+  tolSlider?.addEventListener("input", render);
+  render();
 }
 
 function renderShellPages(inventory) {

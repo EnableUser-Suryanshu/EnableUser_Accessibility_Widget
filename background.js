@@ -429,6 +429,12 @@ async function scanInventory(tabId, options) {
       template_id: tmpl.fingerprint || "unknown",
       url_cluster: tmpl.urlCluster || "unknown",
       text_hash: tmpl.textHash || "",
+      // v0.4.0 team-merge — DOM simhash + top-level tag preview. Captured
+      // alongside the SiteScope-style fingerprint so the inventory UI can
+      // offer BOTH exact-match template grouping AND Hamming-distance
+      // near-dup clustering.
+      dom_hash: tmpl.domHash || "",
+      dom_preview: tmpl.domPreview || "",
       element_counts: tmpl.elementCounts || {},
       audit: {
         scanStartedAt: auditPayload?.scanStartedAt || null,
@@ -913,6 +919,9 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
       template_id: tmpl.fingerprint || "unknown",
       url_cluster: tmpl.urlCluster || "unknown",
       text_hash: textHash,
+      // v0.4.0 team-merge — DOM simhash + top-level tag preview.
+      dom_hash: tmpl.domHash || "",
+      dom_preview: tmpl.domPreview || "",
       element_counts: tmpl.elementCounts || {},
       // Full audit — same shape as multi-page mode.
       audit: {
@@ -2539,6 +2548,9 @@ function buildReport(pages, meta) {
     template_id: p.template?.fingerprint || "",
     url_cluster: p.template?.urlCluster || "",
     text_hash: p.template?.textHash || "",
+    // v0.4.0 team-merge — DOM simhash in the multi-page audit CSV export.
+    dom_hash: p.template?.domHash || "",
+    dom_preview: p.template?.domPreview || "",
     text_length: p.template?.textLength ?? "",
     signature_items: p.template?.signatureItems ?? "",
     elem_headings: p.template?.elementCounts?.headings ?? "",
@@ -2731,7 +2743,8 @@ async function downloadCsv(reportId) {
     "url", "page_title", "depth", "source", "status",
     "violations", "passes", "incomplete", "inapplicable",
     "violation_rules", "pass_rules", "incomplete_rules", "inapplicable_rules",
-    "template_id", "url_cluster", "text_hash", "text_length", "signature_items",
+    "template_id", "url_cluster", "text_hash", "dom_hash", "dom_preview",
+    "text_length", "signature_items",
     "elem_headings", "elem_sections", "elem_forms", "elem_aria_roles",
     "elem_links", "elem_images", "elem_buttons", "elem_inputs",
     "scan_duration_ms", "axe_version", "error"

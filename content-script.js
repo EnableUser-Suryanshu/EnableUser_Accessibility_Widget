@@ -12,6 +12,35 @@
       await new Promise(r => window.addEventListener("load", r, { once: true }));
     }
 
+    // v0.4.0 team-merge — MutationObserver quiet-wait.
+    // Wait for the DOM to stop mutating before snapshotting structural
+    // signals (axe AND our template fingerprint). On SPAs/hydrating pages
+    // the page is "loaded" well before React/Vue/Angular has finished
+    // swapping the initial server HTML for client-rendered content; axe
+    // run against the pre-hydration tree misses actionable issues (bad
+    // ARIA on async-inserted widgets, focus traps in lazy-rendered
+    // modals, contrast on client-painted text), and our DOM simhash is
+    // wrong because half the page hasn't mounted yet. Cap at 10s so a
+    // page that keeps twitching (ads, carousels) can't stall the scan.
+    await new Promise(resolve => {
+      const MAX_MS = 10000;
+      const QUIET_MS = 1000;
+      const startMs = Date.now();
+      let lastMutation = startMs;
+      let obs;
+      try {
+        obs = new MutationObserver(() => { lastMutation = Date.now(); });
+        obs.observe(document, { subtree: true, childList: true });
+      } catch { resolve(); return; }
+      const finish = () => { try { obs.disconnect(); } catch {} resolve(); };
+      (function tick() {
+        const now = Date.now();
+        if (now - startMs >= MAX_MS) return finish();
+        if (now - lastMutation >= QUIET_MS) return finish();
+        setTimeout(tick, 150);
+      })();
+    });
+
     const started = performance.now();
     const startedAt = new Date().toISOString();
 
@@ -226,17 +255,111 @@ async function computeTemplateSignals() {
       inputs: qsaDeep("input,select,textarea").length
     };
 
+    // v0.4.0 team-merge — DOM simhash + preview.
+    // Orthogonal second dedup/classification signal: a presence-based
+    // 64-bit simhash over tag 3-grams along every root-to-leaf path in
+    // document.body, with ads and aria-hidden subtrees excluded. Unlike
+    // our existing structural fingerprint (which is a SHA-1 of a
+    // class/depth/role bucketed signature), the simhash is a Hamming-
+    // distance-comparable hash — two templates that differ slightly
+    // (e.g. one extra <aside> module) still differ by only a few bits,
+    // so the report can cluster near-duplicates with a tolerance slider.
+    // Falls to empty string on hostile/empty DOMs; the dedup path treats
+    // empty hashes as "unhashed" rather than collapsing them together.
+    const { domHash, domPreview } = computeDomSimhash(document);
+
     return {
-      fingerprint,                           // 8-hex structural hash — template id
-      textHash,                              // 8-hex content hash — exact-content dedup signal
+      fingerprint,                           // 12-hex structural hash — template id (SiteScope style)
+      textHash,                              // 12-hex exact-content hash — content dedup signal
+      domHash,                               // 16-hex FNV-64 simhash — near-dup / similarity clustering
+      domPreview,                            // Top-level tag path (debug/UI)
       urlCluster: clusterUrl(location.href), // path-shape bucket (/blog [index], /services/[detail], ...)
       signatureItems: sigItems.length,
       elementCounts,
       textLength: text.length
     };
   } catch (err) {
-    return { fingerprint: "error", textHash: "error", urlCluster: "unknown", error: String(err?.message || err) };
+    return { fingerprint: "error", textHash: "error", domHash: "", domPreview: "", urlCluster: "unknown", error: String(err?.message || err) };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.4.0 team-merge — DOM simhash.
+// Port of team crawler-extension's extractLinksInPage simhash path. Walks
+// document.body collecting tag 3-grams along every root-to-leaf path as
+// presence features (Set, not Bag), hashes each feature with FNV-64, votes
+// each bit across features, and emits the sign vector as a 16-hex string.
+// Presence-based (not count-weighted) means two pages built from the same
+// template but with different numbers of repeated cards/posts hash alike —
+// exactly the property we want for template clustering.
+// ─────────────────────────────────────────────────────────────────────────────
+function computeDomSimhash(doc) {
+  const result = { domHash: "", domPreview: "" };
+  try {
+    const EXCLUDE = new Set(["script", "style", "noscript", "link", "template", "meta", "br", "hr", "head", "title"]);
+    const AD_RE = /\b(ad|ads|advert|adsbygoogle|google_ads|banner-ad|banner_ad)\b/i;
+
+    const elIsHidden = el => {
+      if (!el || !el.getAttribute) return false;
+      if (el.getAttribute("aria-hidden") === "true") return true;
+      const s = el.style;
+      if (s && (s.display === "none" || s.visibility === "hidden")) return true;
+      return false;
+    };
+    const elIsAd = el => {
+      const c = el.className;
+      if (!c || typeof c !== "string") return false;
+      return AD_RE.test(c);
+    };
+
+    const features = new Set();
+    const topTags = [];
+    const MAX_DEPTH = 10;
+    const walk = (el, recent, depth) => {
+      if (depth > MAX_DEPTH) return;
+      const tag = el.tagName && el.tagName.toLowerCase();
+      if (!tag || EXCLUDE.has(tag)) return;
+      if (elIsHidden(el) || elIsAd(el)) return;
+      const nextRecent = recent.length < 3
+        ? recent.concat(tag)
+        : [recent[1], recent[2], tag];
+      if (nextRecent.length >= 2) features.add(nextRecent.join(">"));
+      if (depth <= 2 && topTags.length < 12) topTags.push(tag);
+      const kids = el.children;
+      for (let i = 0; i < kids.length; i++) walk(kids[i], nextRecent, depth + 1);
+    };
+
+    if (doc.body) walk(doc.body, [], 0);
+
+    if (features.size > 0) {
+      const MASK = 0xFFFFFFFFFFFFFFFFn;
+      const FNV_OFFSET = 0xcbf29ce484222325n;
+      const FNV_PRIME = 0x100000001b3n;
+      const hash64 = str => {
+        let h = FNV_OFFSET;
+        for (let i = 0; i < str.length; i++) {
+          h ^= BigInt(str.charCodeAt(i));
+          h = (h * FNV_PRIME) & MASK;
+        }
+        return h;
+      };
+      const bits = new Array(64).fill(0);
+      for (const feature of features) {
+        const h = hash64(feature);
+        for (let i = 0; i < 64; i++) {
+          if (((h >> BigInt(i)) & 1n) === 1n) bits[i]++;
+          else bits[i]--;
+        }
+      }
+      let out = 0n;
+      for (let i = 0; i < 64; i++) {
+        if (bits[i] > 0) out |= (1n << BigInt(i));
+      }
+      result.domHash = out.toString(16).padStart(16, "0");
+      result.domPreview = topTags.join(" › ");
+    }
+  } catch { /* return empty hash on any failure — treated as "unhashed" */ }
+  return result;
 }
 
 // Collect the same set of signature strings SiteScope's v5.3
