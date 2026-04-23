@@ -17,7 +17,6 @@ import {
 } from "./lib/discovery.js";
 import { buildScopeDocx } from "./lib/docx-writer.js";
 import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
-import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -978,94 +977,13 @@ function buildInventory(pages, meta) {
     }
   }
 
-  // Dedup is URL-exact first (canonical → finalUrl → queued URL) via the
-  // first-pass loop above. Template-based and audit-signature-based
-  // single-key collapses have been removed (v6): two audit-distinct pages
+  // Dedup is URL-exact only (canonical → finalUrl → queued URL). See the
+  // first-pass loop above for the merge logic. Template-based and audit-
+  // signature-based collapses have been removed: two audit-distinct pages
   // that happen to share a shell (team profiles, portfolio entries, news
-  // posts) must stay as SEPARATE URLs because they ARE separate human
-  // destinations.
+  // posts) are SEPARATE URLs in the inventory, because they are separate
+  // URLs a visitor could reach and land on.
   //
-  // v12 adds a second, narrow pass — "cross-folder same-slug dedup" —
-  // that catches a specific phantom pattern the URL-exact pass misses:
-  // the same content served under two different URL paths (e.g.
-  // /services/web-design AND /web-design, or /about/team AND
-  // /company/team). These share no canonical, no finalUrl, no queued URL,
-  // so URL-exact dedup treats them as two rows. They DO share four
-  // characteristics simultaneously, and requiring all four is what keeps
-  // this pass safe from the v6 over-collapse failure mode:
-  //
-  //   1. Same template class (from classifyTemplate: home / legal / auth
-  //      / blog-post / html-sitemap / other).
-  //   2. Same leaf slug (last path segment after language-tag strip).
-  //   3. Same template_id (DOM fingerprint — full structural hash).
-  //   4. Same text_hash (rendered text content hash).
-  //
-  // Conjunction (3) AND (4) is what distinguishes this from the v6 failure:
-  //   • Two team profile pages share template_id but DIFFERENT text_hash.
-  //     → NOT collapsed (different content). ✓
-  //   • Two portfolio items share template_id but DIFFERENT text_hash.
-  //     → NOT collapsed. ✓
-  //   • /services/web-design and /web-design share EVERYTHING.
-  //     → Collapsed. Shortest path wins. ✓
-  //
-  // Dropped URLs are preserved on the winner's alt_discoveries list so
-  // the operator can audit the dedup decision, exactly as URL-exact
-  // dedup does.
-  const crossFolderReason = { cross_folder_dropped: 0 };
-  if (!noDedup && realPages.length > 1) {
-    const byTuple = new Map();
-    for (const p of realPages) {
-      if (p.error) continue;
-      const slugKey = templateSlugKey(p.canonicalUrl || p.finalUrl || p.url);
-      const fp = p.template_id || "";
-      const th = p.text_hash || "";
-      // Require non-empty fingerprint AND non-empty text hash. Without
-      // both, we can't tell "same content, different URL" from "two
-      // blank records we couldn't fingerprint". Records without both
-      // hashes pass through untouched.
-      if (!slugKey || !fp || !th) continue;
-      const key = `${slugKey}||${fp}||${th}`;
-      const arr = byTuple.get(key);
-      if (!arr) byTuple.set(key, [p]);
-      else arr.push(p);
-    }
-    const toDrop = new Set();
-    for (const group of byTuple.values()) {
-      if (group.length < 2) continue;
-      // Shortest path wins. Ties broken by the existing scoreRecord()
-      // (more signal = better record to keep).
-      group.sort((a, b) => {
-        const ua = a.canonicalUrl || a.finalUrl || a.url || "";
-        const ub = b.canonicalUrl || b.finalUrl || b.url || "";
-        const la = (new URL(ua, "http://x").pathname).split("/").filter(Boolean).length;
-        const lb = (new URL(ub, "http://x").pathname).split("/").filter(Boolean).length;
-        if (la !== lb) return la - lb;
-        return scoreRecord(b) - scoreRecord(a);
-      });
-      const winner = group[0];
-      winner.alt_discoveries = winner.alt_discoveries || [];
-      for (let i = 1; i < group.length; i++) {
-        const d = group[i];
-        winner.alt_discoveries.push({
-          depth: d.depth,
-          source: d.source,
-          template_id: d.template_id,
-          text_hash: d.text_hash,
-          url: d.url,
-          finalUrl: d.finalUrl,
-          canonicalUrl: d.canonicalUrl,
-          cross_folder_reason: "same-slug-same-fingerprint-same-text"
-        });
-        toDrop.add(d);
-        crossFolderReason.cross_folder_dropped++;
-      }
-      winner.visit_count = (winner.visit_count || 1) + (group.length - 1);
-    }
-    if (toDrop.size > 0) {
-      realPages = realPages.filter(p => !toDrop.has(p));
-    }
-  }
-
   // template_id and text_hash are still computed per-record and carried
   // through — the report renders "template cluster" groupings from them
   // so an auditor can see which pages share a shell without those pages
@@ -1076,8 +994,7 @@ function buildInventory(pages, meta) {
     duplicates_collapsed: realPagesRaw.length - realPages.length,
     by_canonical: dedupReason.by_canonical,
     by_final_url: dedupReason.by_final_url,
-    by_queued_url: dedupReason.by_queued_url,
-    by_cross_folder: crossFolderReason.cross_folder_dropped
+    by_queued_url: dedupReason.by_queued_url
   };
 
   // Group by template fingerprint ALONE. Previously the key was
