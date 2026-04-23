@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EnableUser Accessibility Widget",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA using axe-core. Produces a CSV report.",
   "action": {
     "default_popup": "popup/popup.html",

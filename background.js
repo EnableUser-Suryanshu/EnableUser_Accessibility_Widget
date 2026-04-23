@@ -152,10 +152,17 @@ async function scanCurrent(tabId, options) {
 }
 
 async function scanMulti(tabId, options) {
-  // No arbitrary upper cap on maxUrls or crawlDepth — the operator decides how
-  // big the crawl is. Floor-only: at least 1 URL, at least depth 1.
+  // No arbitrary upper cap on maxUrls — operator decides. Floor of 1.
   const maxUrls = floorInt(options?.maxUrls, DEFAULT_MAX_URLS, 1);
-  const crawlDepth = floorInt(options?.crawlDepth, DEFAULT_CRAWL_DEPTH, 1);
+  // v11: depth unbounded by default, matching scanInventory. The priority
+  // queue naturally biases shallower pages first, so unbounded depth just
+  // means "keep expanding the frontier until maxUrls fills or it empties".
+  // A user-supplied crawlDepth > 0 is still honoured exactly for operators
+  // who deliberately want to short-circuit a deep site.
+  const rawDepth = parseInt(options?.crawlDepth, 10);
+  const crawlDepth = (Number.isFinite(rawDepth) && rawDepth > 0)
+    ? rawDepth
+    : Number.POSITIVE_INFINITY;
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
 
   const tab = await chrome.tabs.get(tabId);
