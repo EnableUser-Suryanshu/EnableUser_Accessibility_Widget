@@ -231,12 +231,17 @@ function extractSignature(root) {
   const sig = [];
   const baseDepth = depthOf(root);
 
-  // Bucket a count into {0, 1, few=2-5, many=6-20, mass=21+}
+  // v0.2.8 — Widened buckets. The previous {0, 1, few=2-5, many=6-20,
+  // mass=21+} split "few" vs "many" at 5, which meant blog posts with 4
+  // h3s clustered separately from posts with 6 h3s even though they
+  // shared the same template shell. Real-world article bodies vary from
+  // 2 to 20+ headings depending on length; those need to fall into ONE
+  // bucket for clustering to be meaningful.
   const bucket = n =>
     n === 0 ? "0" :
     n === 1 ? "1" :
-    n <= 5 ? "few" :
-    n <= 20 ? "many" : "mass";
+    n <= 20 ? "many" :
+    "mass";
   const depthBucket = d =>
     d <= 2 ? "shallow" :
     d <= 5 ? "mid" :
@@ -248,21 +253,48 @@ function extractSignature(root) {
     "table", "thead", "tbody", "tfoot",
     "h1", "h2", "h3", "h4", "h5", "h6"
   ];
+  // v0.2.8 — Aggregate-per-tag rather than per-element. Previously this
+  // emitted ONE sig line per landmark element, so a blog post with 8
+  // <h3> headings produced 8 lines (each with class + depth + kids
+  // count). Two posts with identical shells but different body lengths
+  // therefore hashed differently — which is why greysky.capital showed
+  // 58 pages / 54 templates when the ~40 blog posts should have
+  // collapsed into one template cluster. We now emit: (a) ONE bucketed-
+  // count line per landmark tag, (b) ONE structural-signal line for the
+  // FIRST occurrence of each tag (classes, depth, kids). This captures
+  // the template shell without being held hostage by body content.
   for (const tag of landmarkTags) {
-    for (const el of qsaDeep(tag, root)) {
-      const d = depthBucket(depthOf(el) - baseDepth);
-      const kids = bucket(el.children?.length || 0);
-      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}:k=${kids}`);
-    }
-  }
-
-  for (const el of qsaDeep("[role]", root)) {
+    const els = qsaDeep(tag, root);
+    const n = els.length;
+    if (n === 0) continue;
+    sig.push(`${tag}:n=${bucket(n)}`);
+    const el = els[0];
     const d = depthBucket(depthOf(el) - baseDepth);
-    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}`);
+    const kids = bucket(el.children?.length || 0);
+    sig.push(`${tag}[0]:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}:k=${kids}`);
   }
 
-  const hCounts = [1, 2, 3, 4, 5, 6].map(n => qsaDeep(`h${n}`, root).length);
-  sig.push("H:" + hCounts.join("-"));
+  // v0.2.8 — Same aggregation for [role]-bearing elements. Group by
+  // role value, emit count bucket + first-element signal.
+  const roleGroups = new Map();
+  for (const el of qsaDeep("[role]", root)) {
+    const r = el.getAttribute("role") || "";
+    if (!roleGroups.has(r)) roleGroups.set(r, []);
+    roleGroups.get(r).push(el);
+  }
+  for (const [role, arr] of roleGroups) {
+    sig.push(`role:${role}:n=${bucket(arr.length)}`);
+    const el = arr[0];
+    const d = depthBucket(depthOf(el) - baseDepth);
+    sig.push(`role:${role}[0]:${el.tagName.toLowerCase()}:${firstClasses(el, 3)}:d=${d}`);
+  }
+
+  // v0.2.8 — H-count now bucketed instead of exact integer counts.
+  // Prior "H:1-5-8-3-0-0" vs "H:1-5-12-4-0-0" caused different hashes
+  // for two posts that share the same template but differ in body
+  // heading count.
+  const hBuckets = [1, 2, 3, 4, 5, 6].map(n => bucket(qsaDeep(`h${n}`, root).length));
+  sig.push("H:" + hBuckets.join("-"));
 
   const LAYOUT_PATTERNS = [
     "layout", "template", "container", "wrapper", "grid", "flex", "row", "col-",
