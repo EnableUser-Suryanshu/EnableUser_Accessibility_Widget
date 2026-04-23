@@ -1613,11 +1613,18 @@ async function blobToDataUrl(blob) {
   return `data:${blob.type};base64,${btoa(binary)}`;
 }
 
-async function collectNavLinks(tabId) {
+async function collectNavLinks(tabId, opts = {}) {
+  // opts.noScroll (v0.2.1) is forwarded into the in-page navSurfacedCollect
+  // run. Pass true from seedDiscovery() because the seed tab IS the user's
+  // visible tab — scrolling it makes the "Scan" button look broken. Leave
+  // false for hidden worker tabs (scanInNewTab / inventoryInNewTab) which
+  // open with active:false and can safely scroll for full nav harvest.
+  const noScroll = !!(opts && opts.noScroll);
   try {
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       func: navSurfacedCollect,
+      args: [{ noScroll }],
       world: "ISOLATED"
     });
     return Array.isArray(result) ? result : [];
@@ -1659,7 +1666,13 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   const [sitemapUrls, homepageLinks, navLinks] = await Promise.all([
     seedOrigin ? discoverSeedsFromOrigin(seedOrigin).catch(() => []) : Promise.resolve([]),
     seedOrigin ? discoverHomepageLinks(startUrl).catch(() => ({ hreflang: [], canonical: null, nextPrev: [], feeds: [] })) : Promise.resolve({ hreflang: [], canonical: null, nextPrev: [], feeds: [] }),
-    collectNavLinks(tabId).catch(() => [])
+    // noScroll: true — the seed tab IS the user's visible tab. We already
+    // captured the seed screenshot in its initial scroll position; scrolling
+    // now would (a) visibly jerk the page up/down for 10-30s, (b) trigger
+    // sticky-header / scroll-listener side effects that linger after restore.
+    // Static-DOM nav harvest still runs; sitemap / hreflang / feed discovery
+    // above cover the routes we'd otherwise have surfaced via scroll.
+    collectNavLinks(tabId, { noScroll: true }).catch(() => [])
   ]);
 
   // Feed discovery depends on the homepage autodiscovery links, so it runs
