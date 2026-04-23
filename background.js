@@ -1126,17 +1126,49 @@ function buildInventory(pages, meta) {
     // Paste-mode: every page goes to realPagesRaw. No shell sidelining.
     for (const p of pages) realPagesRaw.push(p);
   } else {
+    // v0.2.3 — shell detection runs in two passes:
+    //
+    //   Pass A (seed-shell): any non-seed page whose (template_id,
+    //   text_hash) matches the seed's is a soft-404 to the home route.
+    //   This is the classic SPA case where /about and /contact and /foo
+    //   all fall through to the home template because the client router
+    //   doesn't have a matching route.
+    //
+    //   Pass B (cluster-shell): group non-seed non-error pages by
+    //   (template_id, text_hash). Any cluster of ≥2 pages sharing the
+    //   same structural fingerprint AND the same text hash is almost
+    //   certainly rendering the identical error page. Canonical example:
+    //   Metronic / admin-template sites where the sidebar has dozens of
+    //   demo links (/crafted/*, /apps/chat/*, /error/*) that all 404 in
+    //   production to the same "page not found" template. The (fp, text)
+    //   key cannot collapse legitimate template clusters because real
+    //   template pages have DIFFERENT text_hash values (their content
+    //   differs), so they end up in separate clusters of 1 and stay in
+    //   realPagesRaw. Only pages that render the literal identical DOM
+    //   AND identical text collapse here.
+    const groups = new Map(); // `${fp}::${textHash}` → [page, …]
     for (const p of pages) {
       if (p.error) { realPagesRaw.push(p); continue; }
       if (p === seedPage) { realPagesRaw.push(p); continue; }
-      const isShell =
-        seedFp && p.template_id === seedFp &&
-        seedTextHash && p.text_hash === seedTextHash;
-      if (isShell) {
-        p.isShell = true;
-        shellPages.push(p);
+      const fp = p.template_id || "";
+      const th = p.text_hash || "";
+      if (!fp || !th) { realPagesRaw.push(p); continue; }
+      const key = `${fp}::${th}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(p);
+    }
+    for (const group of groups.values()) {
+      const sample = group[0];
+      const matchesSeed =
+        seedFp && sample.template_id === seedFp &&
+        seedTextHash && sample.text_hash === seedTextHash;
+      const isPhantomCluster = group.length >= 2;
+      if (matchesSeed) {
+        for (const p of group) { p.isShell = true; p.shellReason = "matches-seed-shell"; shellPages.push(p); }
+      } else if (isPhantomCluster) {
+        for (const p of group) { p.isShell = true; p.shellReason = "identical-shell-cluster"; shellPages.push(p); }
       } else {
-        realPagesRaw.push(p);
+        for (const p of group) realPagesRaw.push(p);
       }
     }
   }
@@ -1505,7 +1537,11 @@ function buildInventory(pages, meta) {
   const shellSummary = shellPages.length ? {
     count: shellPages.length,
     sample_urls: shellPages.slice(0, 20).map(p => p.url),
-    explanation: "These URLs were crawled but returned the same DOM + text as the seed page. On SPAs this usually means the client router matched them to the default/home route (soft-404). Excluded from the main pages + templates tables so they don't inflate inventory counts."
+    by_reason: {
+      matches_seed_shell: shellPages.filter(p => p.shellReason === "matches-seed-shell").length,
+      identical_shell_cluster: shellPages.filter(p => p.shellReason === "identical-shell-cluster").length
+    },
+    explanation: "These URLs were crawled but returned a DOM + text identical to another crawled page. Two patterns are detected: (a) pages whose fingerprint + text matches the seed/home — typically an SPA client router soft-404'ing to the default route; (b) a cluster of ≥2 non-seed pages all rendering the same DOM + text — typically an error/404 page (common with admin-dashboard template sites whose sidebars carry many demo-route links that 404 in production). Excluded from the main pages + templates tables so they don't inflate inventory counts."
   } : null;
 
   return {
