@@ -45,6 +45,14 @@ const DEFAULT_CRAWL_DEPTH = 1;
 const CONCURRENT_TABS = 200;
 const TAB_TIMEOUT_MS = 60_000;
 const SETTLE_MS = 15_000;
+// Per-origin concurrency cap. CONCURRENT_TABS=200 is a GLOBAL worker count;
+// on a single-origin crawl (e.g. one 160-page marketing site) all 200
+// workers slam the same host, the target server's per-IP rate limit trips,
+// Chrome's renderer pool saturates, and tabs start failing with "frame
+// was removed" / "Cannot access contents" before axe ever runs. PER_ORIGIN_TABS
+// caps the host-level parallelism; on a multi-site crawl the global 200 is
+// still reachable (e.g. 25 origins × 8 tabs each).
+const PER_ORIGIN_TABS = 8;
 
 const pending = new Map();
 const reports = new Map();
@@ -55,7 +63,7 @@ const inventories = new Map(); // inventoryId → { inventory, files: { docx: Bl
 // (~32-64MB). The inventory stores only {id, bytes} references; the viewer
 // fetches each image on demand via the GET_SCREENSHOT message.
 const inventoryScreenshots = new Map(); // screenshotId → { dataUrl, bytes }
-const rateLimiter = new RateLimiter();
+const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 
 // Enforce a non-zero floor on numeric options without imposing a ceiling.
 function floorInt(raw, fallback, floor = 1) {
@@ -185,8 +193,17 @@ async function scanMulti(tabId, options) {
   const active = new Set();
 
   async function launch(req) {
+    // `acquired` tracks whether wait() returned a non-null token. Only if
+    // it did do we need to call release() — a null return means the URL
+    // was unparseable and no semaphore slot was taken. We call release()
+    // in a finally so the slot is freed even if reportSuccess/reportFailure
+    // or the scan work throws. Missing a release leaks the slot and
+    // eventually stalls the origin (workers stuck waiting for a slot that
+    // will never free).
+    let acquired = false;
     try {
-      await rateLimiter.wait(req.url);
+      const token = await rateLimiter.wait(req.url);
+      acquired = token != null;
       const r = await scanInNewTab(req.url, req.depth < crawlDepth, { queue });
       rateLimiter.reportSuccess(req.url);
 
@@ -219,6 +236,8 @@ async function scanMulti(tabId, options) {
         error: String(err?.message || err),
         violations: [], passes: [], incomplete: [], inapplicable: []
       });
+    } finally {
+      if (acquired) rateLimiter.release(req.url);
     }
   }
 
@@ -374,8 +393,13 @@ async function scanInventory(tabId, options) {
 
   async function launch(req) {
     console.log(`[EU] launch: ${req.url} (source=${req.source}, depth=${req.depth})`);
+    // See comment on the audit-mode launch above for why `acquired` is
+    // tracked and why release() lives in a finally block. Short version:
+    // semaphore slots MUST be freed on every exit path or the origin stalls.
+    let acquired = false;
     try {
-      await rateLimiter.wait(req.url);
+      const token = await rateLimiter.wait(req.url);
+      acquired = token != null;
       const result = await inventoryInNewTab(req.url, req.depth < crawlDepth, { queue });
       rateLimiter.reportSuccess(req.url);
 
@@ -421,6 +445,8 @@ async function scanInventory(tabId, options) {
     } catch (err) {
       rateLimiter.reportFailure(req.url, { status: err?.status || 0 });
       pages.push({ url: req.url, depth: req.depth, source: req.source, error: String(err?.message || err) });
+    } finally {
+      if (acquired) rateLimiter.release(req.url);
     }
     // Progress tick after every launched URL (success or error). Don't
     // await — fire-and-forget so a slow chrome.storage write can't block
