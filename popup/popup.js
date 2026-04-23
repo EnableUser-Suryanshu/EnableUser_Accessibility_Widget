@@ -9,8 +9,16 @@ const maxUrlsInput = $("opt-max-urls");
 const depthInput = $("opt-depth");
 const profileSelect = $("opt-profile");
 
-const DEFAULT_MAX_URLS = 50;
+// First-run defaults — what the operator sees the first time they open the
+// popup with no stored preferences yet. Combined (WCAG + IS 17802 + GIGW)
+// covers the India-compliance use case most users of this build are here
+// for, and 5000 URLs is a sensible ceiling for mid-size marketing/content
+// sites without being so large it invites runaway crawls. Both are freely
+// editable per-scan and overridden by whatever the operator last saved to
+// chrome.storage.local.
+const DEFAULT_MAX_URLS = 5000;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
+const DEFAULT_PROFILE = "combined_in";
 // No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
 // operator decides the size of the crawl. background.js enforces only a
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
@@ -30,7 +38,7 @@ function readScanOptions() {
   // Infinity. No upper clamp — the operator picks any depth they want.
   const rawDepth = parseInt(depthInput.value, 10);
   const crawlDepth = Number.isFinite(rawDepth) && rawDepth >= 0 ? rawDepth : DEFAULT_DEPTH;
-  const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : "wcag21aa";
+  const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : DEFAULT_PROFILE;
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
   chrome.storage?.local.set({ maxUrls, crawlDepth, profile }).catch(() => {});
