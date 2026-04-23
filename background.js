@@ -46,6 +46,14 @@ const DEFAULT_CRAWL_DEPTH = 1;
 const CONCURRENT_TABS = 200;
 const TAB_TIMEOUT_MS = 60_000;
 const SETTLE_MS = 15_000;
+// v12.2 — hard per-worker ceiling. waitForTabComplete (60s) + SETTLE_MS (15s)
+// + axe run + screenshot + content-signals + link harvest should complete
+// in well under this on any well-behaved page. If a worker exceeds it,
+// something genuinely pathological has happened (hung debugger attach,
+// unreachable extension message bus, runaway JS on the page) and we
+// force-abandon so the pool can move on instead of leaving the tab open
+// indefinitely. See withTimeout() below.
+const WORKER_HARD_TIMEOUT_MS = 150_000;
 // Per-origin concurrency cap. CONCURRENT_TABS=200 is a GLOBAL worker count;
 // on a single-origin crawl (e.g. one 160-page marketing site) all 200
 // workers slam the same host, the target server's per-IP rate limit trips,
@@ -247,7 +255,12 @@ async function scanMulti(tabId, options) {
     try {
       const token = await rateLimiter.wait(req.url);
       acquired = token != null;
-      const r = await scanInNewTab(req.url, req.depth < crawlDepth, { queue });
+      // v12.2 — hard ceiling so one stuck tab can't stall the whole pool.
+      const r = await withTimeout(
+        scanInNewTab(req.url, req.depth < crawlDepth, { queue }),
+        WORKER_HARD_TIMEOUT_MS,
+        `worker ${req.url}`
+      );
       rateLimiter.reportSuccess(req.url);
 
       // Settled-URL dedup: tab landed on a URL another worker already scanned.
@@ -443,7 +456,12 @@ async function scanInventory(tabId, options) {
     try {
       const token = await rateLimiter.wait(req.url);
       acquired = token != null;
-      const result = await inventoryInNewTab(req.url, req.depth < crawlDepth, { queue });
+      // v12.2 — hard ceiling so one stuck tab can't stall the whole pool.
+      const result = await withTimeout(
+        inventoryInNewTab(req.url, req.depth < crawlDepth, { queue }),
+        WORKER_HARD_TIMEOUT_MS,
+        `worker ${req.url}`
+      );
       rateLimiter.reportSuccess(req.url);
 
       // Settled-URL dedup: the tab landed on a URL another worker already
@@ -863,16 +881,42 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null } = {}) {
 // chrome.runtime.sendMessage (practical ceiling ~32-64MB) even on crawls of
 // hundreds of full-page screenshots. The renderer fetches each image on
 // demand via the GET_SCREENSHOT message.
+// v12.2 — wrap each debugger call in a race-with-timeout so a stuck
+// chrome.debugger.attach can't hang the worker (and therefore the whole
+// pool) forever. Chrome throttles/queues concurrent debugger sessions
+// when many tabs request attach at once (CONCURRENT_TABS=200 easily
+// exceeds the practical ceiling). Before this cap, an attach that got
+// queued past Chrome's internal timeout just never resolved, which left
+// the worker stuck mid-`inventoryInNewTab` with its tab still open.
+const DEBUGGER_ATTACH_TIMEOUT_MS = 15_000;
+const DEBUGGER_CMD_TIMEOUT_MS = 20_000;
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
 async function captureFullPageScreenshot(tabId) {
   const target = { tabId };
-  await chrome.debugger.attach(target, "1.3");
+  let attached = false;
   try {
-    await chrome.debugger.sendCommand(target, "Page.enable");
-    const result = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: true,
-      fromSurface: true
-    });
+    await withTimeout(chrome.debugger.attach(target, "1.3"), DEBUGGER_ATTACH_TIMEOUT_MS, "debugger.attach");
+    attached = true;
+    await withTimeout(chrome.debugger.sendCommand(target, "Page.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Page.enable");
+    const result = await withTimeout(
+      chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        fromSurface: true
+      }),
+      DEBUGGER_CMD_TIMEOUT_MS,
+      "Page.captureScreenshot"
+    );
     if (!result?.data) return null;
     const id = `shot-${crypto.randomUUID()}`;
     const dataUrl = `data:image/png;base64,${result.data}`;
@@ -880,7 +924,9 @@ async function captureFullPageScreenshot(tabId) {
     inventoryScreenshots.set(id, { dataUrl, bytes });
     return { id, bytes };
   } finally {
-    try { await chrome.debugger.detach(target); } catch {}
+    if (attached) {
+      try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {}
+    }
   }
 }
 
