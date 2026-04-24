@@ -56,8 +56,17 @@
         </section>
 
         <section>
-          <h2>All Pages</h2>
-          <p class="hint">Full inventory. Click a row to expand element counts, actual component values (form fields, modal titles, tab labels, menu items), audit findings, and the full-page screenshot.</p>
+          <div class="section-head">
+            <h2>All Pages</h2>
+            <div class="url-actions" id="pages-url-actions">
+              <button type="button" id="btn-copy-all-pages" class="section-action">Copy all URLs</button>
+              <button type="button" id="btn-download-all-pages" class="section-action">Download all URLs (.txt)</button>
+              <button type="button" id="btn-copy-auditable-pages" class="section-action primary-action">Copy auditable URLs</button>
+              <button type="button" id="btn-download-auditable-pages" class="section-action">Download auditable URLs (.txt)</button>
+              <span id="pages-url-status" class="muted" aria-live="polite"></span>
+            </div>
+          </div>
+          <p class="hint">Full inventory. Click a row to expand element counts, actual component values (form fields, modal titles, tab labels, menu items), audit findings, and the full-page screenshot. <strong>Auditable URLs</strong> = successful scans only (errors, shell/soft-404 pages, and content-hash duplicates excluded).</p>
           <table id="pages-table">
             <thead>
               <tr>

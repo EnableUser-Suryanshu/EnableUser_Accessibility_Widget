@@ -1,6 +1,6 @@
 import { toCsv } from "./lib/csv-writer.js";
-import { ALL_AA_CRITERIA, extractCriteriaFromTags } from "./lib/wcag-tags.js";
-import { standardsFor, PROFILES, PROFILE_KEYS, isInProfile, profileClause } from "./lib/standards.js";
+import { ALL_AA_CRITERIA, extractCriteriaFromTags, CRITERION_BY_NUM } from "./lib/wcag-tags.js";
+import { standardsFor, PROFILES, PROFILE_KEYS, isInProfile, profileClause, tagsForProfile, criteriaForProfile, versionForProfile } from "./lib/standards.js";
 import {
   RequestQueue,
   RateLimiter,
@@ -17,7 +17,7 @@ import {
 } from "./lib/discovery.js";
 import { probeAllCmsApis } from "./lib/cms-probes.js";
 import { buildScopeDocx } from "./lib/docx-writer.js";
-import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx } from "./lib/xlsx-writer.js";
+import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx, buildReportXlsx } from "./lib/xlsx-writer.js";
 import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
 import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
@@ -65,6 +65,30 @@ const WORKER_HARD_TIMEOUT_MS = 150_000;
 // caps the host-level parallelism; on a multi-site crawl the global 200 is
 // still reachable (e.g. 25 origins × 8 tabs each).
 const PER_ORIGIN_TABS = 8;
+
+// axe runOnly tags for the in-progress scan. Set at the start of each scan
+// handler from the operator-selected profile (tagsForProfile) and read by
+// runContentScan, which pushes it into the page via window.__EU_SCAN_OPTS so
+// content-script.js runs the correct WCAG version (2.0 / 2.1 / 2.2). Only one
+// scan runs at a time (the popup disables its buttons while scanning), so a
+// module-level value is safe.
+let ACTIVE_AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
+// Per-check toggles + overlay-dismissal flag for the in-progress scan, set by
+// each scan handler from the popup options and pushed to the page (with the tag
+// set) by runContentScan via window.__EU_SCAN_OPTS. Default = everything on.
+let ACTIVE_CHECKS = { axe: true, india: true, media: true, is17802: true, pdfOffice: true };
+let ACTIVE_DISMISS = false;
+let ACTIVE_AUDIT_BOTH = false;
+function checksFromOptions(options) {
+  const c = (options && options.checks) || {};
+  return {
+    axe: c.axe !== false,
+    india: c.india !== false,
+    media: c.media !== false,
+    is17802: c.is17802 !== false,
+    pdfOffice: c.pdfOffice !== false
+  };
+}
 
 // v12 fix — in-flight settle tracker. Bug: on sites where multiple
 // discovered URLs (e.g. `/about`, `/about-us`, `/about/?ref=nav`,
@@ -131,6 +155,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "GET_INVENTORY") sendResponse(await getInventory(msg.inventoryId));
       else if (msg.type === "GET_SCREENSHOT") sendResponse(await getScreenshot(msg.id));
       else if (msg.type === "DOWNLOAD_CSV") sendResponse(await downloadCsv(msg.reportId));
+      else if (msg.type === "DOWNLOAD_REPORT_XLSX") sendResponse(await downloadReportXlsx(msg.reportId));
       else if (msg.type === "DOWNLOAD_SCOPE_DOCX") sendResponse(await downloadInventoryFile(msg.inventoryId, "docx"));
       else if (msg.type === "DOWNLOAD_INVENTORY_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "xlsx"));
       else if (msg.type === "DOWNLOAD_CLUSTERS_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "clusters"));
@@ -188,8 +213,12 @@ chrome.tabs.onRemoved.addListener(tabId => {
 
 async function scanCurrent(tabId, options) {
   const tab = await chrome.tabs.get(tabId);
-  const result = await scanInExistingTab(tabId);
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  ACTIVE_AXE_TAGS = tagsForProfile(profile);
+  ACTIVE_CHECKS = checksFromOptions(options);
+  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  const result = await scanInExistingTab(tabId);
   const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url, profile });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
@@ -210,6 +239,10 @@ async function scanMulti(tabId, options) {
     ? rawDepth
     : Number.POSITIVE_INFINITY;
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  ACTIVE_AXE_TAGS = tagsForProfile(profile);
+  ACTIVE_CHECKS = checksFromOptions(options);
+  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
 
   const tab = await chrome.tabs.get(tabId);
   const startUrl = tab.url;
@@ -354,7 +387,17 @@ async function scanInventory(tabId, options) {
   // Mark the seed's URL as settled so workers dedup against it.
   queue.markSettled(startUrl);
 
-  console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth}`);
+  // Resolve the compliance profile up front so the WCAG tag set is active
+  // BEFORE the seed scan runs (it was previously resolved only after the
+  // crawl, so every page scanned with the default 2.1 tags regardless of the
+  // operator's selection). ACTIVE_AXE_TAGS drives content-script.js.
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  ACTIVE_AXE_TAGS = tagsForProfile(profile);
+  ACTIVE_CHECKS = checksFromOptions(options);
+  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+
+  console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth} profile=${profile} tags=${ACTIVE_AXE_TAGS.join(",")}`);
 
   // Reset live-progress state. Written to chrome.storage.local so the popup
   // can show it even if the popup was closed while the scan ran. Updated
@@ -407,6 +450,10 @@ async function scanInventory(tabId, options) {
     const auditPayload = await runContentScan(tabId);
     const signals = await collectContentSignals(tabId);
     let screenshot = null;
+    // Seed runs in the user's VISIBLE tab — element capture scrolls each
+    // element into view, which would jar the page (the codebase deliberately
+    // avoids scrolling the seed). So the seed gets a full-page shot only;
+    // element screenshots are captured on the hidden worker tabs.
     try { screenshot = await captureFullPageScreenshot(tabId); }
     catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
     const tmpl = auditPayload?.template || {};
@@ -440,6 +487,11 @@ async function scanInventory(tabId, options) {
         scanStartedAt: auditPayload?.scanStartedAt || null,
         scanDurationMs: auditPayload?.scanDurationMs || 0,
         testEngine: auditPayload?.testEngine || null,
+        testRunner: auditPayload?.testRunner || null,
+        testEnvironment: auditPayload?.testEnvironment || null,
+        toolOptions: auditPayload?.toolOptions || null,
+        axeTimestamp: auditPayload?.axeTimestamp || null,
+        axeUrl: auditPayload?.axeUrl || null,
         violations: auditPayload?.violations || [],
         passes: auditPayload?.passes || [],
         incomplete: auditPayload?.incomplete || [],
@@ -559,19 +611,18 @@ async function scanInventory(tabId, options) {
   // it clears.
   await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
-  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile });
 
   // v13.1 — audit every discovered PDF for structural accessibility
   // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
   // in mediaRows with an `pdfAudit` object and appends ruleset findings
   // so the report renders them alongside media-checks.js findings.
-  await enrichPdfRowsWithAudit(inventory);
+  if (ACTIVE_CHECKS.pdfOffice) await enrichPdfRowsWithAudit(inventory);
 
   // v0.2.2 — same treatment for Office documents. Byte-level zip read of
   // each docx/xlsx/pptx, extract dc:title / dc:language, verify at least
   // one heading paragraph style (docx) / sheet (xlsx) / slide (pptx).
-  await enrichOfficeRowsWithAudit(inventory);
+  if (ACTIVE_CHECKS.pdfOffice) await enrichOfficeRowsWithAudit(inventory);
 
   const inventoryId = `inv-${Date.now()}`;
 
@@ -619,16 +670,26 @@ async function scanInventory(tabId, options) {
 async function persistInventory(inventoryId, inventory) {
   const record = { [`inv:${inventoryId}`]: inventory };
   const seen = new Set();
-  const collect = (shot) => {
-    if (!shot?.id || seen.has(shot.id)) return;
-    const entry = inventoryScreenshots.get(shot.id);
+  const collectById = (id) => {
+    if (!id || seen.has(id)) return;
+    const entry = inventoryScreenshots.get(id);
     if (entry) {
-      record[`shot:${shot.id}`] = entry;
-      seen.add(shot.id);
+      record[`shot:${id}`] = entry;
+      seen.add(id);
     }
   };
-  for (const p of inventory.pages || []) collect(p.screenshot);
-  for (const t of inventory.templates || []) collect(t.sample_screenshot);
+  const collect = (shot) => collectById(shot?.id);
+  // v0.4.2 — also persist the issue-specific element screenshots referenced by
+  // violation nodes (node.elementShotId), so they survive service-worker
+  // eviction and the viewer / Excel thumbnailer can resolve them via the
+  // storage fallback just like full-page screenshots.
+  const collectShotsFromAudit = (audit) => {
+    for (const v of (audit?.violations || [])) {
+      for (const n of (v.nodes || [])) collectById(n.elementShotId);
+    }
+  };
+  for (const p of inventory.pages || []) { collect(p.screenshot); collectShotsFromAudit(p.audit); }
+  for (const t of inventory.templates || []) { collect(t.sample_screenshot); collectShotsFromAudit(t.sample_audit); }
   await chrome.storage.local.set(record);
   console.log(`[EU] persisted inventory ${inventoryId} + ${seen.size} screenshot(s) to storage.local`);
 }
@@ -664,6 +725,10 @@ async function scanList(options) {
     rawLines = String(options?.text || "").split(/\r?\n/);
   }
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  ACTIVE_AXE_TAGS = tagsForProfile(profile);
+  ACTIVE_CHECKS = checksFromOptions(options);
+  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
 
   const parsed = [];
   const seenExact = new Set();
@@ -789,10 +854,10 @@ async function scanList(options) {
 
   // v13.1 PDF audit for the pasted URL list path too — every PDF linked
   // from any pasted page gets inspected.
-  await enrichPdfRowsWithAudit(inventory);
+  if (ACTIVE_CHECKS.pdfOffice) await enrichPdfRowsWithAudit(inventory);
 
   // v0.2.2 Office audit for the pasted URL list path as well.
-  await enrichOfficeRowsWithAudit(inventory);
+  if (ACTIVE_CHECKS.pdfOffice) await enrichOfficeRowsWithAudit(inventory);
 
   const inventoryId = `inv-${Date.now()}`;
   inventories.set(inventoryId, { inventory, files: {} });
@@ -906,7 +971,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
     let screenshot = null;
     if (!duplicateOf) {
       try {
-        screenshot = await captureFullPageScreenshot(tabId);
+        screenshot = await captureFullPageScreenshot(tabId, auditPayload?.violations || null);
       } catch (err) {
         console.warn(`[EU] screenshot failed for ${url}:`, err?.message || err);
       }
@@ -928,6 +993,11 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
         scanStartedAt: auditPayload?.scanStartedAt || null,
         scanDurationMs: auditPayload?.scanDurationMs || 0,
         testEngine: auditPayload?.testEngine || null,
+        testRunner: auditPayload?.testRunner || null,
+        testEnvironment: auditPayload?.testEnvironment || null,
+        toolOptions: auditPayload?.toolOptions || null,
+        axeTimestamp: auditPayload?.axeTimestamp || null,
+        axeUrl: auditPayload?.axeUrl || null,
         violations: auditPayload?.violations || [],
         passes: auditPayload?.passes || [],
         incomplete: auditPayload?.incomplete || [],
@@ -979,7 +1049,7 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-async function captureFullPageScreenshot(tabId) {
+async function captureFullPageScreenshot(tabId, violations = null) {
   const target = { tabId };
   let attached = false;
   try {
@@ -995,17 +1065,124 @@ async function captureFullPageScreenshot(tabId) {
       DEBUGGER_CMD_TIMEOUT_MS,
       "Page.captureScreenshot"
     );
-    if (!result?.data) return null;
-    const id = `shot-${crypto.randomUUID()}`;
-    const dataUrl = `data:image/png;base64,${result.data}`;
-    const bytes = result.data.length;
-    inventoryScreenshots.set(id, { dataUrl, bytes });
-    return { id, bytes };
+    let shot = null;
+    if (result?.data) {
+      const id = `shot-${crypto.randomUUID()}`;
+      inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${result.data}`, bytes: result.data.length });
+      shot = { id, bytes: result.data.length };
+    }
+    // v0.4.2 — issue-specific element screenshots. Reuse THIS debugger session
+    // (one attach per page — attaching a second time would double the
+    // contention the 200-tab pool already strains) to capture a cropped,
+    // highlighted shot of each distinct violating element. Mutates the
+    // violation nodes in place, tagging each with elementShotId so the report
+    // and the Excel can show the issue exactly where it occurs.
+    if (Array.isArray(violations) && violations.length) {
+      try {
+        const n = await captureElementShotsInSession(target, violations);
+        if (n) console.log(`[EU] captured ${n} element screenshot(s)`);
+      } catch (err) {
+        console.warn("[EU] element screenshots failed:", err?.message || err);
+      }
+    }
+    return shot;
   } finally {
     if (attached) {
       try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {}
     }
   }
+}
+
+// Per-page cap + context padding (CSS px) for issue-specific element shots.
+const MAX_ELEMENT_SHOTS_PER_PAGE = 30;
+const ELEMENT_SHOT_PAD = 14;
+const ELEMENT_SHOT_MAX_DIM = 1600;
+
+// Within an already-attached debugger session, capture one highlighted, cropped
+// screenshot per DISTINCT violating element. Deduped by selector and capped so
+// a page with hundreds of nodes can't explode storage/time. Tags each matched
+// violation node with `elementShotId`. Returns the number captured.
+async function captureElementShotsInSession(target, violations) {
+  const selToNodes = new Map();
+  for (const v of violations) {
+    for (const n of (v.nodes || [])) {
+      const sel = elementSelectorOf(n);
+      if (!sel) continue;
+      if (!selToNodes.has(sel)) selToNodes.set(sel, []);
+      selToNodes.get(sel).push(n);
+    }
+  }
+  if (selToNodes.size === 0) return 0;
+  await withTimeout(chrome.debugger.sendCommand(target, "Runtime.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.enable");
+  let captured = 0;
+  for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
+    try {
+      const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+        expression: elementHighlightExpr(sel), returnByValue: true
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
+      const rect = evalRes?.result?.value;
+      if (!rect || !rect.ok) { await clearElementHighlight(target); continue; }
+      const clip = {
+        x: Math.max(0, rect.x), y: Math.max(0, rect.y),
+        width: Math.max(1, Math.min(rect.width, ELEMENT_SHOT_MAX_DIM)),
+        height: Math.max(1, Math.min(rect.height, ELEMENT_SHOT_MAX_DIM)),
+        scale: 1
+      };
+      const shot = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "png", captureBeyondViewport: true, fromSurface: true, clip
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Page.captureScreenshot(element)");
+      await clearElementHighlight(target);
+      if (!shot?.data) continue;
+      const id = `shot-el-${crypto.randomUUID()}`;
+      inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${shot.data}`, bytes: shot.data.length });
+      for (const node of selToNodes.get(sel)) node.elementShotId = id;
+      captured++;
+    } catch (err) {
+      console.warn(`[EU] element shot failed (${sel}):`, err?.message || err);
+      try { await clearElementHighlight(target); } catch {}
+    }
+  }
+  return captured;
+}
+
+// axe node.target is frame-aware (an array). Top-frame nodes carry a single CSS
+// selector string; nested-frame targets (length > 1) can't be queried from the
+// top document, so we skip them.
+function elementSelectorOf(node) {
+  const t = node && node.target;
+  if (Array.isArray(t)) return (t.length === 1 && typeof t[0] === "string") ? t[0] : null;
+  if (typeof t === "string") return t;
+  return null;
+}
+
+// Page-side expression: outline the element (outline doesn't reflow layout),
+// scroll it into view, and return its page-space rect (+ padding). Stashes the
+// previous inline styles on window so clearElementHighlight can restore them.
+function elementHighlightExpr(sel) {
+  return `(function(){
+    try {
+      var el = document.querySelector(${JSON.stringify(sel)});
+      if (!el || !el.getBoundingClientRect) return { ok:false };
+      try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e){}
+      var r = el.getBoundingClientRect();
+      window.__EU_HL = { el: el, outline: el.style.outline, offset: el.style.outlineOffset, shadow: el.style.boxShadow };
+      el.style.outline = '3px solid #e11d48';
+      el.style.outlineOffset = '2px';
+      el.style.boxShadow = '0 0 0 4px rgba(225,29,72,0.35)';
+      var pad = ${ELEMENT_SHOT_PAD};
+      return { ok: (r.width>0 && r.height>0),
+        x: r.left + window.scrollX - pad, y: r.top + window.scrollY - pad,
+        width: r.width + pad*2, height: r.height + pad*2 };
+    } catch(e){ return { ok:false }; }
+  })()`;
+}
+
+async function clearElementHighlight(target) {
+  try {
+    await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function(){ try { var h=window.__EU_HL; if(h&&h.el){ h.el.style.outline=h.outline; h.el.style.outlineOffset=h.offset; h.el.style.boxShadow=h.shadow; } window.__EU_HL=null; } catch(e){} })()`
+    }), 5000, "clearElementHighlight");
+  } catch {}
 }
 
 async function sha1Prefix(str, hex) {
@@ -1805,19 +1982,26 @@ async function downloadInventoryFile(inventoryId, kind) {
 // unless the caller's crawl had zero screenshots to begin with.
 // ─────────────────────────────────────────────────────────────────────
 async function buildThumbnailMap(inventory) {
-  const pages = (inventory?.pages || []).filter(p => !p.error && p.screenshot?.id);
-  if (!pages.length) return null;
+  // Collect every shot id to thumbnail: full-page screenshots AND the
+  // issue-specific element screenshots referenced by violation nodes.
+  const ids = [];
+  const seen = new Set();
+  for (const p of (inventory?.pages || [])) {
+    if (p.error) continue;
+    if (p.screenshot?.id && !seen.has(p.screenshot.id)) { seen.add(p.screenshot.id); ids.push(p.screenshot.id); }
+    for (const v of (p.audit?.violations || [])) {
+      for (const n of (v.nodes || [])) {
+        if (n.elementShotId && !seen.has(n.elementShotId)) { seen.add(n.elementShotId); ids.push(n.elementShotId); }
+      }
+    }
+  }
+  if (!ids.length) return null;
 
   const out = new Map();
-  const seen = new Set();
   const MAX_W = 300;
   const MAX_H = 400;
 
-  for (const p of pages) {
-    const id = p.screenshot.id;
-    if (seen.has(id)) continue;
-    seen.add(id);
-
+  for (const id of ids) {
     let dataUrl = inventoryScreenshots.get(id)?.dataUrl || null;
     if (!dataUrl) {
       try {
@@ -2254,6 +2438,18 @@ function runContentScan(tabId) {
     }, TAB_TIMEOUT_MS);
     pending.set(tabId, { resolve, reject, timeoutId });
     try {
+      // Hand the operator-selected WCAG tag set to the page in the same
+      // ISOLATED world the content script reads from, so axe runs the chosen
+      // version. Best-effort — on failure content-script.js falls back to its
+      // built-in WCAG 2.1 A+AA default.
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: false },
+          world: "ISOLATED",
+          func: (opts) => { window.__EU_SCAN_OPTS = opts; },
+          args: [{ axeTags: ACTIVE_AXE_TAGS, checks: ACTIVE_CHECKS, dismissOverlays: ACTIVE_DISMISS, auditBoth: ACTIVE_AUDIT_BOTH }]
+        });
+      } catch (e) { /* fall back to content-script default */ }
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: false },
         files: ["content-script.js"],
@@ -2307,8 +2503,17 @@ function buildReport(pages, meta) {
     videoIssues: 0, audioIssues: 0, iframeIssues: 0, documentIssues: 0
   };
 
+  // Criterion scope is driven by the selected profile / WCAG version, so the
+  // summary + per-profile conformance tables reflect exactly the SCs actually
+  // tested (WCAG 2.2 adds e.g. 2.5.8 Target Size and drops 4.1.1 Parsing;
+  // Section 508 restricts to the WCAG 2.0 subset).
+  const profileKey = (meta && meta.profile && PROFILES[meta.profile]) ? meta.profile : "wcag21aa";
+  const reportCriteria = criteriaForProfile(profileKey)
+    .map(num => CRITERION_BY_NUM[num])
+    .filter(Boolean);
+
   const criterionStats = new Map();
-  for (const c of ALL_AA_CRITERIA) {
+  for (const c of reportCriteria) {
     criterionStats.set(c.num, { pagesPassed: new Set(), pagesFailed: new Set(), totalViolations: 0 });
   }
 
@@ -2453,7 +2658,7 @@ function buildReport(pages, meta) {
     // four categories uniformly.
     pushCategoryRows(p, p.violations, "violation", []);
 
-    for (const c of ALL_AA_CRITERIA) {
+    for (const c of reportCriteria) {
       if (!failed.has(c.num)) {
         const st = criterionStats.get(c.num);
         if (st && !p.error) st.pagesPassed.add(pageUrl);
@@ -2518,7 +2723,7 @@ function buildReport(pages, meta) {
     }
   }
 
-  const summaryRows = ALL_AA_CRITERIA.map(c => {
+  const summaryRows = reportCriteria.map(c => {
     const st = criterionStats.get(c.num);
     return {
       wcag_criterion: c.num,
@@ -2624,7 +2829,7 @@ function buildReport(pages, meta) {
     const p = PROFILES[key];
     let applicable = 0, failed = 0, passed = 0, violations = 0;
     const failingClauses = [];
-    for (const c of ALL_AA_CRITERIA) {
+    for (const c of reportCriteria) {
       if (!isInProfile(key, c.num)) continue;
       applicable++;
       const st = criterionStats.get(c.num);
@@ -2660,7 +2865,7 @@ function buildReport(pages, meta) {
   });
 
   return {
-    meta: { ...meta, generatedAt: new Date().toISOString(), totalPages: pages.length, totalTemplates: templatesRows.length },
+    meta: { ...meta, generatedAt: new Date().toISOString(), totalPages: pages.length, totalTemplates: templatesRows.length, profileLabel: (PROFILES[profileKey] && PROFILES[profileKey].label) || "WCAG 2.1 AA", wcagVersion: versionForProfile(profileKey) },
     summaryRows,
     issueRows,
     passRows,
@@ -2681,6 +2886,21 @@ function sumNodes(rules) {
   let n = 0;
   for (const r of rules || []) n += (r.nodes || []).length;
   return n;
+}
+
+async function downloadReportXlsx(reportId) {
+  const report = reports.get(reportId);
+  if (!report) return { ok: false, error: "Report expired" };
+  const blob = await buildReportXlsx(report);
+  const dataUrl = await blobToDataUrl(blob);
+  const host = safeHost(report.meta.seedUrl);
+  const stamp = report.meta.generatedAt.replace(/[:.]/g, "-");
+  await chrome.downloads.download({
+    url: dataUrl,
+    filename: `enableuser-report-${host}-${stamp}.xlsx`,
+    saveAs: false
+  });
+  return { ok: true };
 }
 
 async function downloadCsv(reportId) {
@@ -2791,7 +3011,7 @@ async function downloadCsv(reportId) {
     (report.meta.discoveryStats
       ? `# Discovery: nav=${report.meta.discoveryStats.nav} linkRels=${report.meta.discoveryStats.linkRels ?? 0} hreflang=${report.meta.discoveryStats.hreflang} feed=${report.meta.discoveryStats.feed ?? 0}/${report.meta.discoveryStats.feedRaw ?? 0} sitemap=${report.meta.discoveryStats.sitemap}/${report.meta.discoveryStats.sitemapRaw ?? 0} body=${report.meta.discoveryStats.body}\r\n`
       : ``) +
-    `\r\n## WCAG 2.1 AA Summary\r\n` + summaryCsv +
+    `\r\n## ${report.meta.profileLabel || "WCAG 2.1 AA"} — Criterion Summary\r\n` + summaryCsv +
     `\r\n\r\n## Conformance by Standard (WCAG / IS 17802 / EN 301 549 / Section 508 / ADA)\r\n` + profilesCsv +
     `\r\n\r\n## Templates\r\n` + templatesCsv +
     `\r\n\r\n## Violations (one row per violation × WCAG criterion × node)\r\n` + issuesCsv +

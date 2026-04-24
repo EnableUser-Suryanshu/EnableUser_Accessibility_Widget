@@ -1,11 +1,22 @@
 {
   "manifest_version": 3,
   "name": "EnableUser Accessibility Widget",
-  "version": "0.4.0",
-  "description": "Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA, IS 17802 (Ch 7 / 9 / 10 / 12 / 13), EN 301 549, Section 508, and ADA Title III using axe-core plus India-specific and IS 17802 site-governance checks. Audits linked PDF and Office (docx/xlsx/pptx) documents for structural accessibility. Classifies crawled pages by URL-template shape and DOM simhash (Hamming-distance clustering). Produces a CSV report, scope docx, and component inventory.",
+  "version": "0.4.1",
+  "description": "Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA, IS 17802 (Ch 7 / 9 / 10 / 12 / 13), EN 301 549, Section 508, and ADA Title III using axe-core plus India-specific and IS 17802 site-governance checks. Audits linked PDF and Office (docx/xlsx/pptx) documents for structural accessibility. Classifies crawled pages by URL-template shape and DOM simhash (Hamming-distance clustering). Produces a CSV report, scope docx, component inventory, and one-click copy/download of the auditable-URL list.",
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "EnableUser Accessibility Widget"
+    "default_title": "EnableUser Accessibility Widget",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
   },
   "background": {
     "service_worker": "background.js",
@@ -20,7 +31,7 @@
     "unlimitedStorage",
     "debugger"
   ],
-  "optional_host_permissions": [
+  "host_permissions": [
     "http://*/*",
     "https://*/*"
   ]

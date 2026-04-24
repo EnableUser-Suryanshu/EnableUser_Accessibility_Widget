@@ -153,6 +153,8 @@ function renderNodeDetails(i) {
   }
   document.getElementById("meta").textContent =
     `${modeLabel} · ${report.meta.totalPages} page(s) · generated ${new Date(report.meta.generatedAt).toLocaleString()} · seed: ${report.meta.seedUrl}`;
+  const _summaryHeading = document.getElementById("summary-heading");
+  if (_summaryHeading && report.meta.profileLabel) _summaryHeading.textContent = `${report.meta.profileLabel} — Criterion Status`;
 
   // ── Stats tiles ──
   const totalViolations = report.issueRows.length;
@@ -450,6 +452,15 @@ function renderNodeDetails(i) {
 
   document.getElementById("btn-download").addEventListener("click", async () => {
     const r = await send({ type: "DOWNLOAD_CSV", reportId });
+    if (!r?.ok) alert(r?.error || "Download failed");
+  });
+
+  document.getElementById("btn-download-xlsx").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-download-xlsx");
+    const prev = btn.textContent;
+    btn.disabled = true; btn.textContent = "Preparing…";
+    const r = await send({ type: "DOWNLOAD_REPORT_XLSX", reportId });
+    btn.disabled = false; btn.textContent = prev;
     if (!r?.ok) alert(r?.error || "Download failed");
   });
 

@@ -97,16 +97,28 @@
           <input id="opt-depth" type="number" min="0" step="1" value="0" />
         </label>
         <label class="opt wide">
-          <span>Compliance profile</span>
+          <span>Standard / WCAG version</span>
           <select id="opt-profile">
-            <option value="wcag21aa">WCAG 2.1 AA</option>
+            <option value="wcag21aa" selected>WCAG 2.1 AA</option>
+            <option value="wcag22aa">WCAG 2.2 AA</option>
             <option value="is17802">IS 17802 (India)</option>
-            <option value="combined_in" selected>WCAG 2.1 AA + IS 17802 (Combined India)</option>
+            <option value="combined_in">WCAG 2.1 AA + IS 17802 (Combined India)</option>
             <option value="en301549">EN 301 549 (EU)</option>
             <option value="section508">Section 508 (US)</option>
             <option value="ada">ADA Title III (US)</option>
           </select>
         </label>
+      </section>
+
+      <section class="options" id="checks-options">
+        <div class="opt wide"><span>Checks to run (mix &amp; match — run any subset)</span></div>
+        <label class="chk"><input type="checkbox" id="opt-check-axe" checked /> axe-core (WCAG rules)</label>
+        <label class="chk"><input type="checkbox" id="opt-check-india" /> India language / script checks</label>
+        <label class="chk"><input type="checkbox" id="opt-check-is17802" /> IS 17802 governance (statement, feedback, relay)</label>
+        <label class="chk"><input type="checkbox" id="opt-check-media" checked /> Media checks (video / audio / document links)</label>
+        <label class="chk"><input type="checkbox" id="opt-check-pdfoffice" checked /> PDF / Office document audit</label>
+        <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss cookie / consent / modal overlays before scanning</label>
+        <label class="chk"><input type="checkbox" id="opt-audit-both" checked /> Audit BOTH the overlay and the page (two passes — slower)</label>
       </section>
 
       <p id="status" class="status" hidden></p>
@@ -116,7 +128,7 @@
       <p>To subscribe to the advanced features of EnableUser, kindly contact:<br />
         <a href="mailto:teamenableuser@gmail.com">teamenableuser@gmail.com</a>
       </p>
-      <p class="meta">Version 0.1.0 | Powered by axe-core</p>
+      <p class="meta">Version 0.4.1 | Powered by axe-core</p>
     </footer>
 
     <script src="popup.js" type="module"></script>

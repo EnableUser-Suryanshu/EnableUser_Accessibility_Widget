@@ -8,6 +8,13 @@ const statusEl = $("status");
 const maxUrlsInput = $("opt-max-urls");
 const depthInput = $("opt-depth");
 const profileSelect = $("opt-profile");
+const chkAxe = $("opt-check-axe");
+const chkIndia = $("opt-check-india");
+const chkIs17802 = $("opt-check-is17802");
+const chkMedia = $("opt-check-media");
+const chkPdfOffice = $("opt-check-pdfoffice");
+const chkDismiss = $("opt-dismiss-overlays");
+const chkAuditBoth = $("opt-audit-both");
 
 // First-run defaults — what the operator sees the first time they open the
 // popup with no stored preferences yet. Combined (WCAG 2.1 AA + IS 17802)
@@ -18,16 +25,24 @@ const profileSelect = $("opt-profile");
 // chrome.storage.local.
 const DEFAULT_MAX_URLS = 5000;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
-const DEFAULT_PROFILE = "combined_in";
+const DEFAULT_PROFILE = "wcag21aa";
 // No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
 // operator decides the size of the crawl. background.js enforces only a
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
-const VALID_PROFILES = ["wcag21aa", "is17802", "combined_in", "en301549", "section508", "ada"];
+const VALID_PROFILES = ["wcag21aa", "wcag22aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
   if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
+  const c = s?.checks || {};
+  if (chkAxe) chkAxe.checked = c.axe !== false;
+  if (chkIndia) chkIndia.checked = c.india === true;
+  if (chkIs17802) chkIs17802.checked = c.is17802 === true;
+  if (chkMedia) chkMedia.checked = c.media !== false;
+  if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice !== false;
+  if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
+  if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
 }).catch(() => {});
 
 function readScanOptions() {
@@ -39,10 +54,19 @@ function readScanOptions() {
   const rawDepth = parseInt(depthInput.value, 10);
   const crawlDepth = Number.isFinite(rawDepth) && rawDepth >= 0 ? rawDepth : DEFAULT_DEPTH;
   const profile = VALID_PROFILES.includes(profileSelect.value) ? profileSelect.value : DEFAULT_PROFILE;
+  const checks = {
+    axe: chkAxe ? chkAxe.checked : true,
+    india: chkIndia ? chkIndia.checked : true,
+    is17802: chkIs17802 ? chkIs17802.checked : true,
+    media: chkMedia ? chkMedia.checked : true,
+    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : true
+  };
+  const dismissOverlays = chkDismiss ? chkDismiss.checked : false;
+  const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
-  chrome.storage?.local.set({ maxUrls, crawlDepth, profile }).catch(() => {});
-  return { maxUrls, crawlDepth, profile };
+  chrome.storage?.local.set({ maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth }).catch(() => {});
+  return { maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth };
 }
 
 function setStatus(msg, isError = false) {
@@ -223,7 +247,7 @@ btnList?.addEventListener("click", async () => {
   setStatus(`Template check — scanning ${urls.length} URL${urls.length === 1 ? "" : "s"} (${opts.profile}). Axe + screenshot + fingerprint per URL.`);
   const res = await send({
     type: "SCAN_LIST",
-    options: { urls, profile: opts.profile }
+    options: { urls, profile: opts.profile, checks: opts.checks, dismissOverlays: opts.dismissOverlays, auditBoth: opts.auditBoth }
   });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Template check failed.", true); return; }

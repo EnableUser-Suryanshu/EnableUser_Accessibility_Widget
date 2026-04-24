@@ -26,6 +26,17 @@ h2 .muted { color: #6b7280; font-weight: 400; margin-left: 6px; }
 }
 .section-action:hover { background: #1d4ed8; }
 .section-action:disabled { background: #94a3b8; cursor: not-allowed; }
+.section-action.primary-action { background: #047857; }
+.section-action.primary-action:hover { background: #065f46; }
+
+/* ── URL-list actions (All Pages section, v0.4.1) ─────────────────── */
+.url-actions {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  justify-content: flex-end;
+}
+.url-actions .muted { color: #6b7280; font-size: 12px; }
+.url-actions .ok { color: #047857; font-size: 12px; font-weight: 600; }
+.url-actions .fail { color: #b91c1c; font-size: 12px; font-weight: 600; }
 
 /* ── Tab bar ───────────────────────────────────────────────────────── */
 .tabs {
@@ -402,6 +413,19 @@ button.primary:hover { background: #1e3a8a; }
   max-width: 100%;
   max-height: none;
   cursor: zoom-out;
+}
+/* Issue-specific element screenshots in the Findings table — small by default,
+   click to expand. .element-shot-cell keeps the column narrow. */
+.element-shot-cell { width: 180px; }
+.element-shot-thumb {
+  max-width: 168px;
+  max-height: 64px;
+  object-fit: contain;
+  object-position: top left;
+}
+.element-shot-thumb.expanded {
+  max-width: 520px;
+  max-height: none;
 }
 .components-detail { margin-top: 14px; }
 .components-detail strong { font-size: 12px; }

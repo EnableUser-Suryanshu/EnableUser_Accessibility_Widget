@@ -6,7 +6,12 @@
 
 (async () => {
   try {
-    if (typeof window.axe === "undefined") throw new Error("axe-core not loaded");
+    // Operator's scan options (tag set, per-check toggles, overlay dismissal)
+    // handed in by background.js via window.__EU_SCAN_OPTS in this ISOLATED world.
+    const scanOpts = (typeof window !== "undefined" && window.__EU_SCAN_OPTS) || {};
+    const checks = scanOpts.checks || {};
+    const runAxeWanted = checks.axe !== false; // default ON
+    if (runAxeWanted && typeof window.axe === "undefined") throw new Error("axe-core not loaded");
 
     if (document.readyState !== "complete") {
       await new Promise(r => window.addEventListener("load", r, { once: true }));
@@ -57,19 +62,69 @@
     //
     // Outer retry — belt-and-braces for the rare case where a navigation race
     // or DOM mutation throws mid-rule-execution.
+    // Tag set is chosen by the operator's WCAG version selection and handed in
+    // by background.js via window.__EU_SCAN_OPTS (set in the same ISOLATED
+    // world immediately before this script is injected). Falls back to WCAG
+    // 2.1 A+AA if nothing was provided.
+    const axeTags = Array.isArray(scanOpts.axeTags) && scanOpts.axeTags.length
+      ? scanOpts.axeTags
+      : ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
+    // xpath:true + ancestry:true — axe omits both by default (they come back
+    // "" / [":root"]). Enabling them populates the XPath and Ancestry columns
+    // that the report, CSV, and XLSX already expose but were always blank.
     const runAxe = () => window.axe.run(document, {
-      runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"] },
+      runOnly: { type: "tag", values: axeTags },
       resultTypes: ["violations", "passes", "incomplete", "inapplicable"],
-      preload: false
+      preload: false,
+      xpath: true,
+      ancestry: true
     });
+    // Run axe. Three cases:
+    //  • dismissOverlays + auditBoth → audit TWICE: once with the overlay
+    //    present (captures the banner/modal's OWN issues) and once after
+    //    dismissing it (the real page), then merge (dedupe nodes by selector+HTML).
+    //  • dismissOverlays only → dismiss, then audit the real page once.
+    //  • neither → audit once as loaded.
+    // axe is also optional: with it off we emit an empty result and let the
+    // custom rules below populate the payload.
     let res, lastAxeErr;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try { res = await runAxe(); break; }
-      catch (e) {
-        lastAxeErr = e;
-        if (attempt === 2) throw lastAxeErr;
-        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+    const runAxeRetry = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { return await runAxe(); }
+        catch (e) {
+          lastAxeErr = e;
+          if (attempt === 2) throw lastAxeErr;
+          await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+        }
       }
+    };
+    if (runAxeWanted) {
+      if (scanOpts.dismissOverlays && scanOpts.auditBoth) {
+        // Two passes ONLY when an overlay is actually present. Pass 1 (overlay
+        // up) captures the banner/modal's own issues; we dismiss; if something
+        // was dismissed we run pass 2 on the real page and merge. If nothing
+        // was dismissed (no modal on this page) the second pass would be
+        // identical, so we skip it — no wasted double-run on plain pages.
+        const before = await runAxeRetry();
+        let dismissed = 0;
+        try { dismissed = await dismissBlockingOverlays(); } catch (e) { console.warn("[EU] overlay dismissal failed", e); }
+        if (dismissed > 0) {
+          const after = await runAxeRetry();
+          res = euMergeAxeResults(before, after);
+        } else {
+          res = before;
+        }
+      } else {
+        if (scanOpts.dismissOverlays) {
+          try { await dismissBlockingOverlays(); } catch (e) { console.warn("[EU] overlay dismissal failed", e); }
+        }
+        res = await runAxeRetry();
+      }
+    } else {
+      if (scanOpts.dismissOverlays) {
+        try { await dismissBlockingOverlays(); } catch (e) { console.warn("[EU] overlay dismissal failed", e); }
+      }
+      res = { violations: [], passes: [], incomplete: [], inapplicable: [], testEngine: null, testRunner: null, testEnvironment: null, toolOptions: null, timestamp: null, url: location.href };
     }
     const durationMs = Math.round(performance.now() - started);
 
@@ -78,13 +133,13 @@
     // the pipeline doesn't need to know they came from a different source.
     const customRules = [];
     try {
-      if (window.EU_IndiaChecks?.run) customRules.push(...window.EU_IndiaChecks.run(document));
+      if (checks.india !== false && window.EU_IndiaChecks?.run) customRules.push(...window.EU_IndiaChecks.run(document));
     } catch (e) { console.warn("[EU] india-checks failed", e); }
     // Media checks run collect() so the same pass populates both the rules
     // stream AND the media inventory attached to the payload below.
     let mediaInventory = { videos: [], audios: [], iframeVideos: [], documents: [] };
     try {
-      if (window.EU_MediaChecks?.collect) {
+      if (checks.media !== false && window.EU_MediaChecks?.collect) {
         const mediaResult = window.EU_MediaChecks.collect();
         customRules.push(...(mediaResult.rules || []));
         mediaInventory = mediaResult.inventory || mediaInventory;
@@ -95,7 +150,7 @@
     // snapshot we attach to the payload for the report UI to render.
     let is17802Site = null;
     try {
-      if (window.EU_Is17802Checks?.collect) {
+      if (checks.is17802 !== false && window.EU_Is17802Checks?.collect) {
         const r = window.EU_Is17802Checks.collect();
         customRules.push(...(r.rules || []));
         is17802Site = r.site || null;
@@ -163,6 +218,161 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Node normalisation — preserves every axe field without any length limits.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.4.4 — Blocking-overlay dismissal. Handles cookie/consent banners (OneTrust,
+// Cookiebot, Didomi, Quantcast, Osano, CookieYes, …), SEBI-style announcement
+// interstitials, newsletter/subscribe popups, age gates, and custom <div>
+// overlays — not just <dialog>. Precise by design so it never disturbs real
+// page content:
+//   1. Click known CMP accept/close controls (high confidence).
+//   2. Click accept/close/dismiss buttons ONLY when they sit inside an
+//      overlay-like container (role=dialog/alertdialog, aria-modal, a high
+//      z-index fixed/sticky ancestor, or a class/id naming a modal/popup/
+//      consent/overlay/announcement/etc.).
+//   3. Last resort: hide full-viewport fixed/sticky high-z-index overlays and
+//      release the scroll lock modals leave on <html>/<body>.
+// Runs a few passes because sites stack gates (cookie → newsletter → notice).
+// ─────────────────────────────────────────────────────────────────────────────
+const OVERLAY_HINT_RE = /(modal|popup|pop-up|overlay|consent|cookie|gdpr|ccpa|cmp|interstitial|backdrop|lightbox|dialog|notice|banner|announce|disclaimer|subscribe|newsletter|age-?gate|paywall|drawer)/i;
+const ACCEPT_TEXT_RE = /^(accept(\s+all)?(\s+cookies)?|i\s+accept|agree|i\s+agree|allow(\s+all)?|ok(ay)?|got\s+it!?|understood|i\s+understand|continue|proceed|close|dismiss|no,?\s*thanks|skip|maybe\s+later|not\s+now|✕|×|✖|x)$/i;
+const EU_CMP_SELECTORS = [
+  "#onetrust-accept-btn-handler", ".onetrust-close-btn-handler", "#accept-recommended-btn-handler",
+  "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
+  "#didomi-notice-agree-button", ".qc-cmp2-summary-buttons button[mode='primary']",
+  ".osano-cm-accept-all", ".cky-btn-accept", "#hs-eu-confirmation-button",
+  ".cc-allow", ".cc-dismiss", ".cookie-accept", ".accept-cookies", "#accept-cookies",
+  "button[data-cookiebanner='accept_button']"
+];
+
+function euOverlayVisible(el) {
+  if (!el) return false;
+  let cs; try { cs = getComputedStyle(el); } catch { return false; }
+  if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
+  return el.offsetParent !== null || cs.position === "fixed" || cs.position === "sticky";
+}
+function euInOverlay(el) {
+  let cur = el, depth = 0;
+  while (cur && depth < 12) {
+    if (cur.getAttribute) {
+      const role = cur.getAttribute("role");
+      if (role === "dialog" || role === "alertdialog") return true;
+      if (cur.getAttribute("aria-modal") === "true") return true;
+      const idc = `${cur.id || ""} ${typeof cur.className === "string" ? cur.className : ""}`.trim();
+      if (idc && OVERLAY_HINT_RE.test(idc)) return true;
+      let cs; try { cs = getComputedStyle(cur); } catch { cs = null; }
+      if (cs && (cs.position === "fixed" || cs.position === "sticky") && (parseInt(cs.zIndex, 10) || 0) >= 1000) return true;
+    }
+    cur = cur.parentElement;
+    depth++;
+  }
+  return false;
+}
+function euClick(el) { try { el.click(); return true; } catch { return false; } }
+
+function euClickDismissers() {
+  let clicked = 0;
+  for (const sel of EU_CMP_SELECTORS) {
+    let el = null; try { el = document.querySelector(sel); } catch {}
+    if (el && euOverlayVisible(el) && euClick(el)) clicked++;
+  }
+  let nodes = [];
+  try { nodes = document.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit'], [data-dismiss], .close, [aria-label]"); } catch {}
+  let scanned = 0;
+  for (const el of nodes) {
+    if (scanned++ > 4000) break;
+    const aria = (el.getAttribute && el.getAttribute("aria-label")) || "";
+    const label = (aria || el.textContent || el.value || "").trim();
+    if (!label || label.length > 28) continue;
+    if (!ACCEPT_TEXT_RE.test(label)) continue;
+    if (!euOverlayVisible(el)) continue;
+    if (!euInOverlay(el)) continue; // precision: only act inside overlay-like containers
+    if (euClick(el)) clicked++;
+  }
+  return clicked;
+}
+
+function euHideBlockingOverlays() {
+  let hidden = 0;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let nodes = [];
+  try { nodes = document.querySelectorAll("body *"); } catch {}
+  let scanned = 0;
+  for (const el of nodes) {
+    if (scanned++ > 8000) break;
+    let cs; try { cs = getComputedStyle(el); } catch { continue; }
+    if (cs.position !== "fixed" && cs.position !== "sticky") continue;
+    if ((parseInt(cs.zIndex, 10) || 0) < 1000) continue;
+    let r; try { r = el.getBoundingClientRect(); } catch { continue; }
+    if (r.width >= vw * 0.6 && r.height >= vh * 0.6) {
+      el.style.setProperty("display", "none", "important");
+      hidden++;
+    }
+  }
+  if (hidden) {
+    for (const node of [document.documentElement, document.body]) {
+      if (!node) continue;
+      try {
+        node.style.setProperty("overflow", "auto", "important");
+        node.classList.remove("modal-open", "no-scroll", "noscroll", "overflow-hidden", "is-locked", "scroll-lock");
+      } catch {}
+    }
+  }
+  return hidden;
+}
+
+async function dismissBlockingOverlays() {
+  let total = 0;
+  for (let pass = 0; pass < 3; pass++) {
+    const clicked = euClickDismissers();
+    total += clicked;
+    await new Promise(r => setTimeout(r, 350));
+    if (clicked === 0) break;
+  }
+  total += euHideBlockingOverlays();
+  await new Promise(r => setTimeout(r, 200));
+  return total; // count of overlays clicked/hidden (0 = nothing was there)
+}
+
+// v0.4.4 — merge two axe runs (overlay-present + overlay-dismissed) for the
+// "audit both states" mode. Combines rules by id and dedupes nodes by
+// selector+HTML so the banner/modal's own issues AND the real page's issues
+// both appear without double-counting the nodes common to both passes.
+function euMergeRuleArrays(ra, rb) {
+  const byId = new Map();
+  const addAll = (arr) => {
+    for (const rule of (arr || [])) {
+      let ex = byId.get(rule.id);
+      if (!ex) { ex = Object.assign({}, rule, { nodes: [] }); ex.__seen = new Set(); byId.set(rule.id, ex); }
+      for (const n of (rule.nodes || [])) {
+        const key = (Array.isArray(n.target) ? n.target.join(" ") : String(n.target || "")) + "|" + (n.html || "");
+        if (ex.__seen.has(key)) continue;
+        ex.__seen.add(key);
+        ex.nodes.push(n);
+      }
+    }
+  };
+  addAll(ra); addAll(rb);
+  const out = [];
+  for (const r of byId.values()) { delete r.__seen; out.push(r); }
+  return out;
+}
+function euMergeAxeResults(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    testEngine: a.testEngine || b.testEngine,
+    testRunner: a.testRunner || b.testRunner,
+    testEnvironment: a.testEnvironment || b.testEnvironment,
+    toolOptions: a.toolOptions || b.toolOptions,
+    timestamp: a.timestamp || b.timestamp,
+    url: a.url || b.url,
+    violations: euMergeRuleArrays(a.violations, b.violations),
+    passes: euMergeRuleArrays(a.passes, b.passes),
+    incomplete: euMergeRuleArrays(a.incomplete, b.incomplete),
+    inapplicable: euMergeRuleArrays(a.inapplicable, b.inapplicable)
+  };
+}
 
 function normNode(n) {
   return {

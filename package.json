@@ -9,6 +9,6 @@
     "postinstall": "node build.js"
   },
   "dependencies": {
-    "axe-core": "^4.10.0"
+    "axe-core": "^4.12.1"
   }
 }

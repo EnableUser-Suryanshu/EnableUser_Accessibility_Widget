@@ -89,8 +89,22 @@ function renderStats(inventory) {
   const spa = pages.filter(p => !p.error && p.pageType === "dynamic").length;
   const staticPages = pages.filter(p => !p.error && p.pageType === "static").length;
 
-  host.appendChild(stat("Pages Scanned", ok));
+  // v0.4.1 — "Auditable pages" is the ONE number the auditor actually
+  // cares about: successful scans, shells and hash-duplicates already
+  // excluded by buildInventory. Previously labelled "Pages Scanned",
+  // which blurred the line with the popup's live raw-tab-count and made
+  // the report look inconsistent with the crawl progress counter.
+  host.appendChild(stat("Auditable Pages", ok, "ok"));
+  const shellCount = inventory.shellSummary?.count || 0;
+  const hashDupCount = inventory.hashDuplicateSummary?.count || 0;
+  const collapsed = inventory.dedupSummary?.duplicates_collapsed || 0;
+  const crawlTotal = ok + errs + shellCount + hashDupCount + collapsed;
+  if (crawlTotal > ok) {
+    host.appendChild(stat("URLs Fetched (raw)", crawlTotal));
+  }
   if (errs > 0) host.appendChild(stat("Unreachable", errs, "fail"));
+  if (shellCount > 0) host.appendChild(stat("Shell / Soft-404", shellCount));
+  if (hashDupCount > 0) host.appendChild(stat("Content Duplicates", hashDupCount));
   host.appendChild(stat("Templates", templates));
   host.appendChild(stat("Static / Dynamic", `${staticPages} / ${spa}`));
   host.appendChild(stat("Content Types", contentTypesDetected));
@@ -317,7 +331,7 @@ function renderAuditDetail(audit) {
   const tb = el("tbody");
   for (const v of audit.violations.slice(0, 50)) {
     tb.appendChild(el("tr", {}, [
-      el("td", { class: "mono" }, [v.id || ""]),
+      el("td", { class: "mono" }, [v.ruleId || v.id || ""]),
       el("td", {}, [v.impact || ""]),
       el("td", {}, [String((v.nodes || []).length)]),
       el("td", {}, [v.description || v.help || ""])
@@ -399,6 +413,28 @@ function renderScreenshot(shot, caption) {
   if (screenshotObserver) screenshotObserver.observe(img);
   else loadScreenshot(img); // Fallback: no IntersectionObserver → load eagerly.
   return wrap;
+}
+
+// Issue-specific element screenshot thumbnail for the Findings table. Reuses
+// the same lazy-load path (loadScreenshot + IntersectionObserver) as full-page
+// screenshots; the id resolves to a cropped, red-outlined capture of the exact
+// element axe flagged. Returns a "—" placeholder when the node has no shot
+// (cross-frame target, capture cap reached, or capture failed).
+function renderElementShot(id) {
+  if (!id) return el("span", { class: "muted" }, ["—"]);
+  const img = el("img", {
+    class: "screenshot-thumb element-shot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": id,
+    alt: "issue element screenshot (loading)"
+  });
+  img.addEventListener("click", () => {
+    img.classList.toggle("expanded");
+    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
+  });
+  if (screenshotObserver) screenshotObserver.observe(img);
+  else loadScreenshot(img);
+  return img;
 }
 
 function renderTemplates(inventory) {
@@ -598,6 +634,110 @@ function renderPages(inventory) {
     tbody.appendChild(row);
     tbody.appendChild(detail);
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.4.1 — All Pages URL-list actions.
+// Two separate export scopes so the auditor can grab exactly what they
+// need without manually massaging the list:
+//   • "all URLs"         — every URL we actually fetched (auditable pages
+//                          + unreachable/error rows + shell/soft-404 set
+//                          + content-hash duplicates). This is the raw
+//                          crawl surface, useful for QA'ing the crawler.
+//   • "auditable URLs"   — the set the WCAG/IS 17802 audit actually
+//                          applies to. inventory.pages already has shells
+//                          and hash-duplicates removed, so we just drop
+//                          error rows and we're done.
+// Both actions share the same copy/download plumbing; status text lives
+// in #pages-url-status and is cleared on the next action.
+// ─────────────────────────────────────────────────────────────────────
+function wirePagesUrlActions(inventory) {
+  const statusEl = document.getElementById("pages-url-status");
+  const btnCopyAll = document.getElementById("btn-copy-all-pages");
+  const btnDlAll = document.getElementById("btn-download-all-pages");
+  const btnCopyAud = document.getElementById("btn-copy-auditable-pages");
+  const btnDlAud = document.getElementById("btn-download-auditable-pages");
+  if (!btnCopyAll && !btnDlAll && !btnCopyAud && !btnDlAud) return;
+
+  const pages = inventory.pages || [];
+  const auditableUrls = pages.filter(p => !p.error && p.url).map(p => p.url);
+
+  // Gather URLs from everything crawled, de-duped, stable order:
+  //   1. inventory.pages (successful + errored rows)
+  //   2. inventory.shellPages (seed-shell / soft-404 cluster)
+  //   3. inventory.hashDuplicates (content-hash duplicates)
+  // shellPages + hashDuplicates are FULL lists, not the `sample_urls`
+  // slices from the summary objects (which are capped at 20 each).
+  const allUrlsRaw = [];
+  for (const p of pages) if (p.url) allUrlsRaw.push(p.url);
+  for (const p of (inventory.shellPages || [])) if (p.url) allUrlsRaw.push(p.url);
+  for (const p of (inventory.hashDuplicates || [])) if (p.url) allUrlsRaw.push(p.url);
+  const seen = new Set();
+  const allUrls = [];
+  for (const u of allUrlsRaw) {
+    if (!seen.has(u)) { seen.add(u); allUrls.push(u); }
+  }
+
+  function setStatus(msg, cls = "") {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.className = cls ? `${cls}` : "muted";
+    if (msg) {
+      clearTimeout(setStatus._t);
+      setStatus._t = setTimeout(() => {
+        statusEl.textContent = "";
+        statusEl.className = "muted";
+      }, 4000);
+    }
+  }
+
+  async function copyUrls(urls, label) {
+    if (!urls.length) { setStatus(`No ${label} to copy.`, "muted"); return; }
+    const text = urls.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus(`Copied ${urls.length} ${label} to clipboard.`, "ok");
+    } catch {
+      // Fallback: hidden <textarea> + execCommand. Needed when the
+      // report is viewed over file:// or the clipboard API is blocked.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setStatus(`Copied ${urls.length} ${label} to clipboard.`, "ok");
+      } catch (e) {
+        setStatus(`Copy failed: ${e?.message || e}`, "fail");
+      }
+    }
+  }
+
+  function downloadUrls(urls, filenameSuffix, label) {
+    if (!urls.length) { setStatus(`No ${label} to download.`, "muted"); return; }
+    const host = inventory.meta?.seedHost || "crawl";
+    const safeHost = String(host).replace(/[^a-z0-9_.-]/gi, "_");
+    const stamp = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([urls.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${safeHost}_${filenameSuffix}_${stamp}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setStatus(`Downloading ${urls.length} ${label}…`, "ok");
+  }
+
+  btnCopyAll?.addEventListener("click", () => copyUrls(allUrls, "URLs (all crawled)"));
+  btnDlAll?.addEventListener("click", () => downloadUrls(allUrls, "all-urls", "URLs (all crawled)"));
+  btnCopyAud?.addEventListener("click", () => copyUrls(auditableUrls, "auditable URLs"));
+  btnDlAud?.addEventListener("click", () => downloadUrls(auditableUrls, "auditable-urls", "auditable URLs"));
 }
 
 function wireDownloads(inventory) {
@@ -994,7 +1134,7 @@ function collectFindings(inventory) {
       for (const n of nodes) {
         findings.push({
           url: p.url,
-          ruleId: v.id || "",
+          ruleId: v.ruleId || v.id || "",
           impact: (v.impact || "").toLowerCase(),
           description: v.description || v.help || "",
           help: v.help || "",
@@ -1002,6 +1142,7 @@ function collectFindings(inventory) {
           target: (n.target || []).join(" ") || "",
           html: n.html || "",
           failureSummary: n.failureSummary || "",
+          elementShotId: n.elementShotId || "",
           compliance: derived.compliance,
           standards: derived.standards,
           successCriteria: derived.successCriteria
@@ -1089,6 +1230,7 @@ function renderFindings(inventory) {
         el("tr", {}, [
           el("th", {}, ["Impact"]),
           el("th", {}, ["Target"]),
+          el("th", {}, ["Screenshot"]),
           el("th", {}, ["Compliance"]),
           el("th", {}, ["Standards"]),
           el("th", {}, ["Success Criteria"]),
@@ -1109,6 +1251,7 @@ function renderFindings(inventory) {
         tb.appendChild(el("tr", { class: `impact-${f.impact || "none"}` }, [
           el("td", {}, [el("span", { class: `impact-badge impact-${f.impact || "none"}` }, [f.impact || "—"])]),
           el("td", { class: "mono wrap-anywhere" }, [f.target || "—"]),
+          el("td", { class: "element-shot-cell" }, [renderElementShot(f.elementShotId)]),
           el("td", {}, [f.compliance]),
           el("td", {}, [f.standards]),
           el("td", {}, [f.successCriteria]),
@@ -1225,6 +1368,7 @@ async function main() {
   renderClassification(inventory);
   wireTabs();
   wireDownloads(inventory);
+  wirePagesUrlActions(inventory);
 }
 
 // ─────────────────────────────────────────────────────────────────────
