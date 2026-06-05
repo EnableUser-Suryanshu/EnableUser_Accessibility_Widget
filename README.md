@@ -2,6 +2,10 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.2
+
+Adaptive page-settle wait before axe-core runs (ported from SiteCrawler v1.1.0). Every page waits at least **5 s** after load (cookie banners, JS redirects), then the audit starts as soon as the DOM has been quiet for **2 s**, capped at **10 s** for endlessly-mutating pages. Replaces the fixed 15 s sleep from v0.4.1 — typical pages now audit in roughly a third of the time. Constants: `SETTLE_MIN_MS` / `SETTLE_QUIET_MS` / `SETTLE_MAX_MS` in `background.js`.
+
 Two modes:
 
 - **Scan Current Page** — runs axe on the active tab and opens a report tab with results + CSV download.

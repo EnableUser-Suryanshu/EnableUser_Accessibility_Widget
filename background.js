@@ -39,17 +39,22 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // wrapper (see lower in file) handles the preload-race the 200-way
 // concurrency will trigger more often.
 //
-// SETTLE_MS is the wait between "tab reported navigation complete" and
-// (a) the settled-URL dedup check, (b) axe injection, (c) the full-page
-// screenshot. 15 s gives cookie-consent banners, GDPR popups, lazy-
-// loaded images, animations, and any client-side redirect JS enough time
-// to fully settle before we take the audit and the screenshot. Shorter
-// waits caused screenshots to miss below-the-fold content that hadn't
-// yet intersection-observer-triggered a lazy load.
+// v0.4.2 — adaptive settle window. The wait between "tab reported
+// navigation complete" and (a) the settled-URL dedup check, (b) axe
+// injection, (c) the full-page screenshot used to be a fixed 15 s sleep
+// (SETTLE_MS). It is now a MutationObserver-based DOM-quiet wait
+// (adaptiveSettle, ported from SiteCrawler v1.1.0): every page waits at
+// least SETTLE_MIN_MS so cookie-consent banners, GDPR popups, and
+// client-side redirect JS get time to fire, then the wait ends as soon
+// as the DOM has been quiet for SETTLE_QUIET_MS — capped at
+// SETTLE_MAX_MS for pages that mutate forever (carousels, tickers,
+// animation loops). Static pages settle in ~5 s instead of 15 s.
 const CONCURRENT_TABS = 200;
 const TAB_TIMEOUT_MS = 60_000;
-const SETTLE_MS = 15_000;
-// v12.2 — hard per-worker ceiling. waitForTabComplete (60s) + SETTLE_MS (15s)
+const SETTLE_MIN_MS = 5_000;
+const SETTLE_QUIET_MS = 2_000;
+const SETTLE_MAX_MS = 10_000;
+// v12.2 — hard per-worker ceiling. waitForTabComplete (60s) + settle (≤10s)
 // + axe run + screenshot + content-signals + link harvest should complete
 // in well under this on any well-behaved page. If a worker exceeds it,
 // something genuinely pathological has happened (hung debugger attach,
@@ -95,7 +100,7 @@ function checksFromOptions(options) {
 // `/About/`, old `/company-info` legacy path) all server-redirect to the
 // same canonical page (`/about/`), CONCURRENT_TABS=200 workers could
 // each open a tab on a different queued URL, all land on `/about/` at
-// roughly the same moment, and each begin the SETTLE_MS=15s sleep. The
+// roughly the same moment, and each begin the settle wait. The
 // post-sleep `queue.hasSettled(settledUrl)` dedup only kicks in AFTER
 // the sleep resolves, so all N tabs sit at `/about/` simultaneously
 // for the full settle window (user observation: 8 tabs open on the same
@@ -103,7 +108,7 @@ function checksFromOptions(options) {
 // canonical URL, but it can't predict post-redirect identity.
 //
 // Fix: each worker, immediately after its tab's "complete" event fires
-// AND before entering SETTLE_MS sleep, reads the tab's current URL and
+// AND before entering the settle wait, reads the tab's current URL and
 // claims a slot in `_inFlightSettleUrls`. If another worker already
 // holds the slot (check-and-set is atomic under JS's single-threaded
 // model — no await between .has() and .add()) the current worker
@@ -888,7 +893,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
 
     // v12 fix — pre-sleep in-flight check. See _inFlightSettleUrls comment.
     // If another worker's tab has already landed at the same post-load URL
-    // and is holding the slot while sleeping out SETTLE_MS, this worker
+    // and is holding the slot while waiting out the settle window, this worker
     // aborts immediately instead of duplicating the scan.
     if (queue) {
       let currentUrl = null;
@@ -914,13 +919,13 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
       }
     }
 
-    await sleep(SETTLE_MS);
+    await adaptiveSettle(tabId);
 
-    // Settled-URL dedup — MUST come after SETTLE_MS. waitForTabComplete
+    // Settled-URL dedup — MUST come after the settle. waitForTabComplete
     // resolves on the initial URL's "complete" state, but JavaScript-based
     // redirects (typical of disclosure-gate / age-gate / session-wall sites)
-    // fire AFTER complete, so we have to give them SETTLE_MS to run. We
-    // also poll briefly once more to catch late redirects.
+    // fire AFTER complete, so we have to give the settle window time to run.
+    // We also poll briefly once more to catch late redirects.
     if (queue) {
       const settledUrl = await waitForUrlSettle(tabId);
       console.log(`[EU] worker settled: queued=${url}  → settled=${settledUrl}`);
@@ -2237,9 +2242,9 @@ async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}
       }
     }
 
-    await sleep(SETTLE_MS);
+    await adaptiveSettle(tab.id);
 
-    // Settled-URL dedup (post-SETTLE_MS so JS redirects have fired).
+    // Settled-URL dedup (post-settle so JS redirects have fired).
     if (queue) {
       const settledUrl = await waitForUrlSettle(tab.id);
       console.log(`[EU] worker settled: queued=${url}  → settled=${settledUrl}`);
@@ -3038,10 +3043,45 @@ function safeHost(u) {
   try { return new URL(u).hostname.replace(/[^a-z0-9.-]/gi, "_"); } catch { return "site"; }
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// v0.4.2 — adaptive DOM-quiet settle (ported from SiteCrawler v1.1.0).
+// Injected into the page: resolves once the DOM has stopped mutating for
+// SETTLE_QUIET_MS, but never before SETTLE_MIN_MS and never after
+// SETTLE_MAX_MS. Replaces the old fixed sleep(SETTLE_MS = 15s). If the
+// injection itself fails (tab navigated to an error page, frame removed,
+// restricted URL) we fall back to sleeping out the full max window so
+// behaviour is never worse than a fixed wait.
+async function adaptiveSettle(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (minMs, quietMs, maxMs) => new Promise(resolve => {
+        const start = Date.now();
+        let lastMutation = start;
+        let obs = null;
+        try {
+          obs = new MutationObserver(() => { lastMutation = Date.now(); });
+          obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+        } catch { /* observer refused — the min/max timers below still apply */ }
+        const finish = () => { try { obs && obs.disconnect(); } catch {} resolve(); };
+        (function tick() {
+          const now = Date.now();
+          if (now - start >= maxMs) return finish();
+          if (now - start >= minMs && now - lastMutation >= quietMs) return finish();
+          setTimeout(tick, 150);
+        })();
+      }),
+      args: [SETTLE_MIN_MS, SETTLE_QUIET_MS, SETTLE_MAX_MS]
+    });
+  } catch (err) {
+    console.warn(`[EU] adaptiveSettle injection failed (tab ${tabId}), falling back to fixed ${SETTLE_MAX_MS}ms:`, err?.message || err);
+    await sleep(SETTLE_MAX_MS);
+  }
+}
 function safeOrigin(u) { try { return new URL(u).origin; } catch { return null; } }
 
 // Poll chrome.tabs.get() until the tab's URL has been stable for two
-// consecutive reads. Callers use this AFTER waitForTabComplete + SETTLE_MS,
+// consecutive reads. Callers use this AFTER waitForTabComplete + adaptiveSettle,
 // to catch late JavaScript-based redirects (e.g. disclosure gates that
 // check a session cookie client-side and navigate via `location.href`).
 // Returns the stable URL, or null if the tab went away.
