@@ -70,6 +70,16 @@ const WORKER_HARD_TIMEOUT_MS = 150_000;
 // caps the host-level parallelism; on a multi-site crawl the global 200 is
 // still reachable (e.g. 25 origins × 8 tabs each).
 const PER_ORIGIN_TABS = 8;
+// v0.4.3 — circuit breaker (ported from SiteCrawler v1.1.0). If this many
+// URLs in a row fail (site down, auth wall hit mid-crawl, network dropped),
+// stop launching new workers instead of grinding through the whole queue
+// producing error rows. In-flight workers finish; the report notes the trip.
+const ERROR_STREAK_LIMIT = 20;
+// v0.4.3 — checkpoint cadence. During an inventory crawl the accumulated
+// pages (minus screenshots) are persisted to chrome.storage.local every
+// N completed URLs, so a service-worker death / browser crash mid-crawl
+// leaves a recoverable partial result instead of losing everything.
+const CHECKPOINT_EVERY = 20;
 
 // axe runOnly tags for the in-progress scan. Set at the start of each scan
 // handler from the operator-selected profile (tagsForProfile) and read by
@@ -84,6 +94,18 @@ let ACTIVE_AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 let ACTIVE_CHECKS = { axe: true, india: true, media: true, is17802: true, pdfOffice: true };
 let ACTIVE_DISMISS = false;
 let ACTIVE_AUDIT_BOTH = false;
+// v0.4.3 — screenshots are now opt-in. Full-page + element capture via the
+// debugger API is the single heaviest per-page cost after axe itself and
+// makes large-site crawls impractical; default-off gives a findings+Excel
+// fast path. The popup exposes a "Capture screenshots" checkbox.
+let ACTIVE_SCREENSHOTS = false;
+// v0.4.3 — "real pages only" discovery (SiteCrawler-style). When on,
+// seedDiscovery skips sitemap.xml / robots.txt / RSS-Atom feeds / CMS API
+// probes and the crawl follows only links that actually appear on pages
+// (nav + body anchors). Slower to reach deep pages, but the URL list
+// contains only genuinely linked, reachable pages — no stale sitemap
+// entries, no feed archives, no API-only junk URLs.
+let ACTIVE_LINKS_ONLY = false;
 function checksFromOptions(options) {
   const c = (options && options.checks) || {};
   return {
@@ -154,6 +176,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "SCAN_MULTI") sendResponse(await scanMulti(msg.tabId, msg.options));
       else if (msg.type === "SCAN_INVENTORY") sendResponse(await scanInventory(msg.tabId, msg.options));
       else if (msg.type === "SCAN_LIST") sendResponse(await scanList(msg.options));
+      else if (msg.type === "RECOVER_CHECKPOINT") sendResponse(await recoverCheckpoint());
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
       else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: reports.get(msg.reportId) || null });
@@ -248,6 +271,8 @@ async function scanMulti(tabId, options) {
   ACTIVE_CHECKS = checksFromOptions(options);
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
+  ACTIVE_LINKS_ONLY = !!(options && options.linksOnly);
 
   const tab = await chrome.tabs.get(tabId);
   const startUrl = tab.url;
@@ -277,12 +302,16 @@ async function scanMulti(tabId, options) {
   } catch {}
 
   await seedDiscovery({
-    tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats
+    tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats,
+    linksOnly: ACTIVE_LINKS_ONLY
   });
 
   console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap}/${discoveryStats.sitemapRaw} hreflang:${discoveryStats.hreflang} feed:${discoveryStats.feed}/${discoveryStats.feedRaw} linkRels:${discoveryStats.linkRels} | pending:${queue.pending}`);
 
   const active = new Set();
+  let errorStreak = 0;
+  let stopReason = null;
+  await openCrawlerWindow();
 
   async function launch(req) {
     // `acquired` tracks whether wait() returned a non-null token. Only if
@@ -312,12 +341,14 @@ async function scanMulti(tabId, options) {
           violations: [], passes: [], incomplete: [], inapplicable: []
         });
         depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+        errorStreak = 0; // a clean dedup skip is not a failure
         return;
       }
 
       const { links = [], ...scan } = r;
       results.push({ url: req.url, depth: req.depth, source: req.source, ...scan });
       depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+      errorStreak = 0;
       if (req.depth < crawlDepth) {
         const nav = links.filter(l => l.priority >= 10).map(l => l.url);
         const body = links.filter(l => l.priority < 10).map(l => l.url);
@@ -333,12 +364,22 @@ async function scanMulti(tabId, options) {
         error: String(err?.message || err),
         violations: [], passes: [], incomplete: [], inapplicable: []
       });
+      errorStreak++;
     } finally {
       if (acquired) rateLimiter.release(req.url);
     }
   }
 
   function pump() {
+    // v0.4.3 circuit breaker — stop launching once the error streak trips.
+    // In-flight workers drain naturally; the report meta records the trip.
+    if (errorStreak >= ERROR_STREAK_LIMIT) {
+      if (!stopReason) {
+        stopReason = `stopped early: ${errorStreak} consecutive page failures`;
+        console.warn(`[EU] circuit breaker tripped — ${stopReason}`);
+      }
+      return;
+    }
     while (active.size < CONCURRENT_TABS && queue.pending && queue.remaining > 0) {
       const req = queue.next();
       if (!req) break;
@@ -352,10 +393,12 @@ async function scanMulti(tabId, options) {
     await Promise.race(active);
     pump();
   }
+  await closeCrawlerWindow();
 
   console.log(`[EU] crawl complete — pages per depth:`, depthStats, "rate:", rateLimiter.snapshot());
   const report = buildReport(results, {
-    mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats, profile
+    mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats, profile,
+    stopReason: stopReason || "completed"
   });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
@@ -401,8 +444,10 @@ async function scanInventory(tabId, options) {
   ACTIVE_CHECKS = checksFromOptions(options);
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
+  ACTIVE_LINKS_ONLY = !!(options && options.linksOnly);
 
-  console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth} profile=${profile} tags=${ACTIVE_AXE_TAGS.join(",")}`);
+  console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth} profile=${profile} tags=${ACTIVE_AXE_TAGS.join(",")} screenshots=${ACTIVE_SCREENSHOTS} linksOnly=${ACTIVE_LINKS_ONLY}`);
 
   // Reset live-progress state. Written to chrome.storage.local so the popup
   // can show it even if the popup was closed while the scan ran. Updated
@@ -459,8 +504,11 @@ async function scanInventory(tabId, options) {
     // element into view, which would jar the page (the codebase deliberately
     // avoids scrolling the seed). So the seed gets a full-page shot only;
     // element screenshots are captured on the hidden worker tabs.
-    try { screenshot = await captureFullPageScreenshot(tabId); }
-    catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
+    // v0.4.3 — skipped entirely unless the operator opted into screenshots.
+    if (ACTIVE_SCREENSHOTS) {
+      try { screenshot = await captureFullPageScreenshot(tabId); }
+      catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
+    }
     const tmpl = auditPayload?.template || {};
     // content-signals.js returns `url: location.href` AND `canonicalUrl`
     // (from <link rel="canonical">) — strip both out before spreading so
@@ -525,12 +573,18 @@ async function scanInventory(tabId, options) {
   // starved by a 10k-entry sitemap dumped first.
   await seedDiscovery({
     tabId, startUrl, seedOrigin, queue, depth: 1,
-    discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 }
+    discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 },
+    linksOnly: ACTIVE_LINKS_ONLY
   });
 
   console.log(`[EU] post-discovery queue size: ${queue.pending} pending, ${queue.total} total seen`);
 
   const active = new Set();
+  let errorStreak = 0;
+  let stopReason = null;
+  // v0.4.3 — checkpoint meta reused on every periodic write.
+  const checkpointMeta = { mode: "inventory", seedUrl: startUrl, seedHost, maxUrls, crawlDepth, profile, depthStats, startedAt: Date.now() };
+  await openCrawlerWindow();
 
   async function launch(req) {
     console.log(`[EU] launch: ${req.url} (source=${req.source}, depth=${req.depth})`);
@@ -562,6 +616,7 @@ async function scanInventory(tabId, options) {
           error: `redirected to already-scanned URL: ${result.settledUrl}`
         });
         depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+        errorStreak = 0; // a clean dedup skip is not a failure
         return;
       }
 
@@ -582,6 +637,7 @@ async function scanInventory(tabId, options) {
         ...rest
       });
       depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
+      errorStreak = 0;
       if (req.depth < crawlDepth) {
         const nav = links.filter(l => l.priority >= 10).map(l => l.url);
         const body = links.filter(l => l.priority < 10).map(l => l.url);
@@ -591,6 +647,7 @@ async function scanInventory(tabId, options) {
     } catch (err) {
       rateLimiter.reportFailure(req.url, { status: err?.status || 0 });
       pages.push({ url: req.url, depth: req.depth, source: req.source, error: String(err?.message || err) });
+      errorStreak++;
     } finally {
       if (acquired) rateLimiter.release(req.url);
     }
@@ -598,9 +655,20 @@ async function scanInventory(tabId, options) {
     // await — fire-and-forget so a slow chrome.storage write can't block
     // the next tab from launching. Popup polls via storage.onChanged.
     progressUpdate({ done: pages.length, currentUrl: req.url });
+    // v0.4.3 — periodic checkpoint (fire-and-forget) so a crash mid-crawl
+    // leaves a recoverable partial result.
+    if (pages.length % CHECKPOINT_EVERY === 0) checkpointCrawl(pages, checkpointMeta);
   }
 
   function pump() {
+    // v0.4.3 circuit breaker — see scanMulti.
+    if (errorStreak >= ERROR_STREAK_LIMIT) {
+      if (!stopReason) {
+        stopReason = `stopped early: ${errorStreak} consecutive page failures`;
+        console.warn(`[EU] circuit breaker tripped — ${stopReason}`);
+      }
+      return;
+    }
     while (active.size < CONCURRENT_TABS && queue.pending && queue.remaining > 0) {
       const req = queue.next();
       if (!req) break;
@@ -610,13 +678,14 @@ async function scanInventory(tabId, options) {
   }
   pump();
   while (active.size > 0) { await Promise.race(active); pump(); }
+  await closeCrawlerWindow();
 
   // Mark the crawl as inactive so the popup's progress banner disappears.
   // Keep the final done/total for one refresh so the user sees "done" before
   // it clears.
   await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
-  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile });
+  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile, stopReason: stopReason || "completed" });
 
   // v13.1 — audit every discovered PDF for structural accessibility
   // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
@@ -667,6 +736,9 @@ async function scanInventory(tabId, options) {
   } catch (err) {
     console.warn("[EU] failed to open inventory tab", err);
   }
+  // v0.4.3 — crawl finished and the inventory is persisted; the mid-crawl
+  // checkpoint is now superseded.
+  clearCheckpoint();
   return { ok: true, inventoryId };
 }
 
@@ -734,6 +806,7 @@ async function scanList(options) {
   ACTIVE_CHECKS = checksFromOptions(options);
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
 
   const parsed = [];
   const seenExact = new Set();
@@ -799,6 +872,9 @@ async function scanList(options) {
 
   const active = new Set();
   const toScan = parsed.slice(); // FIFO; preserves paste order
+  let errorStreak = 0;
+  let stopReason = null;
+  await openCrawlerWindow();
 
   async function launch(url) {
     console.log(`[EU] template-check launch: ${url}`);
@@ -819,10 +895,12 @@ async function scanList(options) {
         depth: 0, source: "pasted",
         ...rest
       });
+      errorStreak = 0;
     } catch (err) {
       rateLimiter.reportFailure(url, { status: err?.status || 0 });
       console.warn(`[EU] template-check failed: ${url}`, err?.message || err);
       pages.push({ url, depth: 0, source: "pasted", error: String(err?.message || err) });
+      errorStreak++;
     } finally {
       if (acquired) rateLimiter.release(url);
     }
@@ -830,6 +908,18 @@ async function scanList(options) {
   }
 
   function pump() {
+    // v0.4.3 circuit breaker — emit the unscanned remainder as explicit
+    // rows so the operator sees exactly which pasted URLs were skipped.
+    if (errorStreak >= ERROR_STREAK_LIMIT) {
+      if (!stopReason) {
+        stopReason = `stopped early: ${errorStreak} consecutive page failures`;
+        console.warn(`[EU] circuit breaker tripped — ${stopReason}`);
+        while (toScan.length > 0) {
+          pages.push({ url: toScan.shift(), depth: 0, source: "pasted", error: "skipped — circuit breaker tripped (too many consecutive failures)" });
+        }
+      }
+      return;
+    }
     while (active.size < CONCURRENT_TABS && toScan.length > 0) {
       const url = toScan.shift();
       const p = launch(url).finally(() => active.delete(p));
@@ -838,6 +928,7 @@ async function scanList(options) {
   }
   pump();
   while (active.size > 0) { await Promise.race(active); pump(); }
+  await closeCrawlerWindow();
 
   await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
@@ -854,7 +945,8 @@ async function scanList(options) {
     depthStats: { 0: pages.length },
     profile,
     mode: "template-check",
-    noDedup: true
+    noDedup: true,
+    stopReason: stopReason || "completed"
   });
 
   // v13.1 PDF audit for the pasted URL list path too — every PDF linked
@@ -885,7 +977,7 @@ async function scanList(options) {
 // screenshot blob. This replaces the earlier signals-only path on user
 // direction — inventory mode IS the full audit, not a lightweight preview.
 async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenTextHashes = null } = {}) {
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tab = await createWorkerTab(url); // v0.4.3 — opens in the minimized crawler window
   const tabId = tab.id;
   let inFlightClaimKey = null; // set if we claim a slot; released in finally
   try {
@@ -974,13 +1066,13 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
     // already open on this tab, chrome:// URL, policy). Skipped on
     // content-hash duplicates (see block above).
     let screenshot = null;
-    if (!duplicateOf) {
+    if (ACTIVE_SCREENSHOTS && !duplicateOf) {
       try {
         screenshot = await captureFullPageScreenshot(tabId, auditPayload?.violations || null);
       } catch (err) {
         console.warn(`[EU] screenshot failed for ${url}:`, err?.message || err);
       }
-    } else {
+    } else if (duplicateOf) {
       console.log(`[EU] content-hash dupe — skipping screenshot for ${url} (duplicate of ${duplicateOf})`);
     }
 
@@ -2116,15 +2208,23 @@ async function scanInExistingTab(tabId) {
 // frameworkManifest, jsonLd) surface in discoveryStats so operators can
 // see which source earned which URL on a per-site basis.
 // ─────────────────────────────────────────────────────────────────────────
-async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats }) {
+async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats, linksOnly = false }) {
+  // v0.4.3 — "real pages only" mode (SiteCrawler-style). Nulling the origin
+  // disables every out-of-band source below (sitemap walk, robots.txt,
+  // homepage <link> rels, RSS/Atom feeds, CMS API probes); only the in-page
+  // nav harvest runs, so the crawl frontier is exactly what a human clicking
+  // through the site could reach. No stale sitemap entries, no feed
+  // archives, no API-only URLs.
+  const oobOrigin = linksOnly ? null : seedOrigin;
+  if (linksOnly) console.log("[EU] discovery: links-only mode — sitemap/feeds/CMS probes skipped");
   // Run all out-of-band discovery + nav-harvest + CMS probes in parallel.
   // navSurfacedCollect is the slow one (scroll + click-reveal, up to 45s);
   // CMS probes are HTTP-only and finish quickly on non-matching sites.
   // Failures are tolerated per source — a 404 sitemap shouldn't kill feed
   // discovery, and a non-WP site shouldn't block the Shopify probe.
   const [sitemapUrls, homepageLinks, navLinks, cmsApiResults] = await Promise.all([
-    seedOrigin ? discoverSeedsFromOrigin(seedOrigin).catch(() => []) : Promise.resolve([]),
-    seedOrigin ? discoverHomepageLinks(startUrl).catch(() => ({ hreflang: [], canonical: null, nextPrev: [], feeds: [] })) : Promise.resolve({ hreflang: [], canonical: null, nextPrev: [], feeds: [] }),
+    oobOrigin ? discoverSeedsFromOrigin(oobOrigin).catch(() => []) : Promise.resolve([]),
+    oobOrigin ? discoverHomepageLinks(startUrl).catch(() => ({ hreflang: [], canonical: null, nextPrev: [], feeds: [] })) : Promise.resolve({ hreflang: [], canonical: null, nextPrev: [], feeds: [] }),
     // noScroll: true — the seed tab IS the user's visible tab. We already
     // captured the seed screenshot in its initial scroll position; scrolling
     // now would (a) visibly jerk the page up/down for 10-30s, (b) trigger
@@ -2136,7 +2236,7 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
     // HTML sitemap pages, Next.js / Gatsby build manifests, JSON-LD URL
     // harvest from the seed HTML. Shares ONE seed-URL fetch across the
     // framework + JSON-LD probes, so HTTP cost is bounded.
-    seedOrigin ? probeAllCmsApis(seedOrigin, startUrl).catch(() => ({
+    oobOrigin ? probeAllCmsApis(oobOrigin, startUrl).catch(() => ({
       wordpress: [], shopify: [], htmlSitemap: [], frameworkManifest: [], jsonLd: []
     })) : Promise.resolve({ wordpress: [], shopify: [], htmlSitemap: [], frameworkManifest: [], jsonLd: [] })
   ]);
@@ -2144,8 +2244,8 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   // Feed discovery depends on the homepage autodiscovery links, so it runs
   // after the first batch completes. Still cheap — only fires the HTTP
   // probes if we have an origin, and parseFeedEntries bails fast on HTML.
-  const feedUrls = seedOrigin
-    ? await discoverFeeds(seedOrigin, homepageLinks.feeds || []).catch(() => [])
+  const feedUrls = oobOrigin
+    ? await discoverFeeds(oobOrigin, homepageLinks.feeds || []).catch(() => [])
     : [];
 
   const linkRelUrls = [];
@@ -2215,7 +2315,7 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
 }
 
 async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}) {
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tab = await createWorkerTab(url); // v0.4.3 — opens in the minimized crawler window
   let inFlightClaimKey = null; // see _inFlightSettleUrls comment
   try {
     await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
@@ -3043,6 +3143,89 @@ function safeHost(u) {
   try { return new URL(u).hostname.replace(/[^a-z0-9.-]/gi, "_"); } catch { return "site"; }
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─────────────────────────────────────────────────────────────────────────
+// v0.4.3 — dedicated crawler window (ported from SiteCrawler v1.1.0).
+// Worker tabs open in a separate minimized window instead of the user's
+// own window, so a 200-tab crawl doesn't flood their tab strip. If window
+// creation fails, or the user closes the crawler window mid-crawl, we fall
+// back to plain tabs in the current window — the crawl never dies over it.
+// ─────────────────────────────────────────────────────────────────────────
+let _crawlerWindowId = null;
+
+chrome.windows.onRemoved.addListener((winId) => {
+  if (winId === _crawlerWindowId) _crawlerWindowId = null;
+});
+
+async function openCrawlerWindow() {
+  try {
+    const win = await chrome.windows.create({ url: "about:blank", focused: false, state: "minimized" });
+    _crawlerWindowId = win.id;
+    console.log(`[EU] crawler window opened (id=${win.id})`);
+  } catch (err) {
+    _crawlerWindowId = null;
+    console.warn("[EU] crawler window creation failed — worker tabs will open in the current window:", err?.message || err);
+  }
+}
+
+async function closeCrawlerWindow() {
+  if (_crawlerWindowId == null) return;
+  const id = _crawlerWindowId;
+  _crawlerWindowId = null;
+  try { await chrome.windows.remove(id); } catch {}
+}
+
+async function createWorkerTab(url) {
+  if (_crawlerWindowId != null) {
+    try {
+      return await chrome.tabs.create({ windowId: _crawlerWindowId, url, active: false });
+    } catch {
+      _crawlerWindowId = null; // window vanished — fall through
+    }
+  }
+  return chrome.tabs.create({ url, active: false });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// v0.4.3 — mid-crawl checkpoint (ported from SiteCrawler v1.1.0's
+// persist-every-N-results). Screenshots are stripped: the blobs live in an
+// in-memory map that wouldn't survive the crash anyway, and including them
+// would make every checkpoint write enormous.
+// ─────────────────────────────────────────────────────────────────────────
+const CHECKPOINT_KEY = "eu-crawl-checkpoint";
+
+function checkpointCrawl(pages, meta) {
+  const lite = pages.map(p => ({ ...p, screenshot: null }));
+  chrome.storage.local.set({
+    [CHECKPOINT_KEY]: { ...meta, updatedAt: Date.now(), pages: lite }
+  }).catch(err => console.warn("[EU] checkpoint write failed:", err?.message || err));
+}
+
+function clearCheckpoint() {
+  chrome.storage.local.remove(CHECKPOINT_KEY).catch(() => {});
+}
+
+// Rebuild an inventory report from the last mid-crawl checkpoint. Invoked
+// from the popup's "Recover interrupted crawl" button after a crash.
+async function recoverCheckpoint() {
+  const got = await chrome.storage.local.get(CHECKPOINT_KEY);
+  const cp = got?.[CHECKPOINT_KEY];
+  if (!cp || !Array.isArray(cp.pages) || cp.pages.length === 0) {
+    return { ok: false, error: "no recoverable crawl found" };
+  }
+  const inventory = buildInventory(cp.pages, {
+    seedUrl: cp.seedUrl, seedHost: cp.seedHost, maxUrls: cp.maxUrls,
+    crawlDepth: cp.crawlDepth, depthStats: cp.depthStats || {},
+    profile: cp.profile, recovered: true
+  });
+  const inventoryId = `inv-${Date.now()}`;
+  inventories.set(inventoryId, { inventory, files: {} });
+  try { await persistInventory(inventoryId, inventory); }
+  catch (err) { console.warn("[EU] persistInventory (recovery) failed", err); }
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/inventory.html?id=${inventoryId}`) });
+  clearCheckpoint();
+  return { ok: true, inventoryId, recoveredPages: cp.pages.length };
+}
 
 // v0.4.2 — adaptive DOM-quiet settle (ported from SiteCrawler v1.1.0).
 // Injected into the page: resolves once the DOM has stopped mutating for

@@ -57,7 +57,7 @@
         </div>
         <div class="text">
           <div class="title">Inventory / Scope Mode</div>
-          <div class="sub">Full audit + full-page screenshots + component inventory + static/dynamic classification per page. Produces scope.docx + inventory.xlsx. Depth is unbounded by default (only Max URLs caps the crawl).</div>
+          <div class="sub">Full audit + component inventory + static/dynamic classification per page. Produces scope.docx + inventory.xlsx. Screenshots only if enabled below. Depth is unbounded by default (only Max URLs caps the crawl).</div>
         </div>
         <button id="btn-scan-inventory" class="scan">Scope</button>
       </section>
@@ -119,7 +119,11 @@
         <label class="chk"><input type="checkbox" id="opt-check-pdfoffice" checked /> PDF / Office document audit</label>
         <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss cookie / consent / modal overlays before scanning</label>
         <label class="chk"><input type="checkbox" id="opt-audit-both" checked /> Audit BOTH the overlay and the page (two passes — slower)</label>
+        <label class="chk"><input type="checkbox" id="opt-screenshots" /> Capture screenshots (full-page + per-violation — much slower, bigger reports)</label>
+        <label class="chk"><input type="checkbox" id="opt-links-only" /> Real pages only — follow visible links, skip sitemap / feeds / CMS probes</label>
       </section>
+
+      <button id="btn-recover" class="scan" hidden>Recover interrupted crawl</button>
 
       <p id="status" class="status" hidden></p>
     </main>
@@ -128,7 +132,7 @@
       <p>To subscribe to the advanced features of EnableUser, kindly contact:<br />
         <a href="mailto:teamenableuser@gmail.com">teamenableuser@gmail.com</a>
       </p>
-      <p class="meta">Version 0.4.1 | Powered by axe-core</p>
+      <p class="meta">Version 0.4.3 | Powered by axe-core</p>
     </footer>
 
     <script src="popup.js" type="module"></script>

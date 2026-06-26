@@ -15,6 +15,9 @@ const chkMedia = $("opt-check-media");
 const chkPdfOffice = $("opt-check-pdfoffice");
 const chkDismiss = $("opt-dismiss-overlays");
 const chkAuditBoth = $("opt-audit-both");
+const chkScreenshots = $("opt-screenshots");
+const chkLinksOnly = $("opt-links-only");
+const btnRecover = $("btn-recover");
 
 // First-run defaults — what the operator sees the first time they open the
 // popup with no stored preferences yet. Combined (WCAG 2.1 AA + IS 17802)
@@ -31,7 +34,7 @@ const DEFAULT_PROFILE = "wcag21aa";
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
 const VALID_PROFILES = ["wcag21aa", "wcag22aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
   if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
@@ -43,6 +46,9 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismis
   if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice !== false;
   if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
   if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
+  // v0.4.3 — both default OFF (fast findings+Excel path, full discovery).
+  if (chkScreenshots) chkScreenshots.checked = s?.screenshots === true;
+  if (chkLinksOnly) chkLinksOnly.checked = s?.linksOnly === true;
 }).catch(() => {});
 
 function readScanOptions() {
@@ -63,10 +69,12 @@ function readScanOptions() {
   };
   const dismissOverlays = chkDismiss ? chkDismiss.checked : false;
   const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;
+  const screenshots = chkScreenshots ? chkScreenshots.checked : false;
+  const linksOnly = chkLinksOnly ? chkLinksOnly.checked : false;
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
-  chrome.storage?.local.set({ maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth }).catch(() => {});
-  return { maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth };
+  chrome.storage?.local.set({ maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly }).catch(() => {});
+  return { maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly };
 }
 
 function setStatus(msg, isError = false) {
@@ -119,7 +127,32 @@ function setBusy(busy) {
   btnMulti.disabled = busy;
   if (btnInventory) btnInventory.disabled = busy;
   if (btnList) btnList.disabled = busy;
+  if (btnRecover) btnRecover.disabled = busy;
 }
+
+// ── v0.4.3 — crash recovery ──────────────────────────────────────────────
+// background.js checkpoints the in-progress crawl to chrome.storage.local
+// every 20 pages. If a checkpoint exists while no scan is running, the
+// browser (or the service worker) died mid-crawl — offer to rebuild a
+// report from the partial results.
+chrome.storage?.local.get(["eu-crawl-checkpoint", "scan-progress"]).then(s => {
+  const cp = s?.["eu-crawl-checkpoint"];
+  const running = s?.["scan-progress"]?.active === true;
+  if (btnRecover && cp && Array.isArray(cp.pages) && cp.pages.length > 0 && !running) {
+    btnRecover.hidden = false;
+    btnRecover.textContent = `Recover interrupted crawl (${cp.pages.length} pages scanned)`;
+  }
+}).catch(() => {});
+
+btnRecover?.addEventListener("click", async () => {
+  setBusy(true);
+  setStatus("Rebuilding report from the interrupted crawl…");
+  const res = await send({ type: "RECOVER_CHECKPOINT" });
+  setBusy(false);
+  if (!res?.ok) { setStatus(res?.error || "Recovery failed.", true); return; }
+  setStatus("Recovered report opening…");
+  window.close();
+});
 
 function send(msg) {
   return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
@@ -190,7 +223,7 @@ btnInventory?.addEventListener("click", async () => {
   const opts = readScanOptions();
   const depthLabel = opts.crawlDepth === 0 ? "unbounded" : String(opts.crawlDepth);
   setBusy(true);
-  setStatus(`Full-audit crawl (up to ${opts.maxUrls} URLs, depth ${depthLabel}) — axe + India + IS 17802 + screenshots + component inventory per page. This will take a while…`);
+  setStatus(`Full-audit crawl (up to ${opts.maxUrls} URLs, depth ${depthLabel}) — axe + India + IS 17802 + component inventory per page${opts.screenshots ? " + screenshots" : ""}. This will take a while…`);
   const res = await send({ type: "SCAN_INVENTORY", tabId: tab.id, options: opts });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Scope failed.", true); return; }
@@ -244,10 +277,10 @@ btnList?.addEventListener("click", async () => {
 
   const opts = readScanOptions();
   setBusy(true);
-  setStatus(`Template check — scanning ${urls.length} URL${urls.length === 1 ? "" : "s"} (${opts.profile}). Axe + screenshot + fingerprint per URL.`);
+  setStatus(`Template check — scanning ${urls.length} URL${urls.length === 1 ? "" : "s"} (${opts.profile}). Axe + fingerprint${opts.screenshots ? " + screenshot" : ""} per URL.`);
   const res = await send({
     type: "SCAN_LIST",
-    options: { urls, profile: opts.profile, checks: opts.checks, dismissOverlays: opts.dismissOverlays, auditBoth: opts.auditBoth }
+    options: { urls, profile: opts.profile, checks: opts.checks, dismissOverlays: opts.dismissOverlays, auditBoth: opts.auditBoth, screenshots: opts.screenshots }
   });
   setBusy(false);
   if (!res?.ok) { setStatus(res?.error || "Template check failed.", true); return; }

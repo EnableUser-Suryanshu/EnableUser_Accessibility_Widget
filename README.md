@@ -2,6 +2,14 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.3 — findings-first fast path + SiteCrawler ports
+
+- **Screenshots are now opt-in** (popup checkbox, default off). Full-page + per-violation capture via the debugger API was the heaviest per-page cost after axe; with it off you get findings + Excel only, making large-site crawls practical. Turn the checkbox on when you need the visual evidence.
+- **Dedicated minimized crawler window** — worker tabs open in a separate minimized window instead of flooding your tab strip. Falls back to normal tabs if the window can't be created or you close it mid-crawl.
+- **Circuit breaker** — 20 consecutive page failures (site down, auth wall, network drop) stops the crawl instead of grinding through the whole queue. The report's meta records `stopReason`.
+- **Crash recovery** — the crawl checkpoints its accumulated pages (minus screenshots) to `chrome.storage.local` every 20 URLs. If the browser or service worker dies mid-crawl, the popup shows a **Recover interrupted crawl** button that rebuilds the inventory report from the checkpoint.
+- **"Real pages only" discovery mode** (popup checkbox, default off) — SiteCrawler-style crawling: follow only links that actually appear on pages (nav + body anchors); skip sitemap.xml, robots.txt sitemaps, RSS/Atom feeds, and CMS API probes. Use it when sitemap/feed sources drag junk URLs into the report. Default (off) keeps the full discovery pipeline.
+
 ## v0.4.2
 
 Adaptive page-settle wait before axe-core runs (ported from SiteCrawler v1.1.0). Every page waits at least **5 s** after load (cookie banners, JS redirects), then the audit starts as soon as the DOM has been quiet for **2 s**, capped at **10 s** for endlessly-mutating pages. Replaces the fixed 15 s sleep from v0.4.1 — typical pages now audit in roughly a third of the time. Constants: `SETTLE_MIN_MS` / `SETTLE_QUIET_MS` / `SETTLE_MAX_MS` in `background.js`.
