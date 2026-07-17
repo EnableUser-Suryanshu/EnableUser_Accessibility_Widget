@@ -13,6 +13,7 @@ const chkIndia = $("opt-check-india");
 const chkIs17802 = $("opt-check-is17802");
 const chkMedia = $("opt-check-media");
 const chkPdfOffice = $("opt-check-pdfoffice");
+const chkVisual = $("opt-check-visual");
 const chkDismiss = $("opt-dismiss-overlays");
 const chkAuditBoth = $("opt-audit-both");
 const chkScreenshots = $("opt-screenshots");
@@ -44,6 +45,7 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismis
   if (chkIs17802) chkIs17802.checked = c.is17802 === true;
   if (chkMedia) chkMedia.checked = c.media !== false;
   if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice !== false;
+  if (chkVisual) chkVisual.checked = c.visual !== false;
   if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
   if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
   // v0.4.5 — operator's default recipe: screenshots stay opt-in; real-pages
@@ -79,7 +81,8 @@ function readScanOptions() {
     india: chkIndia ? chkIndia.checked : true,
     is17802: chkIs17802 ? chkIs17802.checked : true,
     media: chkMedia ? chkMedia.checked : true,
-    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : true
+    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : true,
+    visual: chkVisual ? chkVisual.checked : true
   };
   const dismissOverlays = chkDismiss ? chkDismiss.checked : false;
   const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;

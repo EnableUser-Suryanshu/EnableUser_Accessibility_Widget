@@ -95,7 +95,7 @@ let ACTIVE_AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 // Per-check toggles + overlay-dismissal flag for the in-progress scan, set by
 // each scan handler from the popup options and pushed to the page (with the tag
 // set) by runContentScan via window.__EU_SCAN_OPTS. Default = everything on.
-let ACTIVE_CHECKS = { axe: true, india: true, media: true, is17802: true, pdfOffice: true };
+let ACTIVE_CHECKS = { axe: true, india: true, media: true, is17802: true, pdfOffice: true, visual: true };
 let ACTIVE_DISMISS = false;
 let ACTIVE_AUDIT_BOTH = false;
 // v0.4.3 — screenshots are now opt-in. Full-page + element capture via the
@@ -212,6 +212,7 @@ function settingsEcho(mode, { profile, maxUrls, crawlDepth } = {}) {
     "IS 17802 checks": ACTIVE_CHECKS.is17802 ? "on" : "off",
     "Media checks": ACTIVE_CHECKS.media ? "on" : "off",
     "PDF / Office audit": ACTIVE_CHECKS.pdfOffice ? "on" : "off",
+    "Visual-state checks (links / focus / hover)": ACTIVE_CHECKS.visual ? "on" : "off",
     "Dismiss overlays": ACTIVE_DISMISS ? "on" : "off",
     "Audit both overlay + page": ACTIVE_AUDIT_BOTH ? "on (two passes)" : "off",
     "Screenshots": ACTIVE_SCREENSHOTS ? "on" : "off",
@@ -245,7 +246,8 @@ function checksFromOptions(options) {
     india: c.india !== false,
     media: c.media !== false,
     is17802: c.is17802 !== false,
-    pdfOffice: c.pdfOffice !== false
+    pdfOffice: c.pdfOffice !== false,
+    visual: c.visual !== false
   };
 }
 
@@ -2622,7 +2624,7 @@ async function injectAxe(tabId) {
   // always clears with a short pause and a retry. Final failure is re-thrown
   // so the caller can record an error row rather than silently losing the
   // page.
-  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/media-checks.js", "lib/is17802-checks.js"];
+  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/media-checks.js", "lib/is17802-checks.js", "lib/visual-checks.js"];
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {

@@ -156,6 +156,12 @@
         is17802Site = r.site || null;
       }
     } catch (e) { console.warn("[EU] is17802-checks failed", e); }
+    // v0.4.6 — visual-state checks (colour-only links, focus suppression,
+    // hover cues). Provable failures merge as violations; pseudo-state
+    // findings carry the "review" tag and land in incomplete.
+    try {
+      if (checks.visual !== false && window.EU_VisualChecks?.run) customRules.push(...window.EU_VisualChecks.run());
+    } catch (e) { console.warn("[EU] visual-checks failed", e); }
     // Split custom rules by impact + review tag — "review"-tagged rules go
     // to incomplete (auditor needs to confirm), others to violations. The
     // tag-based split replaces the old impact-based one so serious/moderate

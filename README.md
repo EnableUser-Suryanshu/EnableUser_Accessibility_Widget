@@ -2,6 +2,19 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.6 — visual-state checks (automating part of the manual checklist)
+
+New check suite (`lib/visual-checks.js`, popup toggle, default ON) that automates the machine-detectable subset of the Manual Test Checklist:
+
+- **`eu-link-color-only`** (Violation, 1.4.1) — every link inside a text block is route-classified: if it has no grayscale-surviving cue (underline, border, bold, italic, lightness-differing background) AND its colour differs from the surrounding text by less than 3:1, that's a provable Use-of-Colour failure. Assists checklist **C-02 / C-03**.
+- **`eu-link-route-b-states`** (Incomplete/review, 1.4.1) — colour-only links that pass 3:1 but have no `:hover`/`:focus` cue rule anywhere in the page CSS. Route B (G183) requires both. Flagged for confirmation because JS-applied styles are invisible to a CSSOM scan. Assists **C-04**.
+- **`eu-focus-suppressed`** (Violation, 2.4.7) — detects the classic `*:focus { outline: none }` reset with **no** compensating `:focus`/`:focus-visible` indicator anywhere in the CSS. If replacements exist elsewhere, emits `eu-focus-outline-review` (Incomplete) instead. Assists **K-02**.
+- **`eu-link-no-hover-feedback`** (Incomplete/advisory, best-practice) — links with no hover rule at all. Explicitly labelled "not a WCAG AA defect — do not raise" per the team's over-reporting guidance; hover is optional, focus is mandatory.
+
+The **Manual Checklist sheet** gains a **"Machine assist"** column tying K-02/C-02/C-03/C-04 to these rule ids: review the pre-screened findings first, then spot-check. `:visited` contrast remains fully manual (browsers block reading it — force the state in DevTools).
+
+Also ships **`CRAWL-PIPELINE.md`** — the plain-language "what actually runs" walkthrough of every crawl stage with the real constants.
+
 ## v0.4.5 — manual-test layer + scan transparency + default recipe
 
 - **Manual Checklist sheet** in every `report.xlsx` / `inventory.xlsx`: the team's Manual Test Checklist v1.2 (129 cases, 9 passes — keyboard-only, forms & errors, zoom/reflow, colour & non-text contrast, motion/timing/media, screen reader, content & copy, pointer & mobile, cross-page). These are the SCs automated scanners are weak at (keyboard traps, focus indicators, hover/focus/visited link states, form errors, moving content, modal traps). Each case carries an **"Applies To"** column scoped by what the crawler actually found — form tests list the pages with forms, carousel tests the pages with carousels, video tests the pages with video (with sample URLs) — so the team tests where it matters instead of everywhere. Result/Notes columns are blank for the auditor to fill. Data lives in `lib/manual-checklist.js`; regenerate it from the xlsx when the checklist version bumps.
