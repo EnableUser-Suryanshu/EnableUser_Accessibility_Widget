@@ -46,9 +46,10 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismis
   if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice !== false;
   if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
   if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
-  // v0.4.3 — both default OFF (fast findings+Excel path, full discovery).
+  // v0.4.5 — operator's default recipe: screenshots stay opt-in; real-pages
+  // discovery is now the default (linked pages only, no sitemap/feed junk).
   if (chkScreenshots) chkScreenshots.checked = s?.screenshots === true;
-  if (chkLinksOnly) chkLinksOnly.checked = s?.linksOnly === true;
+  if (chkLinksOnly) chkLinksOnly.checked = s?.linksOnly !== false;
   // v0.4.4 — broken-link detection defaults ON.
   if (chkLinkCheck) chkLinkCheck.checked = s?.brokenLinks !== false;
 }).catch(() => {});

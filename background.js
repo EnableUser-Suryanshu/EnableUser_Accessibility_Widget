@@ -49,10 +49,13 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // client-side redirect JS get time to fire, then the wait ends as soon
 // as the DOM has been quiet for SETTLE_QUIET_MS — capped at
 // SETTLE_MAX_MS for pages that mutate forever (carousels, tickers,
-// animation loops). Static pages settle in ~5 s instead of 15 s.
+// animation loops). v0.4.5 — SETTLE_MIN_MS lowered 5s → 1s on operator
+// direction: the 2s DOM-quiet requirement is the real floor (a page can't
+// finish before ~2s of stability anyway), so static pages now settle in
+// ~2s while dynamic pages still get up to the 10s cap.
 const CONCURRENT_TABS = 200;
 const TAB_TIMEOUT_MS = 60_000;
-const SETTLE_MIN_MS = 5_000;
+const SETTLE_MIN_MS = 1_000;
 const SETTLE_QUIET_MS = 2_000;
 const SETTLE_MAX_MS = 10_000;
 // v12.2 — hard per-worker ceiling. waitForTabComplete (60s) + settle (≤10s)
@@ -189,6 +192,36 @@ function mergeRenderedVerdicts(brokenLinks, pages, linkGraph) {
     out.brokenCount++;
   }
   return out;
+}
+
+// v0.4.5 — settings echo. Snapshot of exactly what configuration is running,
+// attached to the report/inventory and emitted as a "Scan Settings" sheet in
+// the Excel workbooks — so nobody has to guess what a given report ran with.
+function settingsEcho(mode, { profile, maxUrls, crawlDepth } = {}) {
+  let version = "";
+  try { version = chrome.runtime.getManifest().version; } catch {}
+  return {
+    "Mode": mode,
+    "Extension version": version,
+    "Standard profile": profile || "",
+    "axe tags": ACTIVE_AXE_TAGS.join(", "),
+    "Max URLs": String(maxUrls ?? ""),
+    "Crawl depth": Number.isFinite(crawlDepth) ? String(crawlDepth) : "unbounded",
+    "axe-core checks": ACTIVE_CHECKS.axe ? "on" : "off",
+    "India checks": ACTIVE_CHECKS.india ? "on" : "off",
+    "IS 17802 checks": ACTIVE_CHECKS.is17802 ? "on" : "off",
+    "Media checks": ACTIVE_CHECKS.media ? "on" : "off",
+    "PDF / Office audit": ACTIVE_CHECKS.pdfOffice ? "on" : "off",
+    "Dismiss overlays": ACTIVE_DISMISS ? "on" : "off",
+    "Audit both overlay + page": ACTIVE_AUDIT_BOTH ? "on (two passes)" : "off",
+    "Screenshots": ACTIVE_SCREENSHOTS ? "on" : "off",
+    "Real pages only (links-only discovery)": ACTIVE_LINKS_ONLY ? "on" : "off",
+    "Broken-link detector": ACTIVE_LINKCHECK ? "on (status + soft-404 probe + redirect-to-home + rendered-DOM)" : "off",
+    "Page settle wait": `adaptive ${SETTLE_MIN_MS / 1000}–${SETTLE_MAX_MS / 1000}s (proceeds after ${SETTLE_QUIET_MS / 1000}s of DOM quiet)`,
+    "Concurrency": `${CONCURRENT_TABS} tabs global / ${PER_ORIGIN_TABS} per origin`,
+    "Tab load timeout": `${TAB_TIMEOUT_MS / 1000}s`,
+    "Worker hard timeout": `${WORKER_HARD_TIMEOUT_MS / 1000}s`
+  };
 }
 
 // v0.4.4 — link-graph recorder. Maps every harvested internal link target
@@ -527,6 +560,7 @@ async function scanMulti(tabId, options) {
     stopReason: stopReason || "completed"
   });
   report.brokenLinks = brokenLinks;
+  report.settings = settingsEcho("multi-page scan", { profile, maxUrls, crawlDepth });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
@@ -845,6 +879,7 @@ async function scanInventory(tabId, options) {
 
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile, stopReason: stopReason || "completed" });
   inventory.brokenLinks = brokenLinks;
+  inventory.settings = settingsEcho("inventory / scope crawl", { profile, maxUrls, crawlDepth });
 
   // v13.1 — audit every discovered PDF for structural accessibility
   // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
@@ -1113,6 +1148,7 @@ async function scanList(options) {
   });
   // v0.4.4 — rendered-DOM soft-404 verdicts for pasted URLs.
   inventory.brokenLinks = mergeRenderedVerdicts(null, pages, null);
+  inventory.settings = settingsEcho("template check (pasted list)", { profile, maxUrls: parsed.length, crawlDepth: 0 });
 
   // v13.1 PDF audit for the pasted URL list path too — every PDF linked
   // from any pasted page gets inspected.

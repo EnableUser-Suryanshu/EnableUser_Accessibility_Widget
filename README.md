@@ -2,6 +2,13 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.5 — manual-test layer + scan transparency + default recipe
+
+- **Manual Checklist sheet** in every `report.xlsx` / `inventory.xlsx`: the team's Manual Test Checklist v1.2 (129 cases, 9 passes — keyboard-only, forms & errors, zoom/reflow, colour & non-text contrast, motion/timing/media, screen reader, content & copy, pointer & mobile, cross-page). These are the SCs automated scanners are weak at (keyboard traps, focus indicators, hover/focus/visited link states, form errors, moving content, modal traps). Each case carries an **"Applies To"** column scoped by what the crawler actually found — form tests list the pages with forms, carousel tests the pages with carousels, video tests the pages with video (with sample URLs) — so the team tests where it matters instead of everywhere. Result/Notes columns are blank for the auditor to fill. Data lives in `lib/manual-checklist.js`; regenerate it from the xlsx when the checklist version bumps.
+- **Scan Settings sheet**: every workbook now records exactly what configuration produced it — profile, axe tags, every check on/off, settle timing, concurrency, extension version. No more guessing what a report ran with.
+- **Default recipe preset** (first-run defaults): axe ✓, media ✓, PDF/Office ✓, dismiss overlays ✓, audit both ✓, **real pages only ✓**, broken-link detector ✓, screenshots ✗. Click Multi Page Scan / Scope with zero checkbox fiddling.
+- **Settle minimum 1s** (was 5s): the 2s DOM-quiet requirement remains the effective floor, so static pages audit ~2s after load; dynamic pages still get up to 10s.
+
 ## v0.4.4 — internal broken-link (404) detector
 
 Runs automatically after every Multi Page / Inventory crawl (popup checkbox to disable). Three detection layers, all executed with your session cookies so results match what a real visitor sees:
