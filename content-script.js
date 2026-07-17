@@ -157,10 +157,13 @@
       }
     } catch (e) { console.warn("[EU] is17802-checks failed", e); }
     // v0.4.6 — visual-state checks (colour-only links, focus suppression,
-    // hover cues). Provable failures merge as violations; pseudo-state
-    // findings carry the "review" tag and land in incomplete.
+    // hover cues). v0.4.7 adds control-boundary/focus-ring/placeholder
+    // contrast, DOM-state checks, text-spacing survival, and an async 2.5s
+    // motion-sampling pass (only paid when carousel-like candidates exist).
+    // Provable failures merge as violations; judgment-dependent findings
+    // carry the "review" tag and land in incomplete.
     try {
-      if (checks.visual !== false && window.EU_VisualChecks?.run) customRules.push(...window.EU_VisualChecks.run());
+      if (checks.visual !== false && window.EU_VisualChecks?.run) customRules.push(...(await window.EU_VisualChecks.run()));
     } catch (e) { console.warn("[EU] visual-checks failed", e); }
     // Split custom rules by impact + review tag — "review"-tagged rules go
     // to incomplete (auditor needs to confirm), others to violations. The
