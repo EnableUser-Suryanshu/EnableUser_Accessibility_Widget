@@ -21,6 +21,7 @@ import { buildInventoryXlsx, buildClustersXlsx, buildAuditXlsx, buildReportXlsx 
 import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js";
 import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
+import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
 
 const DEFAULT_MAX_URLS = 50;
 const DEFAULT_CRAWL_DEPTH = 1;
@@ -106,6 +107,104 @@ let ACTIVE_SCREENSHOTS = false;
 // contains only genuinely linked, reachable pages — no stale sitemap
 // entries, no feed archives, no API-only junk URLs.
 let ACTIVE_LINKS_ONLY = false;
+// v0.4.4 — internal broken-link detection (default ON). After the crawl,
+// every unique internal link target harvested from every scanned page is
+// status-checked (hard 404s, soft 404s via a not-found fingerprint probe,
+// dead redirects to the homepage). Results land in a "Broken Links" sheet.
+let ACTIVE_LINKCHECK = true;
+// v0.4.4 — rendered not-found baseline for the DOM soft-404 layer. Set by
+// probeRendered404() at scan start (a worker tab renders a nonexistent URL
+// so we learn what the site's not-found page looks like AFTER JavaScript
+// runs — the only reliable signal on SPA sites). null = no baseline; the
+// per-page wording heuristic still applies.
+let ACTIVE_R404 = null;
+
+// Open a worker tab on a guaranteed-nonexistent URL, let it fully render
+// (adaptive settle), and capture the rendered not-found signature.
+async function probeRendered404(origin) {
+  if (!origin) return null;
+  const url = `${origin}/eu404probe-${Math.random().toString(36).slice(2, 12)}`;
+  let tab = null;
+  try {
+    tab = await createWorkerTab(url);
+    await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
+    await adaptiveSettle(tab.id);
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: collectRendered404Signals
+    });
+    const sig = results?.[0]?.result;
+    if (!sig) return null;
+    console.log(`[EU] rendered 404 probe — title="${sig.title}" textLen=${sig.textLen} shingles=${sig.shingleHashes?.length || 0}`);
+    return { title: sig.title || "", shingles: new Set(sig.shingleHashes || []), textLen: sig.textLen || 0 };
+  } catch (err) {
+    console.warn("[EU] rendered 404 probe failed:", err?.message || err);
+    return null;
+  } finally {
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
+  }
+}
+
+// Run the rendered-DOM soft-404 check on an open worker tab. Returns a
+// verdict object or null. Never throws — a failed collection just means
+// no rendered verdict for this page.
+async function checkRendered404(tabId) {
+  if (!ACTIVE_LINKCHECK) return null;
+  try {
+    const results = await chrome.scripting.executeScript({ target: { tabId }, func: collectRendered404Signals });
+    return rendered404Verdict(results?.[0]?.result, ACTIVE_R404);
+  } catch { return null; }
+}
+
+// Fold rendered-DOM soft-404 page verdicts into the fetch-layer results so
+// the "Broken Links" sheet carries both. Fetch-layer rows win on URL clash
+// (the rendered verdict is appended to their detail instead).
+function mergeRenderedVerdicts(brokenLinks, pages, linkGraph) {
+  const flagged = (pages || []).filter(p => p && p.soft404 && !p.error);
+  if (!flagged.length) return brokenLinks;
+  const out = brokenLinks || {
+    checked: 0, totalTargets: 0, truncated: false, okCount: 0,
+    brokenCount: 0, notFoundMode: "rendered-only", probeStatuses: [], rows: []
+  };
+  const byUrl = new Map(out.rows.map(r => [r.url, r]));
+  for (const p of flagged) {
+    const existing = byUrl.get(p.url) || (p.finalUrl && byUrl.get(p.finalUrl));
+    if (existing) {
+      existing.detail += ` | ${p.soft404.detail}`;
+      continue;
+    }
+    const entry = linkGraph ? (linkGraph.get(p.url) || (p.finalUrl && linkGraph.get(p.finalUrl))) : null;
+    const sources = entry ? [...entry.sources.entries()] : [];
+    out.rows.push({
+      url: p.url,
+      classification: p.soft404.kind,
+      detail: p.soft404.detail,
+      status: 200,
+      final_url: (p.finalUrl && p.finalUrl !== p.url) ? p.finalUrl : "",
+      source_count: sources.length,
+      sources: sources.map(([src, text]) => text ? `${src}  ["${text}"]` : src).join("\n"),
+      first_source: sources[0]?.[0] || "",
+      first_link_text: sources[0]?.[1] || ""
+    });
+    out.brokenCount++;
+  }
+  return out;
+}
+
+// v0.4.4 — link-graph recorder. Maps every harvested internal link target
+// to the pages that link to it (+ anchor text), feeding detectBrokenLinks.
+function recordLinksInto(linkGraph, sourceUrl, links) {
+  if (!linkGraph || !links) return;
+  for (const l of links) {
+    const u = l && l.url;
+    if (!u) continue;
+    let e = linkGraph.get(u);
+    if (!e) { e = { sources: new Map() }; linkGraph.set(u, e); }
+    if (!e.sources.has(sourceUrl) && e.sources.size < 25) {
+      e.sources.set(sourceUrl, String(l.text || "").slice(0, 120));
+    }
+  }
+}
 function checksFromOptions(options) {
   const c = (options && options.checks) || {};
   return {
@@ -273,10 +372,12 @@ async function scanMulti(tabId, options) {
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
   ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
   ACTIVE_LINKS_ONLY = !!(options && options.linksOnly);
+  ACTIVE_LINKCHECK = !(options && options.brokenLinks === false);
 
   const tab = await chrome.tabs.get(tabId);
   const startUrl = tab.url;
   const seedOrigin = safeOrigin(startUrl);
+  const linkGraph = ACTIVE_LINKCHECK ? new Map() : null;
 
   const queue = new RequestQueue({ scopeUrl: startUrl, maxUrls, maxDepth: crawlDepth, scope: "same-hostname" });
   queue.enqueue(startUrl, { depth: 0, priority: 100, source: "seed" });
@@ -301,17 +402,25 @@ async function scanMulti(tabId, options) {
     if (liveSeed?.url) queue.markSettled(liveSeed.url);
   } catch {}
 
-  await seedDiscovery({
-    tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats,
-    linksOnly: ACTIVE_LINKS_ONLY
-  });
+  await openCrawlerWindow();
+  // v0.4.4 — render the site's not-found page (worker tab on a nonexistent
+  // URL) in parallel with discovery, so the rendered-DOM soft-404 layer has
+  // its baseline before any worker scans a page.
+  const [, r404] = await Promise.all([
+    seedDiscovery({
+      tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats,
+      linksOnly: ACTIVE_LINKS_ONLY,
+      onLinks: linkGraph ? (src, links) => recordLinksInto(linkGraph, src, links) : null
+    }),
+    ACTIVE_LINKCHECK ? probeRendered404(seedOrigin) : Promise.resolve(null)
+  ]);
+  ACTIVE_R404 = r404;
 
   console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap}/${discoveryStats.sitemapRaw} hreflang:${discoveryStats.hreflang} feed:${discoveryStats.feed}/${discoveryStats.feedRaw} linkRels:${discoveryStats.linkRels} | pending:${queue.pending}`);
 
   const active = new Set();
   let errorStreak = 0;
   let stopReason = null;
-  await openCrawlerWindow();
 
   async function launch(req) {
     // `acquired` tracks whether wait() returned a non-null token. Only if
@@ -349,6 +458,7 @@ async function scanMulti(tabId, options) {
       results.push({ url: req.url, depth: req.depth, source: req.source, ...scan });
       depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
       errorStreak = 0;
+      if (linkGraph && links.length) recordLinksInto(linkGraph, req.url, links);
       if (req.depth < crawlDepth) {
         const nav = links.filter(l => l.priority >= 10).map(l => l.url);
         const body = links.filter(l => l.priority < 10).map(l => l.url);
@@ -396,10 +506,27 @@ async function scanMulti(tabId, options) {
   await closeCrawlerWindow();
 
   console.log(`[EU] crawl complete — pages per depth:`, depthStats, "rate:", rateLimiter.snapshot());
+
+  // v0.4.4 — status-check every internal link target found during the crawl.
+  let brokenLinks = null;
+  if (linkGraph && linkGraph.size) {
+    console.log(`[EU] broken-link check — ${linkGraph.size} unique internal link target(s)`);
+    try {
+      brokenLinks = await detectBrokenLinks({ linkGraph, origin: seedOrigin });
+      console.log(`[EU] broken-link check done — ${brokenLinks.brokenCount} broken of ${brokenLinks.checked} checked (not-found mode: ${brokenLinks.notFoundMode})`);
+    } catch (err) {
+      console.warn("[EU] broken-link check failed:", err?.message || err);
+    }
+  }
+  // Fold in the rendered-DOM soft-404 verdicts collected per crawled page.
+  brokenLinks = mergeRenderedVerdicts(brokenLinks, results, linkGraph);
+  ACTIVE_R404 = null;
+
   const report = buildReport(results, {
     mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats, profile,
     stopReason: stopReason || "completed"
   });
+  report.brokenLinks = brokenLinks;
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
@@ -446,6 +573,8 @@ async function scanInventory(tabId, options) {
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
   ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
   ACTIVE_LINKS_ONLY = !!(options && options.linksOnly);
+  ACTIVE_LINKCHECK = !(options && options.brokenLinks === false);
+  const linkGraph = ACTIVE_LINKCHECK ? new Map() : null;
 
   console.log(`[EU] inventory scan start — seed=${startUrl} maxUrls=${maxUrls} depth=${crawlDepth} profile=${profile} tags=${ACTIVE_AXE_TAGS.join(",")} screenshots=${ACTIVE_SCREENSHOTS} linksOnly=${ACTIVE_LINKS_ONLY}`);
 
@@ -571,11 +700,20 @@ async function scanInventory(tabId, options) {
   // parallel and enqueues them in priority order (nav > canonical/next/prev
   // > hreflang > feed > sitemap > body) so limited-budget crawls don't get
   // starved by a 10k-entry sitemap dumped first.
-  await seedDiscovery({
-    tabId, startUrl, seedOrigin, queue, depth: 1,
-    discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 },
-    linksOnly: ACTIVE_LINKS_ONLY
-  });
+  await openCrawlerWindow();
+  // v0.4.4 — render the site's not-found page (worker tab on a nonexistent
+  // URL) in parallel with discovery, so the rendered-DOM soft-404 layer has
+  // its baseline before any worker scans a page.
+  const [, r404] = await Promise.all([
+    seedDiscovery({
+      tabId, startUrl, seedOrigin, queue, depth: 1,
+      discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 },
+      linksOnly: ACTIVE_LINKS_ONLY,
+      onLinks: linkGraph ? (src, links) => recordLinksInto(linkGraph, src, links) : null
+    }),
+    ACTIVE_LINKCHECK ? probeRendered404(seedOrigin) : Promise.resolve(null)
+  ]);
+  ACTIVE_R404 = r404;
 
   console.log(`[EU] post-discovery queue size: ${queue.pending} pending, ${queue.total} total seen`);
 
@@ -584,7 +722,6 @@ async function scanInventory(tabId, options) {
   let stopReason = null;
   // v0.4.3 — checkpoint meta reused on every periodic write.
   const checkpointMeta = { mode: "inventory", seedUrl: startUrl, seedHost, maxUrls, crawlDepth, profile, depthStats, startedAt: Date.now() };
-  await openCrawlerWindow();
 
   async function launch(req) {
     console.log(`[EU] launch: ${req.url} (source=${req.source}, depth=${req.depth})`);
@@ -638,6 +775,7 @@ async function scanInventory(tabId, options) {
       });
       depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
       errorStreak = 0;
+      if (linkGraph && links.length) recordLinksInto(linkGraph, req.url, links);
       if (req.depth < crawlDepth) {
         const nav = links.filter(l => l.priority >= 10).map(l => l.url);
         const body = links.filter(l => l.priority < 10).map(l => l.url);
@@ -680,12 +818,33 @@ async function scanInventory(tabId, options) {
   while (active.size > 0) { await Promise.race(active); pump(); }
   await closeCrawlerWindow();
 
+  // v0.4.4 — status-check every internal link target found during the crawl.
+  // Runs while the progress banner is still active so the operator sees it.
+  let brokenLinks = null;
+  if (linkGraph && linkGraph.size) {
+    console.log(`[EU] broken-link check — ${linkGraph.size} unique internal link target(s)`);
+    await progressUpdate({ currentUrl: `checking ${Math.min(linkGraph.size, 8000)} internal links for 404s…` });
+    try {
+      brokenLinks = await detectBrokenLinks({
+        linkGraph, origin: seedOrigin,
+        onProgress: (done, total) => progressUpdate({ currentUrl: `link check ${done}/${total}` })
+      });
+      console.log(`[EU] broken-link check done — ${brokenLinks.brokenCount} broken of ${brokenLinks.checked} checked (not-found mode: ${brokenLinks.notFoundMode})`);
+    } catch (err) {
+      console.warn("[EU] broken-link check failed:", err?.message || err);
+    }
+  }
+  // Fold in the rendered-DOM soft-404 verdicts collected per crawled page.
+  brokenLinks = mergeRenderedVerdicts(brokenLinks, pages, linkGraph);
+  ACTIVE_R404 = null;
+
   // Mark the crawl as inactive so the popup's progress banner disappears.
   // Keep the final done/total for one refresh so the user sees "done" before
   // it clears.
   await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
   const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile, stopReason: stopReason || "completed" });
+  inventory.brokenLinks = brokenLinks;
 
   // v13.1 — audit every discovered PDF for structural accessibility
   // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
@@ -807,6 +966,10 @@ async function scanList(options) {
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
   ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
+  // v0.4.4 — pasted lists get the rendered-DOM wording heuristic (no
+  // baseline probe — the list may span many origins).
+  ACTIVE_LINKCHECK = !(options && options.brokenLinks === false);
+  ACTIVE_R404 = null;
 
   const parsed = [];
   const seenExact = new Set();
@@ -948,6 +1111,8 @@ async function scanList(options) {
     noDedup: true,
     stopReason: stopReason || "completed"
   });
+  // v0.4.4 — rendered-DOM soft-404 verdicts for pasted URLs.
+  inventory.brokenLinks = mergeRenderedVerdicts(null, pages, null);
 
   // v13.1 PDF audit for the pasted URL list path too — every PDF linked
   // from any pasted page gets inspected.
@@ -1039,6 +1204,10 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
     // Content signals (with shadow DOM, actual values, static/dynamic class).
     const signals = await collectContentSignals(tabId);
 
+    // v0.4.4 — rendered-DOM soft-404 check (SPA-safe: sees what JavaScript
+    // actually painted, not what the server sent).
+    const soft404 = await checkRendered404(tabId);
+
     // v0.2.6 — Content-hash dedup check. runContentScan returns the
     // page's rendered-text hash; if another worker already produced the
     // same hash, this page is the same content served under a different
@@ -1078,6 +1247,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
 
     const out = {
       title: auditPayload?.title || tab.title || "",
+      ...(soft404 ? { soft404 } : {}),
       template_id: tmpl.fingerprint || "unknown",
       url_cluster: tmpl.urlCluster || "unknown",
       text_hash: textHash,
@@ -2208,7 +2378,7 @@ async function scanInExistingTab(tabId) {
 // frameworkManifest, jsonLd) surface in discoveryStats so operators can
 // see which source earned which URL on a per-site basis.
 // ─────────────────────────────────────────────────────────────────────────
-async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats, linksOnly = false }) {
+async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discoveryStats, linksOnly = false, onLinks = null }) {
   // v0.4.3 — "real pages only" mode (SiteCrawler-style). Nulling the origin
   // disables every out-of-band source below (sitemap walk, robots.txt,
   // homepage <link> rels, RSS/Atom feeds, CMS API probes); only the in-page
@@ -2312,6 +2482,30 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   // only way to reach deep-linked detail pages on sites without sitemaps
   // (e.g. many SPAs that never wrote a sitemap.xml).
   discoveryStats.body = queue.enqueueMany(bodyOnly, { depth, priority: 2, source: "body" });
+
+  // v0.4.4 — feed the broken-link detector. Seed-page links carry the real
+  // source URL + anchor text; out-of-band sources get a pseudo-source label
+  // so a stale sitemap/feed entry that 404s is traceable to where it came
+  // from. Everything recorded here gets status-checked after the crawl,
+  // even URLs the crawl budget never reached.
+  if (onLinks) {
+    try {
+      onLinks(startUrl, navLinks);
+      const label = (name, urls) => {
+        if (urls && urls.length) onLinks(`(${name})`, urls.map(u => ({ url: u, text: "" })));
+      };
+      label("sitemap.xml", sitemapSample);
+      label("feed", feedUrls.slice(0, Math.max(feedBudget, 0)));
+      label("hreflang", homepageLinks.hreflang || []);
+      label("link-rel", linkRelUrls);
+      label("cms-api", [
+        ...cmsApiResults.wordpress, ...cmsApiResults.shopify, ...cmsApiResults.htmlSitemap,
+        ...cmsApiResults.frameworkManifest, ...cmsApiResults.jsonLd
+      ]);
+    } catch (err) {
+      console.warn("[EU] onLinks recording failed:", err?.message || err);
+    }
+  }
 }
 
 async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}) {
@@ -2357,6 +2551,9 @@ async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}
 
     await injectAxe(tab.id);
     const r = await runContentScan(tab.id);
+    // v0.4.4 — rendered-DOM soft-404 check (SPA-safe).
+    const soft404 = await checkRendered404(tab.id);
+    if (soft404) r.soft404 = soft404;
     if (collectNextLinks) {
       try {
         r.links = await collectNavLinks(tab.id);

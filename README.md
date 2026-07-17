@@ -2,6 +2,17 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.4 — internal broken-link (404) detector
+
+Runs automatically after every Multi Page / Inventory crawl (popup checkbox to disable). Three detection layers, all executed with your session cookies so results match what a real visitor sees:
+
+1. **Hard errors** — every unique internal link target harvested from every crawled page (including sitemap/feed/CMS-sourced URLs the crawl budget never reached) is status-checked: HEAD first, GET fallback where HEAD is refused. 404/410 → hard-404, 5xx → server-error, timeouts/DNS failures → unreachable, other 4xx → client-error, 401/403 → access-blocked (informational).
+2. **Soft 404s** — before checking, two deliberately-nonexistent URLs are probed to fingerprint the site's real not-found behaviour. If the site answers 200 with a "not found" page, its text signature (word shingles) is captured and every 200-status link target's body is compared against it (≥80% similar → soft-404). A title/H1 wording heuristic ("404", "page not found", …) catches the rest.
+3. **Dead redirects** — links that 30x-redirect to the homepage (the classic silently-deleted page) are flagged even though they end at HTTP 200.
+4. **Rendered-DOM layer (SPA-safe)** — raw fetch can't see not-found pages that JavaScript renders after a 200 app-shell response. At crawl start, a worker tab renders a nonexistent URL and fingerprints the site's *rendered* not-found page (main content only — header/footer/nav stripped so shared page chrome can't false-positive). Every crawled page's rendered DOM is then compared against that fingerprint, plus a rendered title/heading wording check. Verdicts are folded into the same Broken Links sheet as `soft-404 (rendered)`.
+
+Findings land in a **Broken Links** sheet in both `report.xlsx` and `inventory.xlsx`: broken URL, problem type, detail, HTTP status, redirect target, and — because the crawler records the link graph — **every page that links to the broken URL plus the anchor text used**, so you can fix the actual `<a>` tags. Checks run ~16 at a time with a 15 s per-URL timeout, capped at 8,000 targets (cap noted in the sheet when hit). New file: `lib/link-check.js`.
+
 ## v0.4.3 — findings-first fast path + SiteCrawler ports
 
 - **Screenshots are now opt-in** (popup checkbox, default off). Full-page + per-violation capture via the debugger API was the heaviest per-page cost after axe; with it off you get findings + Excel only, making large-site crawls practical. Turn the checkbox on when you need the visual evidence.

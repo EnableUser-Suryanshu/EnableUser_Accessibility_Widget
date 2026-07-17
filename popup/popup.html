@@ -90,7 +90,7 @@
       <section class="options">
         <label class="opt">
           <span>Max URLs</span>
-          <input id="opt-max-urls" type="number" min="1" step="1" value="5000" />
+          <input id="opt-max-urls" type="number" min="1" step="1" value="500" />
         </label>
         <label class="opt">
           <span>Crawl depth (0 = unbounded in Inventory mode)</span>
@@ -118,9 +118,10 @@
         <label class="chk"><input type="checkbox" id="opt-check-media" checked /> Media checks (video / audio / document links)</label>
         <label class="chk"><input type="checkbox" id="opt-check-pdfoffice" checked /> PDF / Office document audit</label>
         <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss cookie / consent / modal overlays before scanning</label>
-        <label class="chk"><input type="checkbox" id="opt-audit-both" checked /> Audit BOTH the overlay and the page (two passes — slower)</label>
+        <label class="chk"><input type="checkbox" id="opt-audit-both" /> Audit BOTH the overlay and the page (two passes — slower)</label>
         <label class="chk"><input type="checkbox" id="opt-screenshots" /> Capture screenshots (full-page + per-violation — much slower, bigger reports)</label>
         <label class="chk"><input type="checkbox" id="opt-links-only" /> Real pages only — follow visible links, skip sitemap / feeds / CMS probes</label>
+        <label class="chk"><input type="checkbox" id="opt-linkcheck" checked /> Detect broken internal links (hard 404s, soft 404s, dead redirects)</label>
       </section>
 
       <button id="btn-recover" class="scan" hidden>Recover interrupted crawl</button>
@@ -132,7 +133,7 @@
       <p>To subscribe to the advanced features of EnableUser, kindly contact:<br />
         <a href="mailto:teamenableuser@gmail.com">teamenableuser@gmail.com</a>
       </p>
-      <p class="meta">Version 0.4.3 | Powered by axe-core</p>
+      <p class="meta">Version 0.4.4 | Powered by axe-core</p>
     </footer>
 
     <script src="popup.js" type="module"></script>

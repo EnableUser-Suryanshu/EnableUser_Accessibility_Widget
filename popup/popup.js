@@ -17,16 +17,16 @@ const chkDismiss = $("opt-dismiss-overlays");
 const chkAuditBoth = $("opt-audit-both");
 const chkScreenshots = $("opt-screenshots");
 const chkLinksOnly = $("opt-links-only");
+const chkLinkCheck = $("opt-linkcheck");
 const btnRecover = $("btn-recover");
 
 // First-run defaults — what the operator sees the first time they open the
-// popup with no stored preferences yet. Combined (WCAG 2.1 AA + IS 17802)
-// covers the India-compliance use case most users of this build are here
-// for, and 5000 URLs is a sensible ceiling for mid-size marketing/content
-// sites without being so large it invites runaway crawls. Both are freely
+// popup with no stored preferences yet. WCAG 2.1 AA is the global baseline
+// every supported standard maps to; 500 URLs keeps a first run fast on a
+// large site (raise it once the site's size is known). Both are freely
 // editable per-scan and overridden by whatever the operator last saved to
 // chrome.storage.local.
-const DEFAULT_MAX_URLS = 5000;
+const DEFAULT_MAX_URLS = 500;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
 const DEFAULT_PROFILE = "wcag21aa";
 // No HARD_MAX_URLS / HARD_MAX_DEPTH ceilings on this end either — the
@@ -34,7 +34,7 @@ const DEFAULT_PROFILE = "wcag21aa";
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
 const VALID_PROFILES = ["wcag21aa", "wcag22aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
   if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
@@ -49,7 +49,20 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismis
   // v0.4.3 — both default OFF (fast findings+Excel path, full discovery).
   if (chkScreenshots) chkScreenshots.checked = s?.screenshots === true;
   if (chkLinksOnly) chkLinksOnly.checked = s?.linksOnly === true;
+  // v0.4.4 — broken-link detection defaults ON.
+  if (chkLinkCheck) chkLinkCheck.checked = s?.brokenLinks !== false;
 }).catch(() => {});
+
+// v0.4.4 — selecting an India compliance profile auto-enables the India /
+// IS 17802 check suites (they're what those profiles are FOR — previously
+// you could pick "IS 17802" and silently run without its own checks).
+// Only ticks ON; never unticks a box the operator set themselves.
+profileSelect?.addEventListener("change", () => {
+  if (profileSelect.value === "is17802" || profileSelect.value === "combined_in") {
+    if (chkIndia) chkIndia.checked = true;
+    if (chkIs17802) chkIs17802.checked = true;
+  }
+});
 
 function readScanOptions() {
   // Floor-only on maxUrls. No ceiling.
@@ -71,10 +84,11 @@ function readScanOptions() {
   const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;
   const screenshots = chkScreenshots ? chkScreenshots.checked : false;
   const linksOnly = chkLinksOnly ? chkLinksOnly.checked : false;
+  const brokenLinks = chkLinkCheck ? chkLinkCheck.checked : true;
   maxUrlsInput.value = maxUrls;
   depthInput.value = crawlDepth;
-  chrome.storage?.local.set({ maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly }).catch(() => {});
-  return { maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly };
+  chrome.storage?.local.set({ maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly, brokenLinks }).catch(() => {});
+  return { maxUrls, crawlDepth, profile, checks, dismissOverlays, auditBoth, screenshots, linksOnly, brokenLinks };
 }
 
 function setStatus(msg, isError = false) {
