@@ -136,7 +136,7 @@ function renderNodeDetails(i) {
   const res = await send({ type: "GET_REPORT", reportId });
   const report = res?.report;
   if (!report) {
-    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>The report has expired. Run a new scan from the popup.</p></div>";
+    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>This report is no longer stored — only the last 5 reports are kept. Run a new scan from the popup. (Since v0.4.8 reports survive browser restarts; if you see this on a fresh report, reload the extension and re-scan.)</p></div>";
     return;
   }
 

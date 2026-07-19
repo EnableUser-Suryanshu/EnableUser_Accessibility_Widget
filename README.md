@@ -2,6 +2,10 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.4.8 — reports persist (no more "Report expired")
+
+Multi-page and single-page reports were held only in the service worker's memory; Chrome evicts an idle MV3 worker after ~30 s, after which the report tab showed "expired" and downloads failed. Reports now persist to chrome.storage.local (last 5 kept, older pruned) and are re-warmed on demand — the report tab, Excel, and CSV work indefinitely, across browser restarts. Viewer, Excel, and CSV all read the same persisted object, so what you see in the run result is exactly what lands in the Excel.
+
 ## v0.4.6 — visual-state checks (automating part of the manual checklist)
 
 New check suite (`lib/visual-checks.js`, popup toggle, default ON) that automates the machine-detectable subset of the Manual Test Checklist:

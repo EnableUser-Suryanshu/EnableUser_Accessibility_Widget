@@ -296,6 +296,38 @@ const inventories = new Map(); // inventoryId → { inventory, files: { docx: Bl
 const inventoryScreenshots = new Map(); // screenshotId → { dataUrl, bytes }
 const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 
+// v0.4.8 — reports survive service-worker eviction. MV3 kills an idle
+// service worker after ~30s; anything held only in the in-memory `reports`
+// Map is gone after that, so refreshing the report tab or clicking Download
+// later returned "Report expired". Reports are now persisted to
+// chrome.storage.local (like inventories already were) and re-warmed into
+// memory on demand. The last 5 reports are kept; older ones are pruned so
+// storage doesn't grow without bound.
+const REPORT_KEEP = 5;
+async function persistReport(reportId, report) {
+  try {
+    await chrome.storage.local.set({ [`report:${reportId}`]: report });
+    const got = await chrome.storage.local.get("report-ids");
+    const ids = Array.isArray(got?.["report-ids"]) ? got["report-ids"] : [];
+    ids.push(reportId);
+    const drop = ids.splice(0, Math.max(0, ids.length - REPORT_KEEP));
+    await chrome.storage.local.set({ "report-ids": ids });
+    if (drop.length) await chrome.storage.local.remove(drop.map(id => `report:${id}`));
+  } catch (err) {
+    console.warn("[EU] persistReport failed — report will only survive while the service worker lives", err?.message || err);
+  }
+}
+async function getReport(reportId) {
+  const mem = reports.get(reportId);
+  if (mem) return mem;
+  try {
+    const got = await chrome.storage.local.get(`report:${reportId}`);
+    const rep = got?.[`report:${reportId}`] || null;
+    if (rep) reports.set(reportId, rep); // re-warm for subsequent downloads
+    return rep;
+  } catch { return null; }
+}
+
 // Enforce a non-zero floor on numeric options without imposing a ceiling.
 function floorInt(raw, fallback, floor = 1) {
   const n = parseInt(raw, 10);
@@ -313,7 +345,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "RECOVER_CHECKPOINT") sendResponse(await recoverCheckpoint());
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
-      else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: reports.get(msg.reportId) || null });
+      else if (msg.type === "GET_REPORT") sendResponse({ ok: true, report: await getReport(msg.reportId) });
       else if (msg.type === "GET_INVENTORY") sendResponse(await getInventory(msg.inventoryId));
       else if (msg.type === "GET_SCREENSHOT") sendResponse(await getScreenshot(msg.id));
       else if (msg.type === "DOWNLOAD_CSV") sendResponse(await downloadCsv(msg.reportId));
@@ -384,6 +416,7 @@ async function scanCurrent(tabId, options) {
   const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url, profile });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
+  await persistReport(reportId, report); // v0.4.8 — survive SW eviction
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
   return { ok: true, reportId };
 }
@@ -565,6 +598,10 @@ async function scanMulti(tabId, options) {
   report.settings = settingsEcho("multi-page scan", { profile, maxUrls, crawlDepth });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
+  // v0.4.8 — persist BEFORE opening the viewer tab, so even if the service
+  // worker is evicted the instant the tab opens, GET_REPORT recovers it
+  // from storage and the Excel/CSV downloads keep working indefinitely.
+  await persistReport(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
   return { ok: true, reportId };
 }
@@ -3229,8 +3266,8 @@ function sumNodes(rules) {
 }
 
 async function downloadReportXlsx(reportId) {
-  const report = reports.get(reportId);
-  if (!report) return { ok: false, error: "Report expired" };
+  const report = await getReport(reportId);
+  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
   const blob = await buildReportXlsx(report);
   const dataUrl = await blobToDataUrl(blob);
   const host = safeHost(report.meta.seedUrl);
@@ -3244,8 +3281,8 @@ async function downloadReportXlsx(reportId) {
 }
 
 async function downloadCsv(reportId) {
-  const report = reports.get(reportId);
-  if (!report) return { ok: false, error: "Report expired" };
+  const report = await getReport(reportId);
+  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
 
   // Shared column sets — full fidelity, no truncation. Objects/arrays are
   // serialised by toCsv via JSON.stringify in wrapCell (see csv-writer.js).
