@@ -1,0 +1,14 @@
+{
+  "name": "enableuser-accessibility-widget",
+  "version": "0.1.0",
+  "description": "Chrome extension that audits a site against WCAG 2.1 AA using axe-core and produces a CSV report.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "postinstall": "node build.js"
+  },
+  "dependencies": {
+    "axe-core": "^4.12.1"
+  }
+}
