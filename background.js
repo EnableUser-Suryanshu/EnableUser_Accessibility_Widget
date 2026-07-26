@@ -137,6 +137,50 @@ let ACTIVE_AUDIT_BOTH = false;
 // makes large-site crawls impractical; default-off gives a findings+Excel
 // fast path. The popup exposes a "Capture screenshots" checkbox.
 let ACTIVE_SCREENSHOTS = false;
+// Which operation currently owns the ACTIVE_* configuration, or null.
+//
+// Every scan entrypoint writes the ACTIVE_* globals to configure the worker
+// pool, so two operations running at once means the second silently reconfigures
+// the first mid-flight — remaining pages get different checks, a different
+// profile, and possibly screenshots switched off, while the run still presents
+// as one coherent scan.
+//
+// This is easy to trigger by accident: the popup disables its buttons while IT is
+// waiting, but closing and reopening the popup during a long crawl resets that,
+// and "Highlight issues" in particular reads as a harmless read-only action.
+let ACTIVE_OPERATION = null;
+function operationLabel(kind) {
+  return {
+    "scan-current": "a single-page scan",
+    "scan-inventory": "a crawl",
+    "scan-list": "a URL-list check",
+    "highlight": "an annotation pass"
+  }[kind] || kind;
+}
+// Claim exclusive ownership of the ACTIVE_* configuration. Returns null when
+// something else holds it, in which case the caller must bail rather than
+// proceed and corrupt the running operation.
+function claimOperation(kind) {
+  if (ACTIVE_OPERATION) return null;
+  ACTIVE_OPERATION = kind;
+  return kind;
+}
+function releaseOperation(kind) {
+  if (ACTIVE_OPERATION === kind) ACTIVE_OPERATION = null;
+}
+// Run `fn` holding the ACTIVE_* claim, refusing rather than corrupting if
+// something else already holds it.
+async function withOperation(kind, fn) {
+  if (!claimOperation(kind)) return busyError(kind);
+  try { return await fn(); }
+  finally { releaseOperation(kind); }
+}
+function busyError(kind) {
+  return {
+    ok: false,
+    error: `${operationLabel(ACTIVE_OPERATION)} is already running — wait for it to finish before starting ${operationLabel(kind)}. Running both would silently change the settings of the one already in progress.`
+  };
+}
 // v0.4.3 — "real pages only" discovery (SiteCrawler-style). When on,
 // seedDiscovery skips sitemap.xml / robots.txt / RSS-Atom feeds / CMS API
 // probes and the crawl follows only links that actually appear on pages
@@ -375,19 +419,41 @@ async function persistReport(reportId, report) {
     const drop = ids.splice(0, Math.max(0, ids.length - REPORT_KEEP));
     await chrome.storage.local.set({ "report-ids": ids });
     if (drop.length) {
-      // Drop each pruned report, its shot-id manifest, and the images it owned.
+      // Drop each pruned report and its shot-id manifest, then delete only the
+      // images NOTHING ELSE still references.
+      //
+      // Shots are genuinely shared. openClassicReport() reprojects a stored
+      // inventory into a report, and the derived report carries the SAME shot ids
+      // the inventory holds. Deleting a pruned report's shots unconditionally
+      // therefore silently blanked the images in the inventory report it came
+      // from — the inventory still referenced shot:<id>, but the bytes were gone,
+      // so its gallery and Excel previews degraded to "unavailable" with nothing
+      // explaining why. Two reports derived from the same crawl collide the same
+      // way.
+      //
+      // Surviving owners are read from the small `*-shots:` manifests rather than
+      // from the payloads themselves, so this stays cheap: an inventory can be
+      // tens of MB and pruning must not have to parse them all.
       const manifestKeys = drop.map(id => `report-shots:${id}`);
-      const manifests = await chrome.storage.local.get(manifestKeys);
-      const orphanShots = [];
+      const dropping = await chrome.storage.local.get(manifestKeys);
+      const candidates = new Set();
       for (const key of manifestKeys) {
-        for (const id of (Array.isArray(manifests?.[key]) ? manifests[key] : [])) {
-          orphanShots.push(`shot:${id}`);
+        for (const id of (Array.isArray(dropping?.[key]) ? dropping[key] : [])) candidates.add(id);
+      }
+
+      if (candidates.size) {
+        const all = await chrome.storage.local.get(null);
+        const survivingKeys = Object.keys(all).filter(k =>
+          (k.startsWith("report-shots:") || k.startsWith("inv-shots:")) && !manifestKeys.includes(k));
+        for (const k of survivingKeys) {
+          for (const id of (Array.isArray(all[k]) ? all[k] : [])) candidates.delete(id);
         }
       }
+
       await chrome.storage.local.remove([
         ...drop.map(id => `report:${id}`),
         ...manifestKeys,
-        ...orphanShots
+        ...[...candidates].map(id => `shot:${id}`)
       ]);
     }
   } catch (err) {
@@ -415,15 +481,18 @@ function floorInt(raw, fallback, floor = 1) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId, msg.options));
+      // Scans and the annotation pass all write the shared ACTIVE_* config, so
+      // exactly one may run at a time. Guarding at the router keeps the claim in
+      // one place instead of threading it through four entrypoints.
+      if (msg.type === "SCAN_CURRENT") sendResponse(await withOperation("scan-current", () => scanCurrent(msg.tabId, msg.options)));
       // v0.4.8 — SCAN_MULTI now runs the same full-audit crawl pipeline as
       // inventory mode and presents in the tabbed viewer (Findings /
       // Screenshots / Templates). The classic flat report stays reachable
       // from the viewer via OPEN_CLASSIC_REPORT below.
-      else if (msg.type === "SCAN_MULTI") sendResponse(await scanInventory(msg.tabId, msg.options));
-      else if (msg.type === "SCAN_INVENTORY") sendResponse(await scanInventory(msg.tabId, msg.options));
+      else if (msg.type === "SCAN_MULTI") sendResponse(await withOperation("scan-inventory", () => scanInventory(msg.tabId, msg.options)));
+      else if (msg.type === "SCAN_INVENTORY") sendResponse(await withOperation("scan-inventory", () => scanInventory(msg.tabId, msg.options)));
       else if (msg.type === "OPEN_CLASSIC_REPORT") sendResponse(await openClassicReport(msg.inventoryId));
-      else if (msg.type === "SCAN_LIST") sendResponse(await scanList(msg.options));
+      else if (msg.type === "SCAN_LIST") sendResponse(await withOperation("scan-list", () => scanList(msg.options)));
       else if (msg.type === "RECOVER_CHECKPOINT") sendResponse(await recoverCheckpoint());
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
       else if (msg.type === "SCAN_ERROR") sendResponse(handleError(msg.payload, sender));
@@ -482,39 +551,46 @@ async function highlightIssuesOnTab(tabId, options) {
   if (!/^https?:/i.test(tab.url || "")) {
     return { ok: false, error: "This page can't be scanned — open a normal http(s) page first." };
   }
+  // Must not run alongside a scan: the ACTIVE_* writes below would reconfigure it
+  // mid-flight, and ACTIVE_SCREENSHOTS = false would silently stop a
+  // screenshot-enabled crawl from capturing for its remaining pages.
+  if (!claimOperation("highlight")) return busyError("highlight");
+  try {
+    const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+    ACTIVE_AXE_TAGS = tagsForProfile(profile);
+    ACTIVE_CHECKS = checksFromOptions(options);
+    ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+    ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+    // Never capture while highlighting: this is the operator's visible tab and the
+    // point is an instant annotation, not a report.
+    ACTIVE_SCREENSHOTS = false;
 
-  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
-  ACTIVE_AXE_TAGS = tagsForProfile(profile);
-  ACTIVE_CHECKS = checksFromOptions(options);
-  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
-  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
-  // Never capture while highlighting: this is the operator's visible tab and the
-  // point is an instant annotation, not a report.
-  ACTIVE_SCREENSHOTS = false;
+    const result = await scanInExistingTab(tabId);
+    const violations = result?.violations || [];
 
-  const result = await scanInExistingTab(tabId);
-  const violations = result?.violations || [];
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      files: ["lib/issue-overlay.js"],
+      world: "ISOLATED"
+    });
+    const [{ result: stats }] = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "ISOLATED",
+      func: (v) => (window.EU_IssueOverlay ? window.EU_IssueOverlay.render(v) : null),
+      args: [violations]
+    });
 
-  await chrome.scripting.executeScript({
-    target: { tabId, allFrames: false },
-    files: ["lib/issue-overlay.js"],
-    world: "ISOLATED"
-  });
-  const [{ result: stats }] = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: false },
-    world: "ISOLATED",
-    func: (v) => (window.EU_IssueOverlay ? window.EU_IssueOverlay.render(v) : null),
-    args: [violations]
-  });
-
-  const nodeCount = violations.reduce((n, r) => n + (r.nodes || []).length, 0);
-  return {
-    ok: true,
-    rules: violations.length,
-    issues: nodeCount,
-    marked: stats?.marked ?? 0,
-    unresolved: stats?.unresolved ?? 0
-  };
+    const nodeCount = violations.reduce((n, r) => n + (r.nodes || []).length, 0);
+    return {
+      ok: true,
+      rules: violations.length,
+      issues: nodeCount,
+      marked: stats?.marked ?? 0,
+      unresolved: stats?.unresolved ?? 0
+    };
+  } finally {
+    releaseOperation("highlight");
+  }
 }
 
 async function clearHighlightsOnTab(tabId) {
@@ -1077,6 +1153,13 @@ async function persistInventory(inventoryId, inventory) {
   };
   for (const p of inventory.pages || []) { collect(p.screenshot); collectShotsFromAudit(p.audit); }
   for (const t of inventory.templates || []) { collect(t.sample_screenshot); collectShotsFromAudit(t.sample_audit); }
+  // Ownership manifest, mirroring `report-shots:`. persistReport's pruning reads
+  // these to decide whether a shot belonging to a dropped report is still needed
+  // elsewhere. Without it, reprojecting this inventory through
+  // "Open Classic Report" and then running a few more scans would prune the
+  // derived report and take THIS inventory's images with it, since both
+  // reference the same shot ids.
+  if (seen.size) record[`inv-shots:${inventoryId}`] = [...seen];
   await chrome.storage.local.set(record);
   console.log(`[EU] persisted inventory ${inventoryId} + ${seen.size} screenshot(s) to storage.local`);
 }
@@ -1505,8 +1588,14 @@ const PAGE_METRICS_EXPR = `(function() {
 // (viewport expansion fires no scroll event, so it never triggered those at all).
 const WARM_STEP_RATIO = 0.8;          // overlap slightly so nothing falls between steps
 const WARM_STEP_PAUSE_MS = 120;       // long enough for observers to fire and fetches to start
-const WARM_MAX_STEPS = 60;            // ~48 viewports; bounds an infinite-scroll page
 const WARM_MAX_TOTAL_MS = 6_000;      // hard ceiling per page regardless of height
+// Derived, not chosen: the time budget is what actually binds, so a separate
+// step count was dead weight. An earlier version hard-coded 60, which
+// 6000ms / 120ms = 50 could never reach — so the "stopped at the step cap"
+// branch was unreachable and the warning that distinguished the two caps was
+// misleading. Deriving it keeps the loop bounded even if the pause is ever
+// lowered, without inventing a second number that has to agree with the first.
+const WARM_MAX_STEPS = Math.ceil(WARM_MAX_TOTAL_MS / WARM_STEP_PAUSE_MS) + 1;
 
 // Poll until every <img> has settled, so the capture doesn't freeze fetches that
 // the walk above only just started. Bounded: a page with a permanently pending

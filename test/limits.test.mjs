@@ -90,6 +90,34 @@ for (const [re, what] of goneFromVisual) {
   check(`removed: ${what}`, !re.test(visual));
 }
 
+// ── Concurrency guard: one operation may own the ACTIVE_* config ──
+// Scans and the annotation pass all write ACTIVE_AXE_TAGS / ACTIVE_CHECKS /
+// ACTIVE_SCREENSHOTS. Two at once means the second silently reconfigures the
+// first mid-run — remaining pages audited with different checks, screenshots
+// switched off, while the run still presents as one coherent scan.
+check("claimOperation / releaseOperation exist",
+  /function claimOperation/.test(bg) && /function releaseOperation/.test(bg));
+check("every scan entrypoint is routed through withOperation",
+  (bg.match(/withOperation\("scan-/g) || []).length >= 4,
+  `${(bg.match(/withOperation\("scan-/g) || []).length} guarded`);
+check("the annotation pass claims the config before writing ACTIVE_*",
+  /claimOperation\("highlight"\)/.test(bg) && /releaseOperation\("highlight"\)/.test(bg));
+check("a rejected claim returns an explanatory error, not a silent no-op",
+  /function busyError/.test(bg) && /already running/.test(bg));
+
+// ── Shot pruning must not delete images another owner still references ──
+// openClassicReport reprojects an inventory into a report, so both hold the SAME
+// shot ids. Pruning the report used to delete them and silently blank the
+// inventory's gallery and Excel previews.
+check("persistInventory writes an inv-shots ownership manifest",
+  /inv-shots:/.test(bg));
+check("pruning checks surviving report-shots AND inv-shots manifests",
+  /report-shots:/.test(bg) && /startsWith\("inv-shots:"\)/.test(bg));
+
+// ── The lazy-content walk's step cap must stay derived, not hard-coded ──
+check("WARM_MAX_STEPS is derived from the time budget",
+  /const WARM_MAX_STEPS = Math\.ceil\(WARM_MAX_TOTAL_MS/.test(bg));
+
 // ── Deliberate safety limits must NOT have been removed ──
 // These bound resources rather than findings; dropping them would be a bug.
 for (const [name, src, file] of [

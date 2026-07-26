@@ -125,6 +125,13 @@
       [...root.querySelectorAll("li")].map(li=>li.textContent.trim()).filter(x=>/^Fix /.test(x)).join(" | ") || "none");
     t("axe any/all heading IS shown as text", /Fix any of the following:/.test(root.textContent));
 
+    // Duplicate element ids are invalid HTML and axe flags them — an accessibility
+    // tool must not emit them. Unmarkable entries used to all get _row_0.
+    const rowIds = [...rows].map(r => r.id);
+    t("every panel row has a unique element id",
+      new Set(rowIds).size === rowIds.length,
+      rowIds.filter((v,i)=>rowIds.indexOf(v)!==i).join(", ") || "all unique");
+
     // Markers must be body-level, not nested in the target — that is what keeps
     // an overflow:hidden ancestor from clipping them and what avoids layout shift.
     const clipped = document.getElementById("clipped");
