@@ -22,13 +22,14 @@ for the full inventory and what was deliberately left behind.
   at 300 images. The **classic-report** workbook now carries them too — it
   previously embedded no images at all, so exporting via "Open Classic Report"
   silently dropped every screenshot the crawl had captured.
-- **Lazy-loaded content is now captured.** Before each capture the layout
-  viewport is expanded to the full document height, which fires every
-  `IntersectionObserver` on the page; we then wait for images to settle (bounded
-  at 4 s). `captureBeyondViewport` reaches below-the-fold content but never
-  triggers its lazy loading, so long pages used to capture blank hero images.
-  Width is left exactly as the tab had it — forcing a width would cross
-  responsive breakpoints and show a layout no real user at that size sees.
+- **Lazy-loaded content is now captured.** Before each capture the page is
+  walked top to bottom in viewport-sized steps, then returned to where it
+  started; we then wait for images to settle (bounded at 4 s).
+  `captureBeyondViewport` reaches below-the-fold content but never triggers its
+  lazy loading, so long pages used to capture blank hero images. Layout is left
+  exactly as the page renders — an earlier attempt resized the viewport to the
+  document height instead, which redefined `vh` and stretched every
+  viewport-sized hero (a 3456px test page became 21328px).
 - **Element crops are legible.** The highlight is drawn as an overlay box rather
   than only an inline outline, because an outline is clipped by any ancestor with
   `overflow: hidden` — precisely the containers that cause layout bugs. Crops

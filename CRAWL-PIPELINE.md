@@ -82,10 +82,11 @@ In order:
 6. Rendered-DOM soft-404 check against the step-2 baseline.
 7. Template fingerprint (URL cluster + DOM simhash) for clustering.
 8. Screenshot — only if the screenshots checkbox is ON. Three steps:
-   a. The layout viewport is expanded to the full document height (width left
-      alone, so responsive breakpoints don't shift). This fires every
-      `IntersectionObserver` on the page, which is what makes lazy-loaded
-      images below the fold actually load. Skipped when the page already fits.
+   a. The page is walked top to bottom in viewport-sized steps (80% overlap,
+      120ms per step, capped at 60 steps / 6s), then returned to where it
+      started. This is what triggers lazy-loaded content — scrolling fires both
+      IntersectionObserver loaders and older scroll-listener ones. Skipped when
+      the page already fits in the viewport.
    b. Wait until every `<img>` reports `complete`, capped at 4 s — otherwise the
       capture freezes lazy images mid-fetch as blank placeholders.
    c. One full-page PNG, then one cropped + highlighted PNG per distinct
