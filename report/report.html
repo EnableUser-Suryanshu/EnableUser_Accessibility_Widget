@@ -95,13 +95,21 @@
         </table>
       </section>
 
+      <!-- Native `hidden` attribute, not class="hidden": report.css scopes that
+           class to `table.hidden`, so it would not hide a <section>. -->
+      <section id="screenshots-section" hidden>
+        <h2>Screenshots</h2>
+        <p class="hint">Full-page screenshot of each scanned page, captured after the page settled. Click any image to expand it. Only present when the scan ran with screenshots enabled; images load as you scroll.</p>
+        <div class="screenshots-grid" id="screenshots-grid"></div>
+      </section>
+
       <section>
         <h2>Violations</h2>
-        <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and the complete any/all/none check results with messages and related nodes.</p>
+        <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and the complete any/all/none check results with messages and related nodes. The <strong>Screenshot</strong> column shows the offending element highlighted in place; click a thumbnail to enlarge it.</p>
         <table id="issues-table">
           <thead>
             <tr>
-              <th>URL</th><th>WCAG</th><th>Level</th><th>Rule</th><th>Impact</th><th>Summary</th>
+              <th>URL</th><th>WCAG</th><th>Level</th><th>Rule</th><th>Impact</th><th>Summary</th><th>Screenshot</th>
             </tr>
           </thead>
           <tbody></tbody>

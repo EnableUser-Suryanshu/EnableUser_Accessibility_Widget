@@ -23,6 +23,135 @@ function escape(s) {
   return String(s ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 }
 
+// ── Screenshots ───────────────────────────────────────────────────────────
+// Screenshots are full-page PNG data URLs — routinely 1–3 MB each. A crawl of
+// 200 pages would be ~400 MB of base64 if every <img> got a real src up front,
+// which locks the report tab for tens of seconds and can OOM it outright. So
+// every thumbnail starts as a 1x1 transparent placeholder and only fetches its
+// real bytes when it scrolls near the viewport.
+
+const BLANK_IMG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+// Read straight from storage first. The service worker may have been evicted
+// since the scan finished, in which case its in-memory Map is empty but
+// storage.local still holds shot:<id> (written by persistReport /
+// persistInventory). Falling back to the message path second means an evicted
+// worker doesn't have to be woken just to serve an image.
+async function readScreenshotFromStorage(id) {
+  try {
+    const key = `shot:${id}`;
+    const stored = await chrome.storage.local.get(key);
+    return stored[key] || null;
+  } catch (err) {
+    console.warn("[EU] storage.local read failed for screenshot", id, err);
+    return null;
+  }
+}
+
+const screenshotObserver = ("IntersectionObserver" in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const img = entry.target;
+        obs.unobserve(img);
+        loadScreenshot(img);
+      }
+    }, { rootMargin: "400px 0px" })
+  : null;
+
+async function loadScreenshot(img) {
+  const id = img.getAttribute("data-shot-id");
+  if (!id || img.getAttribute("data-loaded") === "1") return;
+  // Guard against a click and the observer both firing mid-fetch.
+  if (img.getAttribute("data-loaded") === "loading") return;
+  img.setAttribute("data-loaded", "loading");
+  try {
+    let entry = await readScreenshotFromStorage(id);
+    if (!entry?.dataUrl) {
+      const res = await send({ type: "GET_SCREENSHOT", id });
+      if (res?.ok && res.dataUrl) entry = { dataUrl: res.dataUrl };
+    }
+    if (entry?.dataUrl) {
+      img.src = entry.dataUrl;
+      img.setAttribute("data-loaded", "1");
+      img.alt = img.getAttribute("data-alt-loaded") || "screenshot";
+    } else {
+      img.setAttribute("data-loaded", "error");
+      img.alt = "screenshot unavailable";
+      img.classList.add("screenshot-missing");
+    }
+  } catch (err) {
+    console.warn("[EU] screenshot fetch failed", err);
+    img.setAttribute("data-loaded", "error");
+  }
+}
+
+// Shared wiring for a lazily-loaded thumbnail: click toggles full size, and a
+// click before the observer has fired forces the fetch immediately.
+function wireShotImg(img) {
+  img.addEventListener("click", () => {
+    img.classList.toggle("expanded");
+    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
+  });
+  if (screenshotObserver) screenshotObserver.observe(img);
+  else loadScreenshot(img);
+  return img;
+}
+
+function renderScreenshot(shot, caption) {
+  if (!shot?.id) return null;
+  const wrap = el("div", { class: "screenshot-wrap" });
+  wrap.appendChild(el("div", { class: "check-group-label" }, [caption || "Full-page screenshot"]));
+  wrap.appendChild(wireShotImg(el("img", {
+    class: "screenshot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": shot.id,
+    "data-alt-loaded": "full-page screenshot",
+    alt: "full-page screenshot (loading)"
+  })));
+  return wrap;
+}
+
+// Per-issue cropped, highlighted element shot for a findings-table row.
+function renderElementShot(id) {
+  if (!id) return el("span", { class: "muted" }, ["—"]);
+  return wireShotImg(el("img", {
+    class: "screenshot-thumb element-shot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": id,
+    "data-alt-loaded": "issue element screenshot",
+    alt: "issue element screenshot (loading)"
+  }));
+}
+
+// Page-level screenshot gallery. Returns the number of cards rendered so the
+// caller can leave the section hidden when a scan ran with screenshots off.
+function renderScreenshotGallery(pages) {
+  const section = document.getElementById("screenshots-section");
+  const grid = document.getElementById("screenshots-grid");
+  if (!section || !grid) return 0;
+  grid.innerHTML = "";
+  let count = 0;
+  for (const p of pages || []) {
+    if (!p.screenshot?.id) continue;
+    const imgWrap = renderScreenshot(p.screenshot);
+    if (!imgWrap) continue;
+    const card = el("div", { class: "screenshot-card" }, [
+      el("div", { class: "screenshot-caption" }, [
+        el("div", { class: "screenshot-title" }, [p.title || "Untitled"]),
+        el("a", { class: "screenshot-url", href: p.url, target: "_blank", rel: "noopener" }, [p.url])
+      ]),
+      imgWrap
+    ]);
+    grid.appendChild(card);
+    count++;
+  }
+  // Native attribute, not a class — report.css scopes `.hidden` to `table.hidden`.
+  if (count > 0) section.hidden = false;
+  return count;
+}
+
 function stringifyData(d) {
   if (d === null || d === undefined) return "";
   if (typeof d === "string") return d;
@@ -292,6 +421,12 @@ function renderNodeDetails(i) {
   // ── Media & Documents ──
   renderMediaSection(report);
 
+  // ── Screenshot gallery ──
+  // Driven off report.pages (the raw scanned page objects, which carry
+  // `screenshot`), not report.pagesRows (the flattened table rows, which don't).
+  // Stays hidden when the scan ran with screenshots off.
+  renderScreenshotGallery(report.pages);
+
   // ── Pages table (expand to show scan metadata) ──
   renderPageStatusTiles(report.pagesRows);
   const pagesBody = document.querySelector("#pages-table tbody");
@@ -355,9 +490,14 @@ function renderNodeDetails(i) {
     mainRow.appendChild(el("td", {}, [i.rule_id]));
     mainRow.appendChild(el("td", { class: `impact-${i.impact || "minor"}` }, [i.impact || ""]));
     mainRow.appendChild(el("td", {}, [i.failure_summary || i.wcag_name || i.rule_description || ""]));
+    // Cropped, highlighted shot of the offending element. Clicking it expands
+    // rather than toggling the row, so stop the row's own click handler.
+    const shotCell = el("td", { class: "element-shot-cell" }, [renderElementShot(i.elementShotId)]);
+    shotCell.addEventListener("click", ev => ev.stopPropagation());
+    mainRow.appendChild(shotCell);
 
     const detailRow = el("tr", { class: "issue-detail-row" });
-    const detailCell = el("td", { colspan: "6" });
+    const detailCell = el("td", { colspan: "7" });
     detailCell.appendChild(renderNodeDetails(i));
     detailRow.appendChild(detailCell);
 

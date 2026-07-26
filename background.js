@@ -320,13 +320,56 @@ const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 const REPORT_KEEP = 5;
 async function persistReport(reportId, report) {
   try {
-    await chrome.storage.local.set({ [`report:${reportId}`]: report });
+    const record = { [`report:${reportId}`]: report };
+    // Persist the screenshots this report references, the same way
+    // persistInventory does. Without this the report object survives
+    // service-worker eviction but its images do not: the viewer's storage
+    // fallback finds no shot:<id> key and every thumbnail renders as
+    // "screenshot unavailable". Track the ids so pruning can clean them up
+    // instead of leaking multi-MB PNGs forever.
+    const shotIds = [];
+    const seen = new Set();
+    const collectById = (id) => {
+      if (!id || seen.has(id)) return;
+      const entry = inventoryScreenshots.get(id);
+      if (entry) {
+        record[`shot:${id}`] = entry;
+        seen.add(id);
+        shotIds.push(id);
+      }
+    };
+    for (const p of (report?.pages || [])) {
+      collectById(p.screenshot?.id);
+      // Single-page scans carry violations at the top level; pages adapted from
+      // an inventory keep them nested under `audit`. Handle both.
+      for (const v of (p.violations || p.audit?.violations || [])) {
+        for (const n of (v.nodes || [])) collectById(n.elementShotId);
+      }
+    }
+    if (shotIds.length) record[`report-shots:${reportId}`] = shotIds;
+    await chrome.storage.local.set(record);
+
     const got = await chrome.storage.local.get("report-ids");
     const ids = Array.isArray(got?.["report-ids"]) ? got["report-ids"] : [];
     ids.push(reportId);
     const drop = ids.splice(0, Math.max(0, ids.length - REPORT_KEEP));
     await chrome.storage.local.set({ "report-ids": ids });
-    if (drop.length) await chrome.storage.local.remove(drop.map(id => `report:${id}`));
+    if (drop.length) {
+      // Drop each pruned report, its shot-id manifest, and the images it owned.
+      const manifestKeys = drop.map(id => `report-shots:${id}`);
+      const manifests = await chrome.storage.local.get(manifestKeys);
+      const orphanShots = [];
+      for (const key of manifestKeys) {
+        for (const id of (Array.isArray(manifests?.[key]) ? manifests[key] : [])) {
+          orphanShots.push(`shot:${id}`);
+        }
+      }
+      await chrome.storage.local.remove([
+        ...drop.map(id => `report:${id}`),
+        ...manifestKeys,
+        ...orphanShots
+      ]);
+    }
   } catch (err) {
     console.warn("[EU] persistReport failed — report will only survive while the service worker lives", err?.message || err);
   }
@@ -431,8 +474,29 @@ async function scanCurrent(tabId, options) {
   ACTIVE_CHECKS = checksFromOptions(options);
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
   const result = await scanInExistingTab(tabId);
-  const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url, profile });
+
+  // Single-page scans previously produced no imagery at all — screenshots were
+  // only wired into the inventory crawl, so "Scan this page" gave you findings
+  // with nothing to show a stakeholder. Capture the full-page shot plus one
+  // highlighted crop per violating element, exactly as the crawl does.
+  //
+  // Note this runs against the operator's OWN visible tab, not a throwaway
+  // worker tab: captureElementShotsInSession scrolls to each element and
+  // restores the original scroll position when it finishes, and
+  // clearElementHighlight removes the highlight box, so the page is left as we
+  // found it.
+  let screenshot = null;
+  if (ACTIVE_SCREENSHOTS) {
+    try {
+      screenshot = await captureFullPageScreenshot(tabId, result?.violations || null);
+    } catch (err) {
+      console.warn("[EU] scanCurrent screenshot failed:", err?.message || err);
+    }
+  }
+
+  const report = buildReport([{ url: tab.url, title: tab.title, screenshot, ...result }], { mode: "single", seedUrl: tab.url, profile });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
   await persistReport(reportId, report); // v0.4.8 — survive SW eviction
@@ -467,6 +531,13 @@ function inventoryPagesToReportPages(inventory) {
     source: p.source || "",
     ...(p.error ? { error: p.error } : {}),
     ...(p.audit || {}),
+    // Carry the full-page screenshot handle through to the classic report. The
+    // per-issue thumbnails ride along inside the spread audit (elementShotId
+    // hangs off each violation node), but the page-level shot lives on the
+    // inventory page object itself — without this line the classic report's
+    // screenshot gallery is always empty even though the images are sitting in
+    // storage under shot:<id>.
+    screenshot: p.screenshot || null,
     mediaInventory: p.mediaInventory || null
   }));
 }
@@ -1361,6 +1432,18 @@ async function captureFullPageScreenshot(tabId, violations = null) {
 const MAX_ELEMENT_SHOTS_PER_PAGE = 30;
 const ELEMENT_SHOT_PAD = 14;
 const ELEMENT_SHOT_MAX_DIM = 1600;
+// Minimum crop window for an element shot. A tight crop around a small target
+// (a checkbox, an icon-only button, a 12px "x") produces a thumbnail nobody can
+// interpret — the auditor needs the surrounding context to recognise WHERE on
+// the page the issue is. We therefore centre the crop on the element and expand
+// it to at least this size, clamped to the element's own padded box being fully
+// contained. Ported from the screenshot branch.
+const ELEMENT_SHOT_MIN_W = 400;
+const ELEMENT_SHOT_MIN_H = 300;
+// Time for the injected highlight box + inline outline to actually paint before
+// Page.captureScreenshot samples the surface. Without this the capture races the
+// compositor and a proportion of shots come back with no visible highlight.
+const ELEMENT_SHOT_PAINT_MS = 150;
 
 // Within an already-attached debugger session, capture one highlighted, cropped
 // screenshot per DISTINCT violating element. Deduped by selector and capped so
@@ -1378,32 +1461,63 @@ async function captureElementShotsInSession(target, violations) {
   }
   if (selToNodes.size === 0) return 0;
   await withTimeout(chrome.debugger.sendCommand(target, "Runtime.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.enable");
+
+  // Remember where the page was scrolled. Every highlight below calls
+  // scrollIntoView, so without this the page is left parked at the last
+  // violating element. That was invisible while element shots only ran in
+  // throwaway worker tabs, but scanCurrent runs against the operator's OWN
+  // visible tab — leaving their page yanked to the bottom is user-visible
+  // damage. Restored in the finally below.
+  let originalScroll = null;
+  try {
+    const scrollEval = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `({ x: window.scrollX, y: window.scrollY })`, returnByValue: true
+    }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(getScroll)");
+    originalScroll = scrollEval?.result?.value;
+  } catch (err) {
+    console.warn("[EU] could not read scroll position — will not restore:", err?.message || err);
+  }
+
   let captured = 0;
-  for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
-    try {
-      const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-        expression: elementHighlightExpr(sel), returnByValue: true
-      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
-      const rect = evalRes?.result?.value;
-      if (!rect || !rect.ok) { await clearElementHighlight(target); continue; }
-      const clip = {
-        x: Math.max(0, rect.x), y: Math.max(0, rect.y),
-        width: Math.max(1, Math.min(rect.width, ELEMENT_SHOT_MAX_DIM)),
-        height: Math.max(1, Math.min(rect.height, ELEMENT_SHOT_MAX_DIM)),
-        scale: 1
-      };
-      const shot = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
-        format: "png", captureBeyondViewport: true, fromSurface: true, clip
-      }), DEBUGGER_CMD_TIMEOUT_MS, "Page.captureScreenshot(element)");
-      await clearElementHighlight(target);
-      if (!shot?.data) continue;
-      const id = `shot-el-${crypto.randomUUID()}`;
-      inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${shot.data}`, bytes: shot.data.length });
-      for (const node of selToNodes.get(sel)) node.elementShotId = id;
-      captured++;
-    } catch (err) {
-      console.warn(`[EU] element shot failed (${sel}):`, err?.message || err);
-      try { await clearElementHighlight(target); } catch {}
+  try {
+    for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
+      try {
+        const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+          expression: elementHighlightExpr(sel), returnByValue: true
+        }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
+        const rect = evalRes?.result?.value;
+        if (!rect || !rect.ok) { await clearElementHighlight(target); continue; }
+        // Let the highlight paint before sampling the surface.
+        await new Promise(r => setTimeout(r, ELEMENT_SHOT_PAINT_MS));
+        const clip = {
+          x: Math.max(0, rect.x), y: Math.max(0, rect.y),
+          width: Math.max(1, Math.min(rect.width, ELEMENT_SHOT_MAX_DIM)),
+          height: Math.max(1, Math.min(rect.height, ELEMENT_SHOT_MAX_DIM)),
+          scale: 1
+        };
+        const shot = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+          format: "png", captureBeyondViewport: true, fromSurface: true, clip
+        }), DEBUGGER_CMD_TIMEOUT_MS, "Page.captureScreenshot(element)");
+        await clearElementHighlight(target);
+        if (!shot?.data) continue;
+        const id = `shot-el-${crypto.randomUUID()}`;
+        inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${shot.data}`, bytes: shot.data.length });
+        for (const node of selToNodes.get(sel)) node.elementShotId = id;
+        captured++;
+      } catch (err) {
+        console.warn(`[EU] element shot failed (${sel}):`, err?.message || err);
+        try { await clearElementHighlight(target); } catch {}
+      }
+    }
+  } finally {
+    if (originalScroll && typeof originalScroll.x === "number" && typeof originalScroll.y === "number") {
+      try {
+        await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+          expression: `window.scrollTo(${originalScroll.x}, ${originalScroll.y})`
+        }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(restoreScroll)");
+      } catch (err) {
+        console.warn("[EU] failed to restore scroll position:", err?.message || err);
+      }
     }
   }
   return captured;
@@ -1419,32 +1533,113 @@ function elementSelectorOf(node) {
   return null;
 }
 
-// Page-side expression: outline the element (outline doesn't reflow layout),
-// scroll it into view, and return its page-space rect (+ padding). Stashes the
-// previous inline styles on window so clearElementHighlight can restore them.
+// Page-side expression: mark the element, scroll it into view, and return the
+// PAGE-space crop rect for Page.captureScreenshot (which we always call with
+// captureBeyondViewport:true, so the clip is document-relative, not
+// viewport-relative — hence the window.scrollX/Y offsets).
+//
+// Two marks are applied, deliberately:
+//   • an inline outline on the element itself, and
+//   • a separately positioned absolute box overlaying it.
+// The outline alone is not reliable — any ancestor with overflow:hidden clips
+// it, so the very containers that cause layout bugs are the ones that hide the
+// marker. The overlay box sits on document.body at max z-index and can't be
+// clipped by the element's own ancestors. Both are undone by
+// clearElementHighlight (which also removes the box).
+//
+// The crop is centred on the element and grown to ELEMENT_SHOT_MIN_W/H so a
+// small target still ships with legible surrounding context, then clamped to
+// the document box so we never ask for a negative or off-page region.
 function elementHighlightExpr(sel) {
   return `(function(){
     try {
       var el = document.querySelector(${JSON.stringify(sel)});
       if (!el || !el.getBoundingClientRect) return { ok:false };
-      try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e){}
+      // 'instant' so the scroll completes before we measure — a smooth scroll
+      // would still be animating and every rect below would be stale.
+      try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e){
+        try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e2){}
+      }
       var r = el.getBoundingClientRect();
-      window.__EU_HL = { el: el, outline: el.style.outline, offset: el.style.outlineOffset, shadow: el.style.boxShadow };
+      if (!(r.width > 0 && r.height > 0)) return { ok:false };
+
+      var box = document.createElement('div');
+      box.id = '__EU_HL_BOX';
+      box.style.position = 'absolute';
+      box.style.left = (r.left + window.scrollX - 2) + 'px';
+      box.style.top = (r.top + window.scrollY - 2) + 'px';
+      box.style.width = (r.width + 4) + 'px';
+      box.style.height = (r.height + 4) + 'px';
+      box.style.border = '3px solid #e11d48';
+      box.style.boxShadow = '0 0 0 4px rgba(225,29,72,0.35)';
+      box.style.pointerEvents = 'none';
+      box.style.zIndex = '2147483647';
+      box.style.boxSizing = 'border-box';
+      document.body.appendChild(box);
+
+      window.__EU_HL = {
+        el: el,
+        outline: el.style.outline,
+        offset: el.style.outlineOffset,
+        shadow: el.style.boxShadow,
+        box: box
+      };
       el.style.outline = '3px solid #e11d48';
       el.style.outlineOffset = '2px';
       el.style.boxShadow = '0 0 0 4px rgba(225,29,72,0.35)';
+
       var pad = ${ELEMENT_SHOT_PAD};
-      return { ok: (r.width>0 && r.height>0),
-        x: r.left + window.scrollX - pad, y: r.top + window.scrollY - pad,
-        width: r.width + pad*2, height: r.height + pad*2 };
+      // Page-space centre of the element.
+      var cx = r.left + window.scrollX + r.width / 2;
+      var cy = r.top + window.scrollY + r.height / 2;
+      // Grow to the minimum context window, but never shrink below the
+      // element's own padded box.
+      var w = Math.max(${ELEMENT_SHOT_MIN_W}, r.width + pad * 2);
+      var h = Math.max(${ELEMENT_SHOT_MIN_H}, r.height + pad * 2);
+      // Never ask for more than the document actually has.
+      var docW = Math.max(document.documentElement.scrollWidth || 0, document.body ? (document.body.scrollWidth || 0) : 0, window.innerWidth);
+      var docH = Math.max(document.documentElement.scrollHeight || 0, document.body ? (document.body.scrollHeight || 0) : 0, window.innerHeight);
+      w = Math.min(w, docW);
+      h = Math.min(h, docH);
+      var x = cx - w / 2;
+      var y = cy - h / 2;
+      // Slide the window back inside the document rather than clipping it, so
+      // the element stays within frame even when it sits at a page edge.
+      if (x < 0) x = 0;
+      if (y < 0) y = 0;
+      if (x + w > docW) x = Math.max(0, docW - w);
+      if (y + h > docH) y = Math.max(0, docH - h);
+      return {
+        ok: true,
+        x: Math.round(x), y: Math.round(y),
+        width: Math.round(w), height: Math.round(h)
+      };
     } catch(e){ return { ok:false }; }
   })()`;
 }
 
+// Undo both marks applied by elementHighlightExpr. The id-based fallback matters:
+// if a page's own script replaced document.body between highlight and clear, the
+// stashed node reference is detached and only the live lookup can find the box.
+// Leaving it behind would burn a red rectangle into every subsequent shot on the
+// page, and into the operator's own tab during a scanCurrent run.
 async function clearElementHighlight(target) {
   try {
     await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function(){ try { var h=window.__EU_HL; if(h&&h.el){ h.el.style.outline=h.outline; h.el.style.outlineOffset=h.offset; h.el.style.boxShadow=h.shadow; } window.__EU_HL=null; } catch(e){} })()`
+      expression: `(function(){
+        try {
+          var h = window.__EU_HL;
+          if (h && h.el) {
+            h.el.style.outline = h.outline;
+            h.el.style.outlineOffset = h.offset;
+            h.el.style.boxShadow = h.shadow;
+          }
+          if (h && h.box && typeof h.box.remove === 'function') h.box.remove();
+          var stray = document.getElementById('__EU_HL_BOX');
+          if (stray && typeof stray.remove === 'function') stray.remove();
+          window.__EU_HL = null;
+        } catch(e){}
+      })()`
     }), 5000, "clearElementHighlight");
   } catch {}
 }
@@ -2961,6 +3156,11 @@ function buildReport(pages, meta) {
             xpath: (n.xpath || []).join(" "),
             html_snippet: n.html || "",
             failure_summary: n.failureSummary || "",
+            // Handle to this node's cropped, highlighted element screenshot (set
+            // by captureElementShotsInSession). The report viewer resolves it
+            // lazily via shot:<id> in storage; empty string when screenshots
+            // were off or capture failed for this selector.
+            elementShotId: n.elementShotId || "",
             help_url: v.helpUrl || "",
             checks_any: n.any || [],
             checks_all: n.all || [],
