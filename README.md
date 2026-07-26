@@ -18,8 +18,8 @@ for the full inventory and what was deliberately left behind.
   is storage-first, falling back to a message to the service worker.
 - **Excel** carries previews in three places: inline on each Violations row (the
   sheet auditors actually work in), on the Pages sheet, and on the dedicated
-  Issue Screenshots sheet, which adds Impact / Success Criteria context and caps
-  at 300 images. The **classic-report** workbook now carries them too — it
+  Issue Screenshots sheet, which adds Impact / Success Criteria context. The
+  **classic-report** workbook now carries them too — it
   previously embedded no images at all, so exporting via "Open Classic Report"
   silently dropped every screenshot the crawl had captured.
 - **Lazy-loaded content is now captured.** Before each capture the page is
