@@ -50,7 +50,9 @@ link to it + anchor text) for the broken-link check in step 7.
 
 - Up to **10 tabs globally**, max **8 per origin** (rate limiter also backs
   off on 429/503 and honours Retry-After).
-- Worker tabs open in a **dedicated minimized window** — not your tab strip.
+- Worker tabs open in a **dedicated off-screen window** (not minimized — Chrome
+  halts page composition for minimized windows, which makes screenshots blank
+  or time out) — not your tab strip.
 - Per tab: load (60 s timeout) → **adaptive settle**: minimum 1 s, proceeds
   after 2 s of DOM quiet, hard cap 10 s → late-redirect poll → dedup check.
 - A worker that exceeds 150 s total is force-abandoned so the pool moves on.
@@ -83,13 +85,15 @@ In order:
 7. Template fingerprint (URL cluster + DOM simhash) for clustering.
 8. Screenshot — only if the screenshots checkbox is ON. Three steps:
    a. The page is walked top to bottom in viewport-sized steps (80% overlap,
-      120ms per step, capped at 60 steps / 6s), then returned to where it
+      120ms per step, bounded by a 6s budget), then returned to where it
       started. This is what triggers lazy-loaded content — scrolling fires both
       IntersectionObserver loaders and older scroll-listener ones. Skipped when
       the page already fits in the viewport.
    b. Wait until every `<img>` reports `complete`, capped at 4 s — otherwise the
       capture freezes lazy images mid-fetch as blank placeholders.
-   c. One full-page PNG, then one cropped + highlighted PNG per distinct
+   c. One full-page PNG (height-clamped to 20 000px — beyond that the
+      compositor surface can kill the renderer and lose the page's whole
+      audit), then one cropped + highlighted PNG per distinct
       violating element (every distinct one, bounded by a 45s per-page budget
       rather than a count — anything skipped is logged; 400×300 minimum crop so
       small targets keep context). Each element crop scrolls to its target and the original

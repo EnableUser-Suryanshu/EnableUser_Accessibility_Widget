@@ -161,6 +161,30 @@
     const empty = window.EU_IssueOverlay.render([]);
     t("empty violations renders without throwing", empty && empty.total === 0, JSON.stringify(empty));
 
+    // ── Regression: a positioned / transformed <body> must not offset markers ──
+    // An absolutely-positioned root resolved against body's own origin, so
+    // position:relative, a transform, or a margin on body shifted every marker
+    // away from the element it was supposed to be pointing at.
+    window.EU_IssueOverlay.clear();
+    document.body.style.position = "relative";
+    document.body.style.transform = "translateY(40px)";
+    document.body.style.marginTop = "25px";
+    window.EU_IssueOverlay.render(violations);
+    {
+      const el = document.getElementById("lc");
+      const box = [...document.querySelectorAll("#__eu_issue_overlay__ > div")]
+        .find(d => d.style.width === (el.getBoundingClientRect().width + 4) + "px");
+      const er = el.getBoundingClientRect();
+      const br = box ? box.getBoundingClientRect() : null;
+      const dx = br ? Math.abs(br.left - (er.left - 2)) : 999;
+      const dy = br ? Math.abs(br.top - (er.top - 2)) : 999;
+      t("marker aligns to its element with a positioned+transformed body",
+        br && dx <= 1 && dy <= 1, br ? `off by ${dx.toFixed(1)},${dy.toFixed(1)}px` : "marker not found");
+    }
+    document.body.style.position = "";
+    document.body.style.transform = "";
+    document.body.style.marginTop = "";
+
     const failed = out.filter(l => l.startsWith("FAIL")).length;
     const pre = document.createElement("pre");
     pre.id = "harness-out";

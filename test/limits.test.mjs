@@ -111,12 +111,45 @@ check("a rejected claim returns an explanatory error, not a silent no-op",
 // inventory's gallery and Excel previews.
 check("persistInventory writes an inv-shots ownership manifest",
   /inv-shots:/.test(bg));
-check("pruning checks surviving report-shots AND inv-shots manifests",
-  /report-shots:/.test(bg) && /startsWith\("inv-shots:"\)/.test(bg));
+check("pruning consults both report and inventory shot manifests",
+  /report-shots:/.test(bg) && /inv-shots:/.test(bg));
 
-// ── The lazy-content walk's step cap must stay derived, not hard-coded ──
-check("WARM_MAX_STEPS is derived from the time budget",
-  /const WARM_MAX_STEPS = Math\.ceil\(WARM_MAX_TOTAL_MS/.test(bg));
+// ── Code-review regressions (main...HEAD review, 8 findings) ──
+const cs = code(read("content-script.js"));
+const popup = code(read("popup/popup.js"));
+
+// F1: minimizing the crawler window halts Chrome's page composition, so
+// Page.captureScreenshot on a worker tab in it returns blank or times out.
+check("crawler window is off-screen normal, never minimized",
+  !/state: *"minimized"/.test(bg) && /state: *"normal"/.test(bg) && /left: *-9999/.test(bg));
+
+// F8: two attempts at a step cap were both unreachable under the time budget.
+check("no unreachable step cap remains in the lazy walk",
+  !/WARM_MAX_STEPS/.test(bg) && !/hitStepCap/.test(bg));
+
+// F3: get(null) loads every inventory and every base64 PNG in storage.
+check("pruning never calls storage.local.get(null)",
+  !/storage\.local\.get\(null\)/.test(bg));
+check("shot ownership is resolved via id indexes, not by enumerating storage",
+  /listOwnerManifestKeys/.test(bg) && /"inventory-ids"/.test(bg));
+
+// F4: captureBeyondViewport allocates a surface for the whole document.
+check("full-page capture is height-bounded",
+  /MAX_CAPTURE_HEIGHT/.test(bg) && /clip: \{ x: 0, y: 0/.test(bg));
+
+// F5: an empty panel the popup said did not exist, with Remove hidden.
+check("a zero-violation highlight clears instead of rendering an empty panel",
+  /if \(!violations\.length\)/.test(bg));
+
+// F2: persisting only the marker let the migration silently undo itself.
+check("defaultsVer migration persists the migrated values, not just the marker",
+  /defaultsVer: 50,[\s\S]{0,120}checks: c/.test(popup));
+
+// F7: push(...nodeList) throws RangeError past ~65k nodes.
+check("no NodeList is spread into push()",
+  !/push\(\.\.\.[^)]*querySelectorAll/.test(cs));
+check("overlay root collection uses per-root error handling",
+  /overlay scan skipped a root/.test(cs));
 
 // ── Deliberate safety limits must NOT have been removed ──
 // These bound resources rather than findings; dropping them would be a bug.

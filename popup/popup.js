@@ -50,12 +50,25 @@ chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismis
   // audit-both are all opt-in (default OFF). Preferences saved under the old
   // defaults would otherwise pin the old recipe forever; after this runs
   // once, whatever the operator ticks is saved and wins as usual.
+  //
+  // The migrated VALUES must be persisted alongside the version marker, not just
+  // the marker. Writing only `defaultsVer: 50` mutated `c` and `s` in memory —
+  // enough to render the checkboxes correctly — while storage kept the old
+  // `checks` / `dismissOverlays` / `auditBoth`. Closing the popup without
+  // scanning then left defaultsVer already at 50, so this block was skipped on
+  // reopen and the stale values loaded straight back. The migration appeared to
+  // work once and then silently undid itself, permanently.
   if (s?.defaultsVer !== 50) {
     c.media = false;
     c.pdfOffice = false;
     c.visual = false;
     if (s) { s.dismissOverlays = false; s.auditBoth = false; }
-    chrome.storage?.local.set({ defaultsVer: 50 }).catch(() => {});
+    chrome.storage?.local.set({
+      defaultsVer: 50,
+      checks: c,
+      dismissOverlays: false,
+      auditBoth: false
+    }).catch(() => {});
   }
   if (chkAxe) chkAxe.checked = c.axe !== false;
   if (chkIndia) chkIndia.checked = c.india === true;
@@ -251,6 +264,10 @@ btnHighlight.addEventListener("click", async () => {
   if (!res?.ok) { setStatus(res?.error || "Could not annotate this page.", true); return; }
 
   if (!res.issues) {
+    // The overlay was still rendered — an empty panel saying "0 confirmed
+    // issues" — so hiding Remove here left the operator with a panel on their
+    // page and no button to dismiss it. Background clears it instead of
+    // rendering an empty one, so there is genuinely nothing to remove.
     setStatus("No confirmed violations on this page. (Needs-review findings are not drawn — run a full scan to see those.)");
     btnClearHighlight.hidden = true;
     return;

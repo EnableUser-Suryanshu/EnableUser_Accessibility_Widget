@@ -382,6 +382,23 @@ const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 // memory on demand. The last 5 reports are kept; older ones are pruned so
 // storage doesn't grow without bound.
 const REPORT_KEEP = 5;
+// Resolve `<prefix>:<id>` manifest keys from an id index, so shot-ownership can
+// be checked without enumerating storage. `chrome.storage.local.get(null)` would
+// return every value including the inventories and their base64 PNGs, which is
+// exactly what these small manifests exist to avoid touching.
+async function listOwnerManifestKeys(indexKey, prefix) {
+  try {
+    const got = await chrome.storage.local.get(indexKey);
+    const ids = Array.isArray(got?.[indexKey]) ? got[indexKey] : [];
+    return ids.map(id => `${prefix}:${id}`);
+  } catch (err) {
+    // Returning [] here would make every candidate look unreferenced and delete
+    // shots another owner still needs, so fail loud and keep them instead.
+    console.warn(`[EU] could not read ${indexKey} — keeping all screenshots rather than risk deleting shared ones:`, err?.message || err);
+    return null;
+  }
+}
+
 async function persistReport(reportId, report) {
   try {
     const record = { [`report:${reportId}`]: report };
@@ -442,11 +459,26 @@ async function persistReport(reportId, report) {
       }
 
       if (candidates.size) {
-        const all = await chrome.storage.local.get(null);
-        const survivingKeys = Object.keys(all).filter(k =>
-          (k.startsWith("report-shots:") || k.startsWith("inv-shots:")) && !manifestKeys.includes(k));
-        for (const k of survivingKeys) {
-          for (const id of (Array.isArray(all[k]) ? all[k] : [])) candidates.delete(id);
+        // Read ONLY the manifest keys. An earlier version used
+        // chrome.storage.local.get(null), which loads every value in storage —
+        // every multi-MB inventory and every base64 PNG — precisely the cost the
+        // manifests exist to avoid. Keys come from the two id indexes rather than
+        // from enumerating storage.
+        const reportKeys = await listOwnerManifestKeys("report-ids", "report-shots");
+        const invKeys = await listOwnerManifestKeys("inventory-ids", "inv-shots");
+        if (reportKeys === null || invKeys === null) {
+          // An index was unreadable, so ownership is unknowable. Keep every
+          // candidate: a leaked screenshot costs disk, a wrongly deleted one
+          // silently blanks a stored report's evidence.
+          candidates.clear();
+        } else {
+          const survivingKeys = [...reportKeys, ...invKeys].filter(k => !manifestKeys.includes(k));
+          if (survivingKeys.length) {
+            const surviving = await chrome.storage.local.get(survivingKeys);
+            for (const k of survivingKeys) {
+              for (const id of (Array.isArray(surviving?.[k]) ? surviving[k] : [])) candidates.delete(id);
+            }
+          }
         }
       }
 
@@ -573,6 +605,21 @@ async function highlightIssuesOnTab(tabId, options) {
       files: ["lib/issue-overlay.js"],
       world: "ISOLATED"
     });
+
+    // Nothing confirmed: clear any previous overlay rather than draw an empty
+    // panel. Rendering one left a "0 confirmed issues" panel sitting on the page
+    // while the popup reported no violations and hid its Remove button — so the
+    // operator had a panel they were told did not exist and no way to dismiss it.
+    // Clearing also matters on a re-run: a page whose issues were just fixed
+    // should lose its markers, not keep the stale ones.
+    if (!violations.length) {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: false },
+        world: "ISOLATED",
+        func: () => { if (window.EU_IssueOverlay) window.EU_IssueOverlay.clear(); }
+      });
+      return { ok: true, rules: 0, issues: 0, marked: 0, unresolved: 0 };
+    }
     const [{ result: stats }] = await chrome.scripting.executeScript({
       target: { tabId, allFrames: false },
       world: "ISOLATED",
@@ -1161,6 +1208,19 @@ async function persistInventory(inventoryId, inventory) {
   // reference the same shot ids.
   if (seen.size) record[`inv-shots:${inventoryId}`] = [...seen];
   await chrome.storage.local.set(record);
+  // Index of inventory ids, so persistReport's pruning can find the inv-shots
+  // manifests by key instead of enumerating all of storage. Ids only — a list of
+  // short strings, not payloads.
+  try {
+    const got = await chrome.storage.local.get("inventory-ids");
+    const ids = Array.isArray(got?.["inventory-ids"]) ? got["inventory-ids"] : [];
+    if (!ids.includes(inventoryId)) {
+      ids.push(inventoryId);
+      await chrome.storage.local.set({ "inventory-ids": ids });
+    }
+  } catch (err) {
+    console.warn("[EU] could not update inventory-ids index — report pruning will keep screenshots conservatively:", err?.message || err);
+  }
   console.log(`[EU] persisted inventory ${inventoryId} + ${seen.size} screenshot(s) to storage.local`);
 }
 
@@ -1568,9 +1628,25 @@ const PAGE_METRICS_EXPR = `(function() {
       document.body ? document.body.offsetHeight : 0,
       document.documentElement ? document.documentElement.offsetHeight : 0
     );
-    return { height: Math.ceil(h) | 0, viewportHeight: Math.ceil(window.innerHeight) | 0 };
-  } catch(e) { return { height: 0, viewportHeight: 0 }; }
+    var w = Math.max(
+      document.documentElement ? document.documentElement.scrollWidth : 0,
+      document.body ? (document.body.scrollWidth || 0) : 0,
+      window.innerWidth || 0
+    );
+    return {
+      height: Math.ceil(h) | 0,
+      viewportHeight: Math.ceil(window.innerHeight) | 0,
+      // Only used to size the clip when the height ceiling trips.
+      width: Math.ceil(w) | 0
+    };
+  } catch(e) { return { height: 0, viewportHeight: 0, width: 0 }; }
 })()`;
+
+// Ceiling on the captured region's height. Beyond this, capture the top of the
+// page rather than ask the compositor for a surface big enough to take the
+// renderer down — losing the renderer loses the page's entire audit, not just its
+// screenshot. Matches the bound the screenshot branch used.
+const MAX_CAPTURE_HEIGHT = 20_000;
 
 // Walk the page top to bottom in viewport-sized steps to trigger lazy-loaded
 // content, then return to where we started.
@@ -1589,13 +1665,18 @@ const PAGE_METRICS_EXPR = `(function() {
 const WARM_STEP_RATIO = 0.8;          // overlap slightly so nothing falls between steps
 const WARM_STEP_PAUSE_MS = 120;       // long enough for observers to fire and fetches to start
 const WARM_MAX_TOTAL_MS = 6_000;      // hard ceiling per page regardless of height
-// Derived, not chosen: the time budget is what actually binds, so a separate
-// step count was dead weight. An earlier version hard-coded 60, which
-// 6000ms / 120ms = 50 could never reach — so the "stopped at the step cap"
-// branch was unreachable and the warning that distinguished the two caps was
-// misleading. Deriving it keeps the loop bounded even if the pause is ever
-// lowered, without inventing a second number that has to agree with the first.
-const WARM_MAX_STEPS = Math.ceil(WARM_MAX_TOTAL_MS / WARM_STEP_PAUSE_MS) + 1;
+// There is deliberately no step-count cap.
+//
+// Two attempts got this wrong. First a hard-coded 60, which 6000ms / 120ms = 50
+// steps could never reach. Then `ceil(6000/120) + 1` = 51, which is *also*
+// unreachable for the same reason — deriving the number did not make it
+// reachable, it just made the arithmetic look deliberate. Either way the
+// "stopped at the step cap" branch was dead and the warning that distinguished
+// it from the time cap was reporting a state that could not occur.
+//
+// The time budget is the real bound and it is sufficient: every iteration costs
+// at least WARM_STEP_PAUSE_MS, so the loop cannot spin. A second guard that can
+// never fire is worse than none — it reads as protection that isn't there.
 
 // Poll until every <img> has settled, so the capture doesn't freeze fetches that
 // the walk above only just started. Bounded: a page with a permanently pending
@@ -1625,7 +1706,7 @@ function warmLazyContentExpr() {
       var step = Math.max(200, Math.floor(window.innerHeight * ${WARM_STEP_RATIO}));
       var deadline = Date.now() + ${WARM_MAX_TOTAL_MS};
       var steps = 0, y = 0;
-      while (steps < ${WARM_MAX_STEPS} && Date.now() < deadline) {
+      while (Date.now() < deadline) {
         var docH = Math.max(
           document.documentElement.scrollHeight || 0,
           document.body ? (document.body.scrollHeight || 0) : 0
@@ -1644,8 +1725,11 @@ function warmLazyContentExpr() {
           document.documentElement.scrollHeight || 0,
           document.body ? (document.body.scrollHeight || 0) : 0
         ),
-        hitStepCap: steps >= ${WARM_MAX_STEPS},
-        hitTimeCap: Date.now() >= deadline
+        // True when the walk ran out of time before reaching the foot of the
+        // page, i.e. content near the bottom may capture unloaded. Distinct from
+        // finishing early because the page was fully walked.
+        hitTimeCap: Date.now() >= deadline,
+        reachedBottom: y > (document.documentElement.scrollHeight || 0)
       };
     } catch (e) { return { ok:false, error: String(e && e.message || e) }; }
   })()`;
@@ -1686,8 +1770,8 @@ async function captureFullPageScreenshot(tabId, violations = null) {
         if (r?.ok) {
           warmed = true;
           // Report truncation rather than let a partial walk look complete.
-          if (r.hitStepCap || r.hitTimeCap) {
-            console.warn(`[EU] lazy-content walk stopped early after ${r.steps} step(s) (${r.hitStepCap ? "step cap" : "time cap"}) — content near the foot of the page may capture unloaded`);
+          if (r.hitTimeCap && !r.reachedBottom) {
+            console.warn(`[EU] lazy-content walk ran out of time after ${r.steps} step(s) of ${WARM_MAX_TOTAL_MS / 1000}s on a ${r.docHeight}px page — content near the foot may capture unloaded`);
           }
         } else if (r?.error) {
           console.warn("[EU] lazy-content walk failed:", r.error);
@@ -1712,11 +1796,27 @@ async function captureFullPageScreenshot(tabId, violations = null) {
       }
     }
 
+    // Bound the captured region by height.
+    //
+    // captureBeyondViewport allocates a surface for the whole document, so an
+    // infinite-scroll or runaway-height page can ask the compositor for hundreds
+    // of MB and either tile badly or kill the renderer — which loses the page's
+    // whole audit, not just its screenshot. The warm-up walk above makes this
+    // more likely, not less: it deliberately grows lazy pages before we capture.
+    //
+    // A clip is only passed when the document actually exceeds the ceiling, so
+    // normal pages keep the unclipped path and its exact full-page bounds.
+    // metrics is null when the measurement failed, in which case capture as-is.
+    const overHeight = metrics && metrics.height > MAX_CAPTURE_HEIGHT;
+    if (overHeight) {
+      console.warn(`[EU] page is ${metrics.height}px tall — capturing the top ${MAX_CAPTURE_HEIGHT}px only`);
+    }
     const result = await withTimeout(
       chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
         format: "png",
         captureBeyondViewport: true,
-        fromSurface: true
+        fromSurface: true,
+        ...(overHeight ? { clip: { x: 0, y: 0, width: metrics.width || 1280, height: MAX_CAPTURE_HEIGHT, scale: 1 } } : {})
       }),
       DEBUGGER_CMD_TIMEOUT_MS,
       "Page.captureScreenshot"
@@ -3878,7 +3978,26 @@ chrome.windows.onRemoved.addListener((winId) => {
 
 async function openCrawlerWindow() {
   try {
-    const win = await chrome.windows.create({ url: "about:blank", focused: false, state: "minimized" });
+    // Off-screen, NOT minimized. Chrome halts page composition for a minimized
+    // window, so Page.captureScreenshot on a worker tab in one returns blank or
+    // times out — and since v0.5.0 captures full-page shots plus a crop per
+    // violating element on exactly these tabs, minimizing silently broke the
+    // entire crawl screenshot path while single-page scans (which use the
+    // operator's own visible tab) kept working.
+    //
+    // This branch had reverted to `state: "minimized"` during the v0.4.x work;
+    // the screenshot branch had already found and fixed it. Restored here.
+    // A large negative offset keeps it out of the operator's way without
+    // sacrificing composition.
+    const win = await chrome.windows.create({
+      url: "about:blank",
+      focused: false,
+      state: "normal",
+      left: -9999,
+      top: -9999,
+      width: 1280,
+      height: 960
+    });
     _crawlerWindowId = win.id;
     console.log(`[EU] crawler window opened (id=${win.id})`);
   } catch (err) {

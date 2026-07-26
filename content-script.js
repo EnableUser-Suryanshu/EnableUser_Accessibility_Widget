@@ -312,9 +312,19 @@ function euAllRoots() {
 function euClickDismissers() {
   let clicked = 0;
   const roots = euAllRoots();
+  // Iterate rather than spread — see euHideBlockingOverlays. Spreading a NodeList
+  // into push() makes every node an argument, which throws RangeError past ~65k.
+  // Lower risk here than there (these selectors are specific, not "*"), but the
+  // broad-selector pass below queries "button, [role=button], a, …" which a large
+  // page can absolutely exceed.
   const qAll = (sel) => {
     const out = [];
-    for (const root of roots) { try { out.push(...root.querySelectorAll(sel)); } catch {} }
+    for (const root of roots) {
+      try {
+        const found = root.querySelectorAll(sel);
+        for (let i = 0; i < found.length; i++) out.push(found[i]);
+      } catch {}
+    }
     return out;
   };
   for (const sel of EU_CMP_SELECTORS) {
@@ -340,13 +350,35 @@ function euClickDismissers() {
 function euHideBlockingOverlays() {
   let hidden = 0;
   const vw = window.innerWidth, vh = window.innerHeight;
-  let nodes = [];
-  try {
-    for (const root of euAllRoots()) nodes.push(...root.querySelectorAll(root === document ? "body *" : "*"));
-  } catch {}
+  const nodes = [];
+  // Collect per root, iterating rather than spreading.
+  //
+  // `nodes.push(...nodeList)` passes every node as a separate argument, so a
+  // document with more than ~65k elements threw RangeError (Maximum call stack
+  // size exceeded). One shared try/catch around the whole loop meant that
+  // exception abandoned the entire collection — `nodes` came back empty and
+  // overlay dismissal silently did nothing, on exactly the large pages most
+  // likely to carry a consent wall. axe then audited the page with the overlay
+  // still covering it.
+  //
+  // Per-root try/catch so one unreadable shadow root cannot cost the others.
+  for (const root of euAllRoots()) {
+    try {
+      const found = root.querySelectorAll(root === document ? "body *" : "*");
+      for (let i = 0; i < found.length; i++) nodes.push(found[i]);
+    } catch (err) {
+      console.warn("[EU] overlay scan skipped a root:", err?.message || err);
+    }
+  }
   let scanned = 0;
   for (const el of nodes) {
-    if (scanned++ > 8000) break;
+    // getComputedStyle per element is the expensive part, so this bounds work
+    // rather than findings. It does affect results though — giving up early can
+    // leave a consent overlay in place for the audit — so say so.
+    if (scanned++ > 8000) {
+      console.warn(`[EU] overlay scan stopped after 8000 of ${nodes.length} elements — an overlay below that point would not have been dismissed`);
+      break;
+    }
     let cs; try { cs = getComputedStyle(el); } catch { continue; }
     if (cs.position !== "fixed" && cs.position !== "sticky") continue;
     if ((parseInt(cs.zIndex, 10) || 0) < 1000) continue;
