@@ -40,7 +40,7 @@
         </div>
         <div class="text">
           <div class="title">Multi Page Scan</div>
-          <div class="sub">Crawls same-site links + sitemap.xml / robots.txt</div>
+          <div class="sub">Crawls same-site links + sitemap.xml / robots.txt. Opens the tabbed audit report (findings, screenshots, templates); the classic table report is one click away from there.</div>
         </div>
         <button id="btn-scan-multi" class="scan">Scan</button>
       </section>
@@ -117,9 +117,9 @@
         <label class="chk"><input type="checkbox" id="opt-check-is17802" /> IS 17802 governance (statement, feedback, relay)</label>
         <label class="chk"><input type="checkbox" id="opt-check-media" /> Media checks (video / audio / document links)</label>
         <label class="chk"><input type="checkbox" id="opt-check-pdfoffice" /> PDF / Office document audit</label>
-        <label class="chk"><input type="checkbox" id="opt-check-visual" checked /> Visual-state checks (colour-only links, focus suppression, hover cues)</label>
-        <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss cookie / consent / modal overlays before scanning</label>
-        <label class="chk"><input type="checkbox" id="opt-audit-both" checked /> Audit BOTH the overlay and the page (two passes — slower)</label>
+        <label class="chk"><input type="checkbox" id="opt-check-visual" /> Visual-state checks (colour-only links, focus suppression, hover cues)</label>
+        <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" /> Dismiss cookie / consent / modal overlays before scanning</label>
+        <label class="chk"><input type="checkbox" id="opt-audit-both" /> Audit BOTH the overlay and the page (extra pass only when an overlay is found)</label>
         <label class="chk"><input type="checkbox" id="opt-screenshots" /> Capture screenshots (full-page + per-violation — much slower, bigger reports)</label>
         <label class="chk"><input type="checkbox" id="opt-links-only" checked /> Real pages only — follow visible links, skip sitemap / feeds / CMS probes</label>
         <label class="chk"><input type="checkbox" id="opt-linkcheck" checked /> Detect broken internal links (hard 404s, soft 404s, dead redirects)</label>

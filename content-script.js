@@ -163,7 +163,7 @@
     // Provable failures merge as violations; judgment-dependent findings
     // carry the "review" tag and land in incomplete.
     try {
-      if (checks.visual !== false && window.EU_VisualChecks?.run) customRules.push(...(await window.EU_VisualChecks.run()));
+      if (checks.visual === true && window.EU_VisualChecks?.run) customRules.push(...(await window.EU_VisualChecks.run()));
     } catch (e) { console.warn("[EU] visual-checks failed", e); }
     // Split custom rules by impact + review tag — "review"-tagged rules go
     // to incomplete (auditor needs to confirm), others to violations. The
@@ -242,16 +242,23 @@
 //   3. Last resort: hide full-viewport fixed/sticky high-z-index overlays and
 //      release the scroll lock modals leave on <html>/<body>.
 // Runs a few passes because sites stack gates (cookie → newsletter → notice).
+// v0.4.8 — all click/hide passes now pierce open shadow roots (Usercentrics-
+// style CMPs render entirely inside one), and the accept/close text matcher
+// understands Hindi labels for Indian-language sites.
 // ─────────────────────────────────────────────────────────────────────────────
 const OVERLAY_HINT_RE = /(modal|popup|pop-up|overlay|consent|cookie|gdpr|ccpa|cmp|interstitial|backdrop|lightbox|dialog|notice|banner|announce|disclaimer|subscribe|newsletter|age-?gate|paywall|drawer)/i;
-const ACCEPT_TEXT_RE = /^(accept(\s+all)?(\s+cookies)?|i\s+accept|agree|i\s+agree|allow(\s+all)?|ok(ay)?|got\s+it!?|understood|i\s+understand|continue|proceed|close|dismiss|no,?\s*thanks|skip|maybe\s+later|not\s+now|✕|×|✖|x)$/i;
+const ACCEPT_TEXT_RE = /^(accept(\s+all)?(\s+cookies)?|i\s+accept|agree|i\s+agree|allow(\s+all)?|ok(ay)?|got\s+it!?|understood|i\s+understand|continue|proceed|close|dismiss|no,?\s*thanks|skip|maybe\s+later|not\s+now|✕|×|✖|x|(सभी\s+)?स्वीकार(\s+करें)?|स्वीकारें|सहमति\s+दें|(मैं\s+)?सहमत(\s+हूँ|\s+हूं)?|ठीक\s+है|समझ\s+(गया|गई)|बंद\s+करें|जारी\s+रखें|आगे\s+बढ़ें|अभी\s+नहीं|बाद\s+में)$/i;
 const EU_CMP_SELECTORS = [
   "#onetrust-accept-btn-handler", ".onetrust-close-btn-handler", "#accept-recommended-btn-handler",
   "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
   "#didomi-notice-agree-button", ".qc-cmp2-summary-buttons button[mode='primary']",
   ".osano-cm-accept-all", ".cky-btn-accept", "#hs-eu-confirmation-button",
   ".cc-allow", ".cc-dismiss", ".cookie-accept", ".accept-cookies", "#accept-cookies",
-  "button[data-cookiebanner='accept_button']"
+  "button[data-cookiebanner='accept_button']",
+  // Usercentrics (lives in an open shadow root under #usercentrics-root).
+  "button[data-testid='uc-accept-all-button']",
+  // Google Funding Choices (very common on ad-funded news sites).
+  ".fc-cta-consent", "button.fc-cta-consent"
 ];
 
 function euOverlayVisible(el) {
@@ -272,21 +279,50 @@ function euInOverlay(el) {
       let cs; try { cs = getComputedStyle(cur); } catch { cs = null; }
       if (cs && (cs.position === "fixed" || cs.position === "sticky") && (parseInt(cs.zIndex, 10) || 0) >= 1000) return true;
     }
-    cur = cur.parentElement;
+    // Cross open-shadow boundaries: at a shadow root's top, hop to the host so
+    // overlay hints on the host element (e.g. #usercentrics-root) still count.
+    let next = cur.parentElement;
+    if (!next) { try { const rn = cur.getRootNode(); next = rn && rn.host ? rn.host : null; } catch { next = null; } }
+    cur = next;
     depth++;
   }
   return false;
 }
 function euClick(el) { try { el.click(); return true; } catch { return false; } }
 
+// One bounded walk collecting document + every reachable open shadow root, so
+// each dismissal pass queries every root once instead of re-walking the tree
+// per selector. Closed shadow roots stay opaque (spec). Own literal cap — do
+// NOT use TMPL_WALK_CAP here; its `const` may still be in TDZ when the first
+// dismissal pass runs during initial script evaluation.
+function euAllRoots() {
+  const roots = [document];
+  let visited = 0;
+  (function walk(node) {
+    if (!node || visited > 30000) return;
+    let all = []; try { all = node.querySelectorAll("*"); } catch { return; }
+    for (const el of all) {
+      if (++visited > 30000) return;
+      if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); }
+    }
+  })(document);
+  return roots;
+}
+
 function euClickDismissers() {
   let clicked = 0;
+  const roots = euAllRoots();
+  const qAll = (sel) => {
+    const out = [];
+    for (const root of roots) { try { out.push(...root.querySelectorAll(sel)); } catch {} }
+    return out;
+  };
   for (const sel of EU_CMP_SELECTORS) {
-    let el = null; try { el = document.querySelector(sel); } catch {}
-    if (el && euOverlayVisible(el) && euClick(el)) clicked++;
+    for (const el of qAll(sel)) {
+      if (euOverlayVisible(el) && euClick(el)) { clicked++; break; }
+    }
   }
-  let nodes = [];
-  try { nodes = document.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit'], [data-dismiss], .close, [aria-label]"); } catch {}
+  const nodes = qAll("button, [role='button'], a, input[type='button'], input[type='submit'], [data-dismiss], .close, [aria-label]");
   let scanned = 0;
   for (const el of nodes) {
     if (scanned++ > 4000) break;
@@ -305,7 +341,9 @@ function euHideBlockingOverlays() {
   let hidden = 0;
   const vw = window.innerWidth, vh = window.innerHeight;
   let nodes = [];
-  try { nodes = document.querySelectorAll("body *"); } catch {}
+  try {
+    for (const root of euAllRoots()) nodes.push(...root.querySelectorAll(root === document ? "body *" : "*"));
+  } catch {}
   let scanned = 0;
   for (const el of nodes) {
     if (scanned++ > 8000) break;

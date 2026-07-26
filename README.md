@@ -2,13 +2,14 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
-## v0.4.9 — screenshots implemented that persist in excel
-
-Implemented Screenshots. Screenshots captured during audits are now embedded directly in the downloaded Excel sheets (inside a new "Preview" column on the "Violations" and "Pages" sheets), ensuring that they are saved and persist inside the spreadsheet itself.
-
 ## v0.4.8 — reports persist (no more "Report expired")
 
 Multi-page and single-page reports were held only in the service worker's memory; Chrome evicts an idle MV3 worker after ~30 s, after which the report tab showed "expired" and downloads failed. Reports now persist to chrome.storage.local (last 5 kept, older pruned) and are re-warmed on demand — the report tab, Excel, and CSV work indefinitely, across browser restarts. Viewer, Excel, and CSV all read the same persisted object, so what you see in the run result is exactly what lands in the Excel.
+
+Also in v0.4.8:
+
+- **Default recipe slimmed to axe-core only**: media checks, PDF/Office audit, visual-state checks, overlay dismissal, and audit-both are now all **opt-in (default OFF)**. First-run defaults: axe ✓, real pages only ✓, broken-link detector ✓ — everything else unticked. Saved preferences migrate once to the new recipe, then whatever you tick wins as usual.
+- **Overlay dismissal upgraded** (when enabled): the dismisser now pierces open shadow roots, so shadow-DOM CMPs (Usercentrics-style) can be clicked instead of just hidden; Google Funding Choices selectors added; and accept/close button matching understands Hindi labels (स्वीकार करें, सहमत, ठीक है, बंद करें, …) for Indian-language sites.
 
 ## v0.4.6 — visual-state checks (automating part of the manual checklist)
 

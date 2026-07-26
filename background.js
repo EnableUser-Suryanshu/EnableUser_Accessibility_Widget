@@ -30,15 +30,26 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // We floor at 1 to prevent a zero-URL crawl, and let the operator set any
 // upper number they're willing to wait for. Concurrency + rate-limiter keep
 // the target site safe regardless of total URL count.
-// CONCURRENT_TABS governs how many tabs run axe in parallel. Each tab
-// spins up its own Chromium renderer + axe context so memory cost is
-// real (~100–200 MB per tab on content-heavy pages). At 200 tabs that's
-// roughly 20–40 GB of RAM at peak — the operator set this explicitly
-// ("open 200 tabs at once") so a large site finishes in a small number
-// of concurrent waves. The RateLimiter still governs per-site pacing
-// (backoff on 429/503, same-host politeness) and the injectAxe retry
-// wrapper (see lower in file) handles the preload-race the 200-way
-// concurrency will trigger more often.
+// CONCURRENT_TABS is the GLOBAL cap on how many worker tabs run in
+// parallel across the whole crawl, regardless of origin. Each tab spins
+// up its own Chromium renderer + axe context, so memory cost is real
+// (~100–200 MB per content-heavy page).
+//
+// v0.4.9 — lowered 200 → 10. The old 200 was only ever reachable on
+// MULTI-origin runs: on a single-origin crawl PER_ORIGIN_TABS (8) is the
+// real limiter, so single-site behaviour is unchanged by this. But the
+// paste-a-list ("template check") mode routinely receives URLs spread
+// across many different domains, where the per-origin cap does nothing
+// (each host only has a few URLs) and this global cap is the ONLY thing
+// holding concurrency down. A 200-URL paste therefore opened ~200 tabs at
+// once (20–40 GB peak), Chrome's renderer/network pool collapsed, and
+// pages that were perfectly reachable came back as load failures /
+// "URL not reachable". A modest global cap makes every mode behave the
+// way the operator expects: open a handful of tabs, let each fully
+// load → settle → audit → save its result, then pull the next URL off the
+// queue. The RateLimiter still governs per-site pacing (backoff on
+// 429/503, same-host politeness) and the injectAxe retry wrapper (see
+// lower in file) still handles transient preload races.
 //
 // v0.4.2 — adaptive settle window. The wait between "tab reported
 // navigation complete" and (a) the settled-URL dedup check, (b) axe
@@ -53,7 +64,7 @@ const DEFAULT_CRAWL_DEPTH = 1;
 // direction: the 2s DOM-quiet requirement is the real floor (a page can't
 // finish before ~2s of stability anyway), so static pages now settle in
 // ~2s while dynamic pages still get up to the 10s cap.
-const CONCURRENT_TABS = 200;
+const CONCURRENT_TABS = 10;
 const TAB_TIMEOUT_MS = 60_000;
 const SETTLE_MIN_MS = 1_000;
 const SETTLE_QUIET_MS = 2_000;
@@ -66,13 +77,14 @@ const SETTLE_MAX_MS = 10_000;
 // force-abandon so the pool can move on instead of leaving the tab open
 // indefinitely. See withTimeout() below.
 const WORKER_HARD_TIMEOUT_MS = 150_000;
-// Per-origin concurrency cap. CONCURRENT_TABS=200 is a GLOBAL worker count;
-// on a single-origin crawl (e.g. one 160-page marketing site) all 200
-// workers slam the same host, the target server's per-IP rate limit trips,
-// Chrome's renderer pool saturates, and tabs start failing with "frame
-// was removed" / "Cannot access contents" before axe ever runs. PER_ORIGIN_TABS
-// caps the host-level parallelism; on a multi-site crawl the global 200 is
-// still reachable (e.g. 25 origins × 8 tabs each).
+// Per-origin concurrency cap. CONCURRENT_TABS (10) is the GLOBAL worker
+// count; this caps how many of those may target the SAME host at once, so
+// a single-origin crawl can't slam one server's per-IP rate limit or
+// saturate Chrome's renderer pool (which surfaced as "frame was removed" /
+// "Cannot access contents" before axe ever ran). With the global cap now
+// 10, single-origin crawls run at min(10, 8) = 8; the per-origin cap is
+// the binding limit there, exactly as before. On a mixed paste list the
+// global cap of 10 is what keeps total tab count sane.
 const PER_ORIGIN_TABS = 8;
 // v0.4.3 — circuit breaker (ported from SiteCrawler v1.1.0). If this many
 // URLs in a row fail (site down, auth wall hit mid-crawl, network dropped),
@@ -94,8 +106,10 @@ const CHECKPOINT_EVERY = 20;
 let ACTIVE_AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 // Per-check toggles + overlay-dismissal flag for the in-progress scan, set by
 // each scan handler from the popup options and pushed to the page (with the tag
-// set) by runContentScan via window.__EU_SCAN_OPTS. Default = everything on.
-let ACTIVE_CHECKS = { axe: true, india: true, media: true, is17802: true, pdfOffice: true, visual: true };
+// set) by runContentScan via window.__EU_SCAN_OPTS. v0.4.8 — media, PDF/Office,
+// and visual-state audits are opt-in (default OFF); overlay dismissal +
+// audit-both also default OFF. Default recipe = axe-core only.
+let ACTIVE_CHECKS = { axe: true, india: true, media: false, is17802: true, pdfOffice: false, visual: false };
 let ACTIVE_DISMISS = false;
 let ACTIVE_AUDIT_BOTH = false;
 // v0.4.3 — screenshots are now opt-in. Full-page + element capture via the
@@ -144,7 +158,7 @@ async function probeRendered404(origin) {
     console.warn("[EU] rendered 404 probe failed:", err?.message || err);
     return null;
   } finally {
-    if (tab) { try { await chrome.tabs.remove(tab.id); } catch { } }
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch {} }
   }
 }
 
@@ -199,7 +213,7 @@ function mergeRenderedVerdicts(brokenLinks, pages, linkGraph) {
 // the Excel workbooks — so nobody has to guess what a given report ran with.
 function settingsEcho(mode, { profile, maxUrls, crawlDepth } = {}) {
   let version = "";
-  try { version = chrome.runtime.getManifest().version; } catch { }
+  try { version = chrome.runtime.getManifest().version; } catch {}
   return {
     "Mode": mode,
     "Extension version": version,
@@ -244,17 +258,17 @@ function checksFromOptions(options) {
   return {
     axe: c.axe !== false,
     india: c.india !== false,
-    media: c.media !== false,
+    media: c.media === true,
     is17802: c.is17802 !== false,
-    pdfOffice: c.pdfOffice !== false,
-    visual: c.visual !== false
+    pdfOffice: c.pdfOffice === true,
+    visual: c.visual === true
   };
 }
 
 // v12 fix — in-flight settle tracker. Bug: on sites where multiple
 // discovered URLs (e.g. `/about`, `/about-us`, `/about/?ref=nav`,
 // `/About/`, old `/company-info` legacy path) all server-redirect to the
-// same canonical page (`/about/`), CONCURRENT_TABS=200 workers could
+// same canonical page (`/about/`), concurrent workers could
 // each open a tab on a different queued URL, all land on `/about/` at
 // roughly the same moment, and each begin the settle wait. The
 // post-sleep `queue.hasSettled(settledUrl)` dedup only kicks in AFTER
@@ -302,35 +316,17 @@ const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 // later returned "Report expired". Reports are now persisted to
 // chrome.storage.local (like inventories already were) and re-warmed into
 // memory on demand. The last 5 reports are kept; older ones are pruned so
+// storage doesn't grow without bound.
+const REPORT_KEEP = 5;
 async function persistReport(reportId, report) {
   try {
-    const record = { [`report:${reportId}`]: report };
-    const seen = new Set();
-    const collectById = (id) => {
-      if (!id || seen.has(id)) return;
-      const entry = inventoryScreenshots.get(id);
-      if (entry) {
-        record[`shot:${id}`] = entry;
-        seen.add(id);
-      }
-    };
-    const collect = (shot) => collectById(shot?.id);
-    const collectShotsFromPage = (p) => {
-      collect(p.screenshot);
-      const violations = p.violations || p.audit?.violations || [];
-      for (const v of violations) {
-        for (const n of (v.nodes || [])) collectById(n.elementShotId);
-      }
-    };
-    for (const p of report.pages || []) {
-      collectShotsFromPage(p);
-    }
-    await chrome.storage.local.set(record);
-
+    await chrome.storage.local.set({ [`report:${reportId}`]: report });
     const got = await chrome.storage.local.get("report-ids");
     const ids = Array.isArray(got?.["report-ids"]) ? got["report-ids"] : [];
     ids.push(reportId);
+    const drop = ids.splice(0, Math.max(0, ids.length - REPORT_KEEP));
     await chrome.storage.local.set({ "report-ids": ids });
+    if (drop.length) await chrome.storage.local.remove(drop.map(id => `report:${id}`));
   } catch (err) {
     console.warn("[EU] persistReport failed — report will only survive while the service worker lives", err?.message || err);
   }
@@ -357,8 +353,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "SCAN_CURRENT") sendResponse(await scanCurrent(msg.tabId, msg.options));
-      else if (msg.type === "SCAN_MULTI") sendResponse(await scanMulti(msg.tabId, msg.options));
+      // v0.4.8 — SCAN_MULTI now runs the same full-audit crawl pipeline as
+      // inventory mode and presents in the tabbed viewer (Findings /
+      // Screenshots / Templates). The classic flat report stays reachable
+      // from the viewer via OPEN_CLASSIC_REPORT below.
+      else if (msg.type === "SCAN_MULTI") sendResponse(await scanInventory(msg.tabId, msg.options));
       else if (msg.type === "SCAN_INVENTORY") sendResponse(await scanInventory(msg.tabId, msg.options));
+      else if (msg.type === "OPEN_CLASSIC_REPORT") sendResponse(await openClassicReport(msg.inventoryId));
       else if (msg.type === "SCAN_LIST") sendResponse(await scanList(msg.options));
       else if (msg.type === "RECOVER_CHECKPOINT") sendResponse(await recoverCheckpoint());
       else if (msg.type === "SCAN_RESULT") sendResponse(handleResult(msg.payload, sender));
@@ -430,20 +431,8 @@ async function scanCurrent(tabId, options) {
   ACTIVE_CHECKS = checksFromOptions(options);
   ACTIVE_DISMISS = !!(options && options.dismissOverlays);
   ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
-  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
-
   const result = await scanInExistingTab(tabId);
-
-  let screenshot = null;
-  if (ACTIVE_SCREENSHOTS) {
-    try {
-      screenshot = await captureFullPageScreenshot(tabId, result?.violations || null);
-    } catch (err) {
-      console.warn(`[EU] scanCurrent screenshot failed:`, err?.message || err);
-    }
-  }
-
-  const report = buildReport([{ url: tab.url, title: tab.title, screenshot, ...result }], { mode: "single", seedUrl: tab.url, profile });
+  const report = buildReport([{ url: tab.url, title: tab.title, ...result }], { mode: "single", seedUrl: tab.url, profile });
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
   await persistReport(reportId, report); // v0.4.8 — survive SW eviction
@@ -451,204 +440,84 @@ async function scanCurrent(tabId, options) {
   return { ok: true, reportId };
 }
 
-async function scanMulti(tabId, options) {
-  // No arbitrary upper cap on maxUrls — operator decides. Floor of 1.
-  const maxUrls = floorInt(options?.maxUrls, DEFAULT_MAX_URLS, 1);
-  // v11: depth unbounded by default, matching scanInventory. The priority
-  // queue naturally biases shallower pages first, so unbounded depth just
-  // means "keep expanding the frontier until maxUrls fills or it empties".
-  // A user-supplied crawlDepth > 0 is still honoured exactly for operators
-  // who deliberately want to short-circuit a deep site.
-  const rawDepth = parseInt(options?.crawlDepth, 10);
-  const crawlDepth = (Number.isFinite(rawDepth) && rawDepth > 0)
-    ? rawDepth
-    : Number.POSITIVE_INFINITY;
-  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
-  ACTIVE_AXE_TAGS = tagsForProfile(profile);
-  ACTIVE_CHECKS = checksFromOptions(options);
-  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
-  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
-  ACTIVE_SCREENSHOTS = !!(options && options.screenshots);
-  ACTIVE_LINKS_ONLY = !!(options && options.linksOnly);
-  ACTIVE_LINKCHECK = !(options && options.brokenLinks === false);
+// v0.4.8 — scanMulti removed. SCAN_MULTI now routes to scanInventory (same
+// discovery + crawl engine, plus template fingerprints, content signals,
+// screenshots, and checkpoint/recovery). The classic flat report this
+// function used to build is still available on demand — see
+// openClassicReport(), which adapts a stored inventory back into
+// buildReport's page shape.
 
-  const tab = await chrome.tabs.get(tabId);
-  const startUrl = tab.url;
-  const seedOrigin = safeOrigin(startUrl);
-  const linkGraph = ACTIVE_LINKCHECK ? new Map() : null;
+// Rebuild the classic report.html presentation (WCAG criterion status,
+// conformance by standard, media & documents, passes/incomplete/inapplicable
+// tables, scan environment, CSV/Excel/JSON exports) from a completed
+// inventory crawl. The inventory page records carry the FULL axe payload
+// (see inventoryInNewTab), so nothing needs rescanning — this is a pure
+// reshape: flatten each page's nested `audit` back to the top level that
+// buildReport expects.
+function inventoryPagesToReportPages(inventory) {
+  const all = [
+    ...(inventory.pages || []),
+    ...(inventory.shellPages || []),
+    ...(inventory.hashDuplicates || [])
+  ];
+  return all.map(p => ({
+    url: p.url,
+    title: p.title || "",
+    depth: p.depth ?? "",
+    source: p.source || "",
+    ...(p.error ? { error: p.error } : {}),
+    ...(p.audit || {}),
+    mediaInventory: p.mediaInventory || null
+  }));
+}
 
-  const queue = new RequestQueue({ scopeUrl: startUrl, maxUrls, maxDepth: crawlDepth, scope: "same-hostname" });
-  queue.enqueue(startUrl, { depth: 0, priority: 100, source: "seed" });
-  queue.markSettled(startUrl);
-
-  const results = [];
-  const depthStats = {};
-  const discoveryStats = {
-    nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0,
-    sitemapRaw: 0, feedRaw: 0, commonPaths: 0
-  };
-
-  queue.next();
-  depthStats[0] = 1;
-  const startScan = await scanInExistingTab(tabId);
-  let screenshot = null;
-  if (ACTIVE_SCREENSHOTS) {
+async function openClassicReport(inventoryId) {
+  let inventory = inventories.get(inventoryId)?.inventory || null;
+  if (!inventory) {
     try {
-      screenshot = await captureFullPageScreenshot(tabId, startScan?.violations || null);
+      const stored = await chrome.storage.local.get(`inv:${inventoryId}`);
+      inventory = stored[`inv:${inventoryId}`] || null;
     } catch (err) {
-      console.warn(`[EU] seed screenshot failed:`, err?.message || err);
+      console.warn("[EU] openClassicReport storage fallback failed", err);
     }
   }
-  results.push({ url: startUrl, title: tab.title, depth: 0, source: "seed", screenshot, ...startScan });
+  if (!inventory) return { ok: false, error: "Inventory expired" };
 
-  // Seed tab may have redirected during the scan. Mark the current URL as
-  // settled so workers dedup against it.
-  try {
-    const liveSeed = await chrome.tabs.get(tabId);
-    if (liveSeed?.url) queue.markSettled(liveSeed.url);
-  } catch { }
-
-  await openCrawlerWindow();
-  // v0.4.4 — render the site's not-found page (worker tab on a nonexistent
-  // URL) in parallel with discovery, so the rendered-DOM soft-404 layer has
-  // its baseline before any worker scans a page.
-  const [, r404] = await Promise.all([
-    seedDiscovery({
-      tabId, startUrl, seedOrigin, queue, depth: 1, discoveryStats,
-      linksOnly: ACTIVE_LINKS_ONLY,
-      onLinks: linkGraph ? (src, links) => recordLinksInto(linkGraph, src, links) : null
-    }),
-    ACTIVE_LINKCHECK ? probeRendered404(seedOrigin) : Promise.resolve(null)
-  ]);
-  ACTIVE_R404 = r404;
-
-  console.log(`[EU] discovery — nav:${discoveryStats.nav} body:${discoveryStats.body} sitemap:${discoveryStats.sitemap}/${discoveryStats.sitemapRaw} hreflang:${discoveryStats.hreflang} feed:${discoveryStats.feed}/${discoveryStats.feedRaw} linkRels:${discoveryStats.linkRels} | pending:${queue.pending}`);
-
-  const active = new Set();
-  let errorStreak = 0;
-  let stopReason = null;
-
-  async function launch(req) {
-    // `acquired` tracks whether wait() returned a non-null token. Only if
-    // it did do we need to call release() — a null return means the URL
-    // was unparseable and no semaphore slot was taken. We call release()
-    // in a finally so the slot is freed even if reportSuccess/reportFailure
-    // or the scan work throws. Missing a release leaks the slot and
-    // eventually stalls the origin (workers stuck waiting for a slot that
-    // will never free).
-    let acquired = false;
-    try {
-      const token = await rateLimiter.wait(req.url);
-      acquired = token != null;
-      // v12.2 — hard ceiling so one stuck tab can't stall the whole pool.
-      const r = await withTimeout(
-        scanInNewTab(req.url, req.depth < crawlDepth, { queue }),
-        WORKER_HARD_TIMEOUT_MS,
-        `worker ${req.url}`
-      );
-      rateLimiter.reportSuccess(req.url);
-
-      // Settled-URL dedup: tab landed on a URL another worker already scanned.
-      if (r.__skipped === "redirect-to-duplicate") {
-        results.push({
-          url: req.url, depth: req.depth, source: req.source,
-          error: `redirected to already-scanned URL: ${r.settledUrl}`,
-          violations: [], passes: [], incomplete: [], inapplicable: []
-        });
-        depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
-        errorStreak = 0; // a clean dedup skip is not a failure
-        return;
-      }
-
-      const { links = [], ...scan } = r;
-      results.push({ url: req.url, depth: req.depth, source: req.source, ...scan });
-      depthStats[req.depth] = (depthStats[req.depth] || 0) + 1;
-      errorStreak = 0;
-      if (linkGraph && links.length) recordLinksInto(linkGraph, req.url, links);
-      if (req.depth < crawlDepth) {
-        const nav = links.filter(l => l.priority >= 10).map(l => l.url);
-        const body = links.filter(l => l.priority < 10).map(l => l.url);
-        queue.enqueueMany(nav, { depth: req.depth + 1, priority: 8, source: "nav" });
-        queue.enqueueMany(body, { depth: req.depth + 1, priority: 2, source: "body" });
-      }
-    } catch (err) {
-      const status = err?.status || 0;
-      rateLimiter.reportFailure(req.url, { status });
-      console.warn(`[EU] scan failed: ${req.url}`, err?.message || err);
-      results.push({
-        url: req.url, depth: req.depth, source: req.source,
-        error: String(err?.message || err),
-        violations: [], passes: [], incomplete: [], inapplicable: []
-      });
-      errorStreak++;
-    } finally {
-      if (acquired) rateLimiter.release(req.url);
-    }
-  }
-
-  function pump() {
-    // v0.4.3 circuit breaker — stop launching once the error streak trips.
-    // In-flight workers drain naturally; the report meta records the trip.
-    if (errorStreak >= ERROR_STREAK_LIMIT) {
-      if (!stopReason) {
-        stopReason = `stopped early: ${errorStreak} consecutive page failures`;
-        console.warn(`[EU] circuit breaker tripped — ${stopReason}`);
-      }
-      return;
-    }
-    while (active.size < CONCURRENT_TABS && queue.pending && queue.remaining > 0) {
-      const req = queue.next();
-      if (!req) break;
-      const p = launch(req).finally(() => { active.delete(p); });
-      active.add(p);
-    }
-  }
-
-  pump();
-  while (active.size > 0) {
-    await Promise.race(active);
-    pump();
-  }
-  await closeCrawlerWindow();
-
-  console.log(`[EU] crawl complete — pages per depth:`, depthStats, "rate:", rateLimiter.snapshot());
-
-  // v0.4.4 — status-check every internal link target found during the crawl.
-  let brokenLinks = null;
-  if (linkGraph && linkGraph.size) {
-    console.log(`[EU] broken-link check — ${linkGraph.size} unique internal link target(s)`);
-    try {
-      brokenLinks = await detectBrokenLinks({ linkGraph, origin: seedOrigin });
-      console.log(`[EU] broken-link check done — ${brokenLinks.brokenCount} broken of ${brokenLinks.checked} checked (not-found mode: ${brokenLinks.notFoundMode})`);
-    } catch (err) {
-      console.warn("[EU] broken-link check failed:", err?.message || err);
-    }
-  }
-  // Fold in the rendered-DOM soft-404 verdicts collected per crawled page.
-  brokenLinks = mergeRenderedVerdicts(brokenLinks, results, linkGraph);
-  ACTIVE_R404 = null;
-
-  const report = buildReport(results, {
-    mode: "multi", seedUrl: startUrl, maxUrls, crawlDepth, depthStats, discoveryStats, profile,
-    stopReason: stopReason || "completed"
+  const meta = inventory.meta || {};
+  const report = buildReport(inventoryPagesToReportPages(inventory), {
+    mode: meta.mode || "multi",
+    seedUrl: meta.seedUrl || "",
+    maxUrls: meta.maxUrls,
+    crawlDepth: meta.crawlDepth,
+    depthStats: meta.depthStats || {},
+    ...(meta.discoveryStats ? { discoveryStats: meta.discoveryStats } : {}),
+    profile: meta.profile,
+    stopReason: meta.stopReason || "completed"
   });
-  report.brokenLinks = brokenLinks;
-  report.settings = settingsEcho("multi-page scan", { profile, maxUrls, crawlDepth });
+  // Prefer the inventory's media rows when present — they carry the PDF /
+  // Office structural-audit enrichment (pdfAudit / officeAudit) that
+  // buildReport's fresh collection wouldn't have.
+  if (Array.isArray(inventory.mediaRows) && inventory.mediaRows.length) {
+    report.mediaRows = inventory.mediaRows;
+    if (inventory.mediaSummary) report.mediaSummary = inventory.mediaSummary;
+  }
+  report.brokenLinks = inventory.brokenLinks || null;
+  report.settings = inventory.settings || null;
+
   const reportId = `r-${Date.now()}`;
   reports.set(reportId, report);
-  // v0.4.8 — persist BEFORE opening the viewer tab, so even if the service
-  // worker is evicted the instant the tab opens, GET_REPORT recovers it
-  // from storage and the Excel/CSV downloads keep working indefinitely.
   await persistReport(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
   return { ok: true, reportId };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Inventory mode — crawl but skip axe. Produces the scope document (.docx)
-// + inventory workbook (.xlsx) that a professional audit firm uses before
-// committing to the full audit. Same discovery pipeline as scanMulti, but
-// each page runs only content-signals.js (no axe-core, much faster).
+// Full-audit crawl — the single crawl engine behind BOTH the popup's
+// "Multi Page Scan" and "Inventory / Scope Mode" buttons (v0.4.8). Every
+// page gets the full audit stack (axe + india + is17802 + media + visual)
+// plus template fingerprint, content signals, and optional screenshots.
+// Results open in the tabbed viewer (report/inventory.html); the classic
+// flat report remains available from there via openClassicReport().
 // ─────────────────────────────────────────────────────────────────────────
 async function scanInventory(tabId, options) {
   // Inventory mode: no ceilings on maxUrls or depth. The operator decides.
@@ -703,13 +572,13 @@ async function scanInventory(tabId, options) {
       startedAt: Date.now(),
       seedUrl: startUrl
     }
-  }).catch(() => { });
+  }).catch(() => {});
   async function progressUpdate(patch) {
     try {
       const got = await chrome.storage.local.get("scan-progress");
       const prev = got?.["scan-progress"] || {};
       await chrome.storage.local.set({ "scan-progress": { ...prev, ...patch } });
-    } catch { }
+    } catch {}
   }
 
   const pages = [];
@@ -746,7 +615,7 @@ async function scanInventory(tabId, options) {
     // element screenshots are captured on the hidden worker tabs.
     // v0.4.3 — skipped entirely unless the operator opted into screenshots.
     if (ACTIVE_SCREENSHOTS) {
-      try { screenshot = await captureFullPageScreenshot(tabId, auditPayload?.violations || null); }
+      try { screenshot = await captureFullPageScreenshot(tabId); }
       catch (err) { console.warn(`[EU] seed screenshot failed:`, err?.message || err); }
     }
     const tmpl = auditPayload?.template || {};
@@ -790,6 +659,12 @@ async function scanInventory(tabId, options) {
         incomplete: auditPayload?.incomplete || [],
         inapplicable: auditPayload?.inapplicable || []
       },
+      // v0.4.8 — media & document inventory (videos / audio / embedded
+      // players / linked PDFs & Office docs) was previously dropped on the
+      // inventory path, which left buildInventory without mediaRows and made
+      // the PDF / Office structural audits a silent no-op. Kept per page so
+      // collectMediaRows can build the corpus-level media table.
+      mediaInventory: auditPayload?.mediaInventory || null,
       screenshot,
       ...seedSignals
     });
@@ -806,7 +681,7 @@ async function scanInventory(tabId, options) {
   // completion state, not just successes.
   await progressUpdate({ done: pages.length, currentUrl: startUrl });
 
-  // Same discovery pipeline as scanMulti — seedDiscovery() runs sitemap,
+  // Discovery — seedDiscovery() runs sitemap,
   // homepage <link rel=…>, RSS/Atom feeds, and in-page nav harvest in
   // parallel and enqueues them in priority order (nav > canonical/next/prev
   // > hreflang > feed > sitemap > body) so limited-budget crawls don't get
@@ -815,10 +690,13 @@ async function scanInventory(tabId, options) {
   // v0.4.4 — render the site's not-found page (worker tab on a nonexistent
   // URL) in parallel with discovery, so the rendered-DOM soft-404 layer has
   // its baseline before any worker scans a page.
+  // v0.4.8 — discoveryStats kept (previously discarded) so the meta reaches
+  // buildInventory and the classic-report bridge can echo discovery counts.
+  const discoveryStats = { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 };
   const [, r404] = await Promise.all([
     seedDiscovery({
       tabId, startUrl, seedOrigin, queue, depth: 1,
-      discoveryStats: { nav: 0, body: 0, sitemap: 0, hreflang: 0, feed: 0, linkRels: 0, sitemapRaw: 0, feedRaw: 0 },
+      discoveryStats,
       linksOnly: ACTIVE_LINKS_ONLY,
       onLinks: linkGraph ? (src, links) => recordLinksInto(linkGraph, src, links) : null
     }),
@@ -910,7 +788,8 @@ async function scanInventory(tabId, options) {
   }
 
   function pump() {
-    // v0.4.3 circuit breaker — see scanMulti.
+    // v0.4.3 circuit breaker — stop launching once the error streak trips;
+    // in-flight workers drain naturally and the meta records the trip.
     if (errorStreak >= ERROR_STREAK_LIMIT) {
       if (!stopReason) {
         stopReason = `stopped early: ${errorStreak} consecutive page failures`;
@@ -954,9 +833,11 @@ async function scanInventory(tabId, options) {
   // it clears.
   await progressUpdate({ active: false, currentUrl: "", completedAt: Date.now(), done: pages.length });
 
-  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, profile, stopReason: stopReason || "completed" });
+  const inventory = buildInventory(pages, { seedUrl: startUrl, seedHost, maxUrls, crawlDepth, depthStats, discoveryStats, profile, stopReason: stopReason || "completed" });
   inventory.brokenLinks = brokenLinks;
-  inventory.settings = settingsEcho("inventory / scope crawl", { profile, maxUrls, crawlDepth });
+  // v0.4.8 — one crawl engine serves both popup buttons, so the echoed mode
+  // label covers both.
+  inventory.settings = settingsEcho("full-audit crawl (multi-page / scope)", { profile, maxUrls, crawlDepth });
 
   // v13.1 — audit every discovered PDF for structural accessibility
   // markers (tagged, struct tree, /Lang, /Title). Enriches the PDF rows
@@ -1092,9 +973,9 @@ async function scanList(options) {
     if (s.startsWith("#")) continue;
     // Try as-is. If that fails, try prepending https://.
     let parsedUrl = null;
-    try { parsedUrl = new URL(s); } catch { }
+    try { parsedUrl = new URL(s); } catch {}
     if (!parsedUrl && !/^[a-z][a-z0-9+.-]*:/i.test(s)) {
-      try { parsedUrl = new URL(`https://${s}`); } catch { }
+      try { parsedUrl = new URL(`https://${s}`); } catch {}
     }
     if (!parsedUrl) {
       invalidRows.push({ url: s, error: "invalid URL — could not parse" });
@@ -1129,13 +1010,13 @@ async function scanList(options) {
       startedAt: Date.now(),
       seedUrl
     }
-  }).catch(() => { });
+  }).catch(() => {});
   async function progressUpdate(patch) {
     try {
       const got = await chrome.storage.local.get("scan-progress");
       const prev = got?.["scan-progress"] || {};
       await chrome.storage.local.set({ "scan-progress": { ...prev, ...patch } });
-    } catch { }
+    } catch {}
   }
 
   const pages = [];
@@ -1270,7 +1151,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
       try {
         const t = await chrome.tabs.get(tabId);
         currentUrl = t?.url || null;
-      } catch { }
+      } catch {}
       if (currentUrl) {
         const keyUrl = canonicalize(currentUrl) || currentUrl;
         // Fast path — another worker already COMPLETED a scan at this URL
@@ -1310,7 +1191,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
       if (settledUrl) queue.markSettled(settledUrl, url);
     }
 
-    // Full audit stack — same code path as scanMulti.
+    // Full audit stack — axe + custom check bundles via the content script.
     await injectAxe(tabId);
     const auditPayload = await runContentScan(tabId);
 
@@ -1383,6 +1264,9 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
         incomplete: auditPayload?.incomplete || [],
         inapplicable: auditPayload?.inapplicable || []
       },
+      // v0.4.8 — see the seed-page record in scanInventory: media inventory
+      // must survive into the page record for mediaRows / PDF & Office audits.
+      mediaInventory: auditPayload?.mediaInventory || null,
       screenshot, // { dataUrl, width, height } | null
       duplicate_of: duplicateOf, // URL of first page with same text_hash, else null
       ...signals
@@ -1393,7 +1277,7 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
     return out;
   } finally {
     if (inFlightClaimKey) _inFlightSettleUrls.delete(inFlightClaimKey);
-    try { await chrome.tabs.remove(tabId); } catch { }
+    try { await chrome.tabs.remove(tabId); } catch {}
   }
 }
 
@@ -1410,17 +1294,15 @@ async function inventoryInNewTab(url, collectNextLinks, { queue = null, seenText
 // hundreds of full-page screenshots. The renderer fetches each image on
 // demand via the GET_SCREENSHOT message.
 // v12.2 — wrap each debugger call in a race-with-timeout so a stuck
-// hundreds of full-page screenshots. The renderer fetches each image on
-// demand via the GET_SCREENSHOT message.
-// v12.2 — wrap each debugger call in a race-with-timeout so a stuck
 // chrome.debugger.attach can't hang the worker (and therefore the whole
 // pool) forever. Chrome throttles/queues concurrent debugger sessions
-// when many tabs request attach at once (CONCURRENT_TABS=200 easily
-// exceeds the practical ceiling). Before this cap, an attach that got
+// when many tabs request attach at once (concurrent workers can still
+// exceed the practical ceiling). Before this cap, an attach that got
 // queued past Chrome's internal timeout just never resolved, which left
 // the worker stuck mid-`inventoryInNewTab` with its tab still open.
 const DEBUGGER_ATTACH_TIMEOUT_MS = 15_000;
 const DEBUGGER_CMD_TIMEOUT_MS = 20_000;
+
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
@@ -1430,115 +1312,47 @@ function withTimeout(promise, ms, label) {
     );
   });
 }
+
 async function captureFullPageScreenshot(tabId, violations = null) {
-  console.log("Herre2")
   const target = { tabId };
   let attached = false;
-  let overridden = false;
   try {
     await withTimeout(chrome.debugger.attach(target, "1.3"), DEBUGGER_ATTACH_TIMEOUT_MS, "debugger.attach");
     attached = true;
     await withTimeout(chrome.debugger.sendCommand(target, "Page.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Page.enable");
-
-    // Query page dimensions to calculate total page width and height
-    const metricsExpr = `(function() {
-      var heights = [
-        window.innerHeight,
-        document.body?.scrollHeight || 0,
-        document.documentElement?.scrollHeight || 0,
-        document.body?.offsetHeight || 0,
-        document.documentElement?.offsetHeight || 0
-      ];
-      try {
-        var wrappers = document.querySelectorAll('#root, #__next, [id*="app"], main, body > div');
-        for (var i = 0; i < wrappers.length; i++) {
-          heights.push(wrappers[i].scrollHeight || 0);
-          heights.push(wrappers[i].offsetHeight || 0);
-        }
-      } catch(e) {}
-      try {
-        var all = document.getElementsByTagName('*');
-        var maxBottom = 0;
-        var len = all.length;
-        // Scan elements backwards from the end (where footers are situated)
-        var limit = Math.max(0, len - 600);
-        for (var i = len - 1; i >= limit; i--) {
-          var rect = all[i].getBoundingClientRect();
-          var bottom = rect.bottom + window.scrollY;
-          if (bottom > maxBottom && rect.width > 0 && rect.height > 0) {
-            maxBottom = bottom;
-          }
-        }
-        heights.push(maxBottom);
-      } catch(e) {}
-      
-      var widths = [
-        window.innerWidth,
-        document.body?.scrollWidth || 0,
-        document.documentElement?.scrollWidth || 0
-      ];
-      
-      return {
-        width: Math.ceil(Math.max.apply(null, widths)) | 0,
-        height: Math.ceil(Math.max.apply(null, heights)) | 0
-      };
-    })()`;
-
-    let metrics = { width: 1280, height: 960 };
-    try {
-      const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-        expression: metricsExpr, returnByValue: true
-      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(getMetrics)");
-      if (evalRes?.result?.value) {
-        metrics = evalRes.result.value;
-      }
-    } catch (err) {
-      console.warn("[EU] failed to evaluate page metrics, using defaults:", err?.message || err);
-    }
-
-    if (metrics) {
-      // Clamp dimensions to prevent texture memory allotment crashes on giant/infinite scroll pages
-      const finalWidth = Math.max(800, Math.min(metrics.width || 1280, 1920));
-      const finalHeight = Math.max(600, Math.min(metrics.height || 960, 20000));
-
-      // Temporarily override the device metrics layout viewport to the full page dimensions
-      try {
-        await withTimeout(chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", {
-          width: finalWidth,
-          height: finalHeight,
-          deviceScaleFactor: 1, // force 1 to minimize memory usage and prevent tiling artifacts
-          mobile: false
-        }), DEBUGGER_CMD_TIMEOUT_MS, "Emulation.setDeviceMetricsOverride");
-        overridden = true;
-      } catch (err) {
-        console.warn("[EU] failed to set device metrics override:", err?.message || err);
-      }
-    }
-
+    const result = await withTimeout(
+      chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        fromSurface: true
+      }),
+      DEBUGGER_CMD_TIMEOUT_MS,
+      "Page.captureScreenshot"
+    );
     let shot = null;
-
-    // Capture issue-specific element screenshots
+    if (result?.data) {
+      const id = `shot-${crypto.randomUUID()}`;
+      inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${result.data}`, bytes: result.data.length });
+      shot = { id, bytes: result.data.length };
+    }
+    // v0.4.2 — issue-specific element screenshots. Reuse THIS debugger session
+    // (one attach per page — attaching a second time would double the
+    // contention the 200-tab pool already strains) to capture a cropped,
+    // highlighted shot of each distinct violating element. Mutates the
+    // violation nodes in place, tagging each with elementShotId so the report
+    // and the Excel can show the issue exactly where it occurs.
     if (Array.isArray(violations) && violations.length) {
       try {
-        const n = await captureElementShotsInSession(target, violations, overridden);
+        const n = await captureElementShotsInSession(target, violations);
         if (n) console.log(`[EU] captured ${n} element screenshot(s)`);
       } catch (err) {
         console.warn("[EU] element screenshots failed:", err?.message || err);
       }
     }
-
     return shot;
   } finally {
-    // Restore the device metrics layout viewport to standard size
-    if (overridden) {
-      try {
-        await withTimeout(chrome.debugger.sendCommand(target, "Emulation.clearDeviceMetricsOverride"), DEBUGGER_CMD_TIMEOUT_MS, "Emulation.clearDeviceMetricsOverride");
-      } catch (err) {
-        console.warn("[EU] failed to clear device metrics override:", err?.message || err);
-      }
-    }
     if (attached) {
-      try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch { }
+      try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {}
     }
   }
 }
@@ -1552,8 +1366,7 @@ const ELEMENT_SHOT_MAX_DIM = 1600;
 // screenshot per DISTINCT violating element. Deduped by selector and capped so
 // a page with hundreds of nodes can't explode storage/time. Tags each matched
 // violation node with `elementShotId`. Returns the number captured.
-async function captureElementShotsInSession(target, violations, skipScroll = false) {
-  console.log("Hereeee")
+async function captureElementShotsInSession(target, violations) {
   const selToNodes = new Map();
   for (const v of violations) {
     for (const n of (v.nodes || [])) {
@@ -1563,90 +1376,34 @@ async function captureElementShotsInSession(target, violations, skipScroll = fal
       selToNodes.get(sel).push(n);
     }
   }
-  console.log({
-    violations: violations.length,
-    selectors: selToNodes.size,
-    max: MAX_ELEMENT_SHOTS_PER_PAGE
-  });
   if (selToNodes.size === 0) return 0;
   await withTimeout(chrome.debugger.sendCommand(target, "Runtime.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.enable");
-
-  let originalScroll = null;
-  if (!skipScroll) {
-    try {
-      const scrollEval = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-        expression: `({ x: window.scrollX, y: window.scrollY })`, returnByValue: true
-      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(getScroll)");
-      originalScroll = scrollEval?.result?.value;
-    } catch (err) {
-      console.warn("[EU] failed to get original scroll position:", err);
-    }
-  }
-
   let captured = 0;
-  try {
-    for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
-      try {
-        const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-          expression: elementHighlightExpr(sel, skipScroll), returnByValue: true
-        }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
-        const rect = evalRes?.result?.value;
-        console.log("[SELECTOR]", sel, rect);
-        if (!rect) {
-          console.log("[SKIP] No rect", sel);
-          await clearElementHighlight(target);
-          continue;
-        }
-
-        if (!rect.ok) {
-          console.log("[SKIP] rect.ok=false", sel, rect);
-          await clearElementHighlight(target);
-          continue;
-        }
-        // Allow time for the element highlight styles and overlay box to paint
-        await new Promise(resolve => setTimeout(resolve, 150));
-        console.log("[CAPTURE]", {
-          selector: sel,
-          clip: {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height
-          }
-        });
-
-        const shot = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
-          format: "png",
-          clip: {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-            scale: 1
-          },
-          captureBeyondViewport: true,
-          fromSurface: true
-        }), DEBUGGER_CMD_TIMEOUT_MS, "Page.captureScreenshot(element)");
-        await clearElementHighlight(target);
-        if (!shot?.data) continue;
-        const id = `shot-el-${crypto.randomUUID()}`;
-        inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${shot.data}`, bytes: shot.data.length });
-        for (const node of selToNodes.get(sel)) node.elementShotId = id;
-        captured++;
-      } catch (err) {
-        console.warn(`[EU] element shot failed (${sel}):`, err?.message || err);
-        try { await clearElementHighlight(target); } catch { }
-      }
-    }
-  } finally {
-    if (!skipScroll && originalScroll && typeof originalScroll.x === "number" && typeof originalScroll.y === "number") {
-      try {
-        await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-          expression: `window.scrollTo(${originalScroll.x}, ${originalScroll.y})`
-        }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(restoreScroll)");
-      } catch (err) {
-        console.warn("[EU] failed to restore scroll position:", err);
-      }
+  for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
+    try {
+      const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+        expression: elementHighlightExpr(sel), returnByValue: true
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
+      const rect = evalRes?.result?.value;
+      if (!rect || !rect.ok) { await clearElementHighlight(target); continue; }
+      const clip = {
+        x: Math.max(0, rect.x), y: Math.max(0, rect.y),
+        width: Math.max(1, Math.min(rect.width, ELEMENT_SHOT_MAX_DIM)),
+        height: Math.max(1, Math.min(rect.height, ELEMENT_SHOT_MAX_DIM)),
+        scale: 1
+      };
+      const shot = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+        format: "png", captureBeyondViewport: true, fromSurface: true, clip
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Page.captureScreenshot(element)");
+      await clearElementHighlight(target);
+      if (!shot?.data) continue;
+      const id = `shot-el-${crypto.randomUUID()}`;
+      inventoryScreenshots.set(id, { dataUrl: `data:image/png;base64,${shot.data}`, bytes: shot.data.length });
+      for (const node of selToNodes.get(sel)) node.elementShotId = id;
+      captured++;
+    } catch (err) {
+      console.warn(`[EU] element shot failed (${sel}):`, err?.message || err);
+      try { await clearElementHighlight(target); } catch {}
     }
   }
   return captured;
@@ -1665,93 +1422,21 @@ function elementSelectorOf(node) {
 // Page-side expression: outline the element (outline doesn't reflow layout),
 // scroll it into view, and return its page-space rect (+ padding). Stashes the
 // previous inline styles on window so clearElementHighlight can restore them.
-function elementHighlightExpr(sel, skipScroll = false) {
+function elementHighlightExpr(sel) {
   return `(function(){
     try {
       var el = document.querySelector(${JSON.stringify(sel)});
       if (!el || !el.getBoundingClientRect) return { ok:false };
-      
-      // For background worker tabs, device metrics override has expanded the layout viewport 
-      // to cover the entire page height, so there is no scrollbar or need to scroll into view.
-      if (!${skipScroll}) {
-        try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e){}
-      }
+      try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e){}
       var r = el.getBoundingClientRect();
-      console.log({
-        rect: {
-            left: r.left,
-            top: r.top,
-            width: r.width,
-            height: r.height
-        },
-        scrollX: window.scrollX,
-        scrollY: window.scrollY,
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        pageY: r.top + window.scrollY,
-        pageBottom: r.bottom + window.scrollY
-      });
-      // Create a visual box overlay around the element
-      var box = document.createElement('div');
-      box.id = '__EU_HL_BOX';
-      box.style.position = 'absolute';
-      box.style.left = (r.left + window.scrollX - 2) + 'px';
-      box.style.top = (r.top + window.scrollY - 2) + 'px';
-      box.style.width = (r.width + 4) + 'px';
-      box.style.height = (r.height + 4) + 'px';
-      box.style.border = '3px solid #e11d48';
-      box.style.boxShadow = '0 0 0 4px rgba(225,29,72,0.35)';
-      box.style.pointerEvents = 'none';
-      box.style.zIndex = '2147483647';
-      box.style.boxSizing = 'border-box';
-      document.body.appendChild(box);
-
-      window.__EU_HL = {
-        el: el,
-        outline: el.style.outline,
-        offset: el.style.outlineOffset,
-        shadow: el.style.boxShadow,
-        box: box
-      };
-
+      window.__EU_HL = { el: el, outline: el.style.outline, offset: el.style.outlineOffset, shadow: el.style.boxShadow };
       el.style.outline = '3px solid #e11d48';
       el.style.outlineOffset = '2px';
       el.style.boxShadow = '0 0 0 4px rgba(225,29,72,0.35)';
-
       var pad = ${ELEMENT_SHOT_PAD};
-      
-      // Calculate center coordinates of the element
-      var elCenterX = r.left + r.width / 2;
-      var elCenterY = r.top + r.height / 2;
-      
-      // Enforce a minimum crop snippet dimension of 400x300 so that small elements have ample surrounding context
-      var minW = 400;
-      var minH = 300;
-      
-      var targetW = Math.max(minW, r.width + pad * 2);
-      var targetH = Math.max(minH, r.height + pad * 2);
-      
-      var vw = window.innerWidth;
-      var vh = window.innerHeight;
-      
-      // Ensure crop dimensions do not exceed the actual viewport size
-      targetW = Math.min(targetW, vw);
-      targetH = Math.min(targetH, vh);
-      
-      var x = elCenterX - targetW / 2;
-      var y = elCenterY - targetH / 2;
-      
-      // Clamp crop box so it stays fully inside the viewport bounds
-      if (x < 0) x = 0;
-      if (y < 0) y = 0;
-      
-      return {
-        ok: targetW > 0 && targetH > 0,
-        x: Math.round(x),
-        y: Math.round(y),
-        width: Math.round(targetW),
-        height: Math.round(targetH)
-      };
+      return { ok: (r.width>0 && r.height>0),
+        x: r.left + window.scrollX - pad, y: r.top + window.scrollY - pad,
+        width: r.width + pad*2, height: r.height + pad*2 };
     } catch(e){ return { ok:false }; }
   })()`;
 }
@@ -1759,27 +1444,9 @@ function elementHighlightExpr(sel, skipScroll = false) {
 async function clearElementHighlight(target) {
   try {
     await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function(){
-        try {
-          var h = window.__EU_HL;
-          if (h) {
-            if (h.el) {
-              h.el.style.outline = h.outline;
-              h.el.style.outlineOffset = h.offset;
-              h.el.style.boxShadow = h.shadow;
-            }
-            if (h.box && typeof h.box.remove === 'function') {
-              h.box.remove();
-            } else {
-              var b = document.getElementById('__EU_HL_BOX');
-              if (b) b.remove();
-            }
-          }
-          window.__EU_HL = null;
-        } catch(e){}
-      })()`
+      expression: `(function(){ try { var h=window.__EU_HL; if(h&&h.el){ h.el.style.outline=h.outline; h.el.style.outlineOffset=h.offset; h.el.style.boxShadow=h.shadow; } window.__EU_HL=null; } catch(e){} })()`
     }), 5000, "clearElementHighlight");
-  } catch { }
+  } catch {}
 }
 
 async function sha1Prefix(str, hex) {
@@ -2472,12 +2139,21 @@ function buildInventory(pages, meta) {
     explanation: "These URLs were crawled but returned a DOM + text identical to another crawled page. Two patterns are detected: (a) pages whose fingerprint + text matches the seed/home — typically an SPA client router soft-404'ing to the default route; (b) a cluster of ≥2 non-seed pages all rendering the same DOM + text — typically an error/404 page (common with admin-dashboard template sites whose sidebars carry many demo-route links that 404 in production). Excluded from the main pages + templates tables so they don't inflate inventory counts."
   } : null;
 
+  // v0.4.8 — media & document rows across the real page set. This is what
+  // enrichPdfRowsWithAudit / enrichOfficeRowsWithAudit iterate; before this,
+  // inventory.mediaRows was never populated and both enrichers silently
+  // no-oped on every inventory / template-check run. Shell and hash-duplicate
+  // pages are excluded — their media is the same as the primary page's.
+  const { mediaRows, mediaSummary } = collectMediaRows(realPages);
+
   return {
     meta: {
       ...meta,
       crawlDepthLabel: Number.isFinite(meta.crawlDepth) ? String(meta.crawlDepth) : "unbounded",
       generatedAt: new Date().toISOString()
     },
+    mediaRows,
+    mediaSummary,
     // `pages` is the real set (shell + hash-duplicate pages excluded).
     // Both sidelined sets are kept addressable so nothing is silently
     // dropped from the audit trail.
@@ -2586,7 +2262,7 @@ async function buildThumbnailMap(inventory) {
   for (const p of (inventory?.pages || [])) {
     if (p.error) continue;
     if (p.screenshot?.id && !seen.has(p.screenshot.id)) { seen.add(p.screenshot.id); ids.push(p.screenshot.id); }
-    for (const v of (p.violations || p.audit?.violations || [])) {
+    for (const v of (p.audit?.violations || [])) {
       for (const n of (v.nodes || [])) {
         if (n.elementShotId && !seen.has(n.elementShotId)) { seen.add(n.elementShotId); ids.push(n.elementShotId); }
       }
@@ -2657,7 +2333,7 @@ async function collectNavLinks(tabId, opts = {}) {
   // opts.noScroll (v0.2.1) is forwarded into the in-page navSurfacedCollect
   // run. Pass true from seedDiscovery() because the seed tab IS the user's
   // visible tab — scrolling it makes the "Scan" button look broken. Leave
-  // false for hidden worker tabs (scanInNewTab / inventoryInNewTab) which
+  // false for hidden worker tabs (inventoryInNewTab) which
   // open with active:false and can safely scroll for full nav harvest.
   const noScroll = !!(opts && opts.noScroll);
   try {
@@ -2752,14 +2428,14 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   if (homepageLinks.canonical && homepageLinks.canonical !== startUrl) linkRelUrls.push(homepageLinks.canonical);
   for (const u of homepageLinks.nextPrev || []) linkRelUrls.push(u);
 
-  const navOnly = navLinks.filter(l => l.priority >= 10).map(l => l.url);
-  const bodyOnly = navLinks.filter(l => l.priority < 10).map(l => l.url);
+  const navOnly  = navLinks.filter(l => l.priority >= 10).map(l => l.url);
+  const bodyOnly = navLinks.filter(l => l.priority <  10).map(l => l.url);
 
   // Enqueue in strict priority order. Each enqueueMany() stops adding once
   // the seen-set fills (queue.enqueue returns false past maxUrls), so the
   // first-in wins behaviour correctly biases the crawl.
-  discoveryStats.nav = queue.enqueueMany(navOnly, { depth, priority: 8, source: "nav" });
-  discoveryStats.linkRels = queue.enqueueMany(linkRelUrls, { depth, priority: 7, source: "linkRel" });
+  discoveryStats.nav      = queue.enqueueMany(navOnly,           { depth, priority: 8, source: "nav" });
+  discoveryStats.linkRels = queue.enqueueMany(linkRelUrls,       { depth, priority: 7, source: "linkRel" });
 
   // CMS-API tier (priority 6) — structured-data sources that tend to be
   // comprehensive and high-signal. Recorded before hreflang so the raw
@@ -2796,7 +2472,7 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   // chronological) and 70% to sitemap (typically complete site index),
   // with bucket-sampling on the sitemap so sections aren't starved.
   const remainingAfterHighPrio = Math.max(0, queue.maxUrls - queue.total);
-  const feedBudget = Math.min(feedUrls.length, Math.ceil(remainingAfterHighPrio * 0.3));
+  const feedBudget    = Math.min(feedUrls.length, Math.ceil(remainingAfterHighPrio * 0.3));
   const sitemapBudget = Math.max(0, remainingAfterHighPrio - feedBudget);
 
   discoveryStats.feedRaw = feedUrls.length;
@@ -2838,78 +2514,9 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
   }
 }
 
-async function scanInNewTab(url, collectNextLinks = false, { queue = null } = {}) {
-  const tab = await createWorkerTab(url); // v0.4.3 — opens in the minimized crawler window
-  let inFlightClaimKey = null; // see _inFlightSettleUrls comment
-  try {
-    await waitForTabComplete(tab.id, TAB_TIMEOUT_MS);
-
-    // v12 fix — pre-sleep in-flight check (mirror of inventoryInNewTab).
-    if (queue) {
-      let currentUrl = null;
-      try {
-        const t = await chrome.tabs.get(tab.id);
-        currentUrl = t?.url || null;
-      } catch { }
-      if (currentUrl) {
-        const keyUrl = canonicalize(currentUrl) || currentUrl;
-        if (queue.hasSettled(keyUrl, url)) {
-          console.log(`[EU] pre-sleep dedup skip: ${url} → ${keyUrl} (already scanned)`);
-          return { __skipped: "pre-sleep-already-scanned", settledUrl: keyUrl, title: "" };
-        }
-        if (_inFlightSettleUrls.has(keyUrl)) {
-          console.log(`[EU] pre-sleep dedup skip: ${url} → ${keyUrl} (in flight on another tab)`);
-          return { __skipped: "pre-sleep-in-flight", settledUrl: keyUrl, title: "" };
-        }
-        _inFlightSettleUrls.add(keyUrl);
-        inFlightClaimKey = keyUrl;
-      }
-    }
-
-    await adaptiveSettle(tab.id);
-
-    // Settled-URL dedup (post-settle so JS redirects have fired).
-    if (queue) {
-      const settledUrl = await waitForUrlSettle(tab.id);
-      console.log(`[EU] worker settled: queued=${url}  → settled=${settledUrl}`);
-      if (settledUrl && queue.hasSettled(settledUrl, url)) {
-        console.log(`[EU] dedup skip: ${url} → ${settledUrl} (already scanned)`);
-        return { __skipped: "redirect-to-duplicate", settledUrl, title: "" };
-      }
-      if (settledUrl) queue.markSettled(settledUrl, url);
-    }
-
-    await injectAxe(tab.id);
-    const r = await runContentScan(tab.id);
-    // v0.4.4 — rendered-DOM soft-404 check (SPA-safe).
-    const soft404 = await checkRendered404(tab.id);
-    if (soft404) r.soft404 = soft404;
-
-    // Capture screenshots (full-page and highlighted element clips) if enabled.
-    let screenshot = null;
-    if (ACTIVE_SCREENSHOTS) {
-      try {
-        screenshot = await captureFullPageScreenshot(tab.id, r?.violations || null);
-      } catch (err) {
-        console.warn(`[EU] screenshot failed for worker ${url}:`, err?.message || err);
-      }
-    }
-    r.screenshot = screenshot;
-    if (collectNextLinks) {
-      try {
-        r.links = await collectNavLinks(tab.id);
-        console.log(`[EU]   ${url} → ${r.links.length} link(s)`);
-      } catch (err) {
-        console.warn(`[EU]   ${url} → collect failed`, err);
-        r.links = [];
-      }
-    }
-    return r;
-  } finally {
-    if (inFlightClaimKey) _inFlightSettleUrls.delete(inFlightClaimKey);
-    try { await chrome.tabs.remove(tab.id); } catch { }
-  }
-}
+// v0.4.8 — scanInNewTab (the lighter axe-only crawl worker) removed along
+// with scanMulti. All crawl modes now use inventoryInNewTab, which runs the
+// same audit stack plus template fingerprint / content signals / screenshots.
 
 async function injectAxe(tabId) {
   // Inject axe-core + our custom check bundles together. They attach to
@@ -3013,7 +2620,7 @@ function computeTemplateFingerprintInline() {
     (function walk(node) {
       if (!node || visited > WALK_CAP) return;
       if (typeof node.querySelectorAll !== "function") return;
-      try { for (const el of node.querySelectorAll(selector)) out.push(el); } catch { }
+      try { for (const el of node.querySelectorAll(selector)) out.push(el); } catch {}
       const children = node.querySelectorAll("*");
       for (const el of children) {
         visited++;
@@ -3035,25 +2642,25 @@ function computeTemplateFingerprintInline() {
     return d;
   };
   const sig = [];
-  const landmarkTags = ["header", "nav", "main", "article", "aside", "footer", "section", "form", "dialog", "details", "summary", "figure", "figcaption", "table", "thead", "tbody", "tfoot", "h1", "h2", "h3", "h4", "h5", "h6"];
+  const landmarkTags = ["header","nav","main","article","aside","footer","section","form","dialog","details","summary","figure","figcaption","table","thead","tbody","tfoot","h1","h2","h3","h4","h5","h6"];
   for (const tag of landmarkTags) {
     for (const el of qsaDeep(tag)) {
       const d = depthBucket(depthOf(el));
       const k = bucket(el.children ? el.children.length : 0);
-      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}:k=${k}`);
+      sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}:d=${d}:k=${k}`);
     }
   }
   for (const el of qsaDeep("[role]")) {
     const d = depthBucket(depthOf(el));
-    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role") || ""}:${firstClasses(el, 3)}:d=${d}`);
+    sig.push(`${el.tagName.toLowerCase()}:${el.getAttribute("role")||""}:${firstClasses(el,3)}:d=${d}`);
   }
-  const hCounts = [1, 2, 3, 4, 5, 6].map(n => qsaDeep(`h${n}`).length);
+  const hCounts = [1,2,3,4,5,6].map(n => qsaDeep(`h${n}`).length);
   sig.push("H:" + hCounts.join("-"));
-  const LAYOUT = ["layout", "template", "container", "wrapper", "grid", "flex", "row", "col-", "block", "module", "widget", "component", "page-", "content"];
+  const LAYOUT = ["layout","template","container","wrapper","grid","flex","row","col-","block","module","widget","component","page-","content"];
   const seen = new Set();
   for (const p of LAYOUT) {
     for (const el of qsaDeep(`[class*="${p}" i]`)) {
-      const k = `${el.tagName.toLowerCase()}::${firstClasses(el, 3)}:k=${bucket(el.children ? el.children.length : 0)}`;
+      const k = `${el.tagName.toLowerCase()}::${firstClasses(el,3)}:k=${bucket(el.children?el.children.length:0)}`;
       if (!seen.has(k)) { seen.add(k); sig.push(k); }
     }
   }
@@ -3061,10 +2668,10 @@ function computeTemplateFingerprintInline() {
 
   const clusterUrl = (href) => {
     let u; try { u = new URL(href); } catch { return "unknown"; }
-    const path = u.pathname.toLowerCase().replace(/^\/+|\/+$/g, "");
+    const path = u.pathname.toLowerCase().replace(/^\/+|\/+$/g,"");
     const parts = path.split("/").filter(Boolean);
     if (!parts.length) return "home";
-    const last = parts[parts.length - 1];
+    const last = parts[parts.length-1];
     if (/[0-9a-f]{8}-[0-9a-f]{4}/.test(last) || /^\d+$/.test(last) || /\d{4}[/-]\d{2}/.test(path)) return `/${parts[0]}/[dynamic-id]`;
     if (parts.length >= 3) return `/${parts[0]}/${parts[1]}/[detail]`;
     if (parts.length === 2) return `/${parts[0]}/${parts[1]}`;
@@ -3132,6 +2739,81 @@ function handleError(payload, sender) {
 // exporter handle serialisation. No truncation anywhere.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Media & document inventory — one flat row per item detected across the
+// corpus, plus corpus-level summary counts. v0.4.8 — extracted from
+// buildReport so buildInventory can produce the same mediaRows shape (which
+// the PDF / Office structural-audit enrichers and the classic report's
+// Media & Documents section both consume).
+function collectMediaRows(pages) {
+  const mediaRows = [];
+  const mediaSummary = {
+    videos: 0, audios: 0, iframeVideos: 0, documents: 0,
+    pdf: 0, spreadsheet: 0, document: 0, presentation: 0,
+    videoIssues: 0, audioIssues: 0, iframeIssues: 0, documentIssues: 0
+  };
+
+  for (const p of pages) {
+    const pageUrl = p.url;
+    // Keeps the per-item issue list (as emitted by media-checks.js) so the
+    // renderer can group findings under the item and the CSV can expose
+    // them as a pipe list.
+    const mi = p.mediaInventory;
+    if (!mi || typeof mi !== "object") continue;
+    const pushItem = (kindKey, it, extras) => {
+      mediaSummary[kindKey]++;
+      mediaSummary[`${kindKey === "iframeVideos" ? "iframe" : kindKey === "videos" ? "video" : kindKey === "audios" ? "audio" : "document"}Issues`] += (it.issues || []).length;
+      mediaRows.push({
+        url: pageUrl,
+        page_title: p.title || "",
+        kind: extras.kind,
+        subtype: it.subtype || "",
+        type_label: extras.typeLabel,
+        family: it.family || "",
+        media_url: it.url || "",
+        accessible_name: it.accessibleName || "",
+        link_text: it.linkText || "",
+        context: it.context || "",
+        selector: it.selector || "",
+        has_captions: it.hasCaptions ?? "",
+        has_descriptions: it.hasDescriptions ?? "",
+        has_controls: it.hasControls ?? "",
+        autoplay: it.autoplay ?? "",
+        muted: it.muted ?? "",
+        has_transcript: it.hasTranscript ?? "",
+        has_type_hint: it.hasTypeHint ?? "",
+        has_size_hint: it.hasSizeHint ?? "",
+        opens_in_new_tab: it.opensInNewTab ?? "",
+        has_new_tab_notice: it.hasNewTabNotice ?? "",
+        title_attr: it.title || it.titleAttr || "",
+        aria_label: it.ariaLabel || "",
+        duration_seconds: it.durationSeconds ?? "",
+        vendor_label: it.vendorLabel || "",
+        tracks: it.tracks || [],
+        issues: it.issues || [],
+        issue_count: (it.issues || []).length,
+        html_snippet: it.html || ""
+      });
+    };
+    for (const v of mi.videos || []) {
+      pushItem("videos", v, { kind: "video", typeLabel: "HTML5 Video" });
+    }
+    for (const a of mi.audios || []) {
+      pushItem("audios", a, { kind: "audio", typeLabel: "HTML5 Audio" });
+    }
+    for (const f of mi.iframeVideos || []) {
+      pushItem("iframeVideos", f, { kind: "iframe-video", typeLabel: f.vendorLabel || "Embedded Video" });
+    }
+    for (const d of mi.documents || []) {
+      pushItem("documents", d, { kind: "document", typeLabel: d.typeLabel || d.subtype || "Document" });
+      // Per-family rollup count so the summary tile can show "12 PDFs, 3 Excels".
+      const fam = d.family || "document";
+      if (mediaSummary[fam] != null) mediaSummary[fam]++;
+    }
+  }
+
+  return { mediaRows, mediaSummary };
+}
+
 function buildReport(pages, meta) {
   const issueRows = [];
   const passRows = [];
@@ -3139,12 +2821,7 @@ function buildReport(pages, meta) {
   const inapplicableRows = [];
   const checkRows = [];   // one row per {node × check-slot × check} — the deepest detail
   const envRows = [];     // per-page axe test engine / environment / toolOptions
-  const mediaRows = [];   // one row per media / document item detected across the corpus
-  const mediaSummary = {
-    videos: 0, audios: 0, iframeVideos: 0, documents: 0,
-    pdf: 0, spreadsheet: 0, document: 0, presentation: 0,
-    videoIssues: 0, audioIssues: 0, iframeIssues: 0, documentIssues: 0
-  };
+  const { mediaRows, mediaSummary } = collectMediaRows(pages);
 
   // Criterion scope is driven by the selected profile / WCAG version, so the
   // summary + per-profile conformance tables reflect exactly the SCs actually
@@ -3267,10 +2944,10 @@ function buildReport(pages, meta) {
             wcag_name: crit.name,
             // Cross-framework clause references (null when SC isn't covered
             // by that framework — Section 508 pre-WCAG-2.1 carve-outs etc).
-            is17802_clause: xref?.is17802 || "",
-            en301549_clause: xref?.en301549 || "",
-            section508_ref: xref?.section508 || "",
-            ada_ref: xref?.ada || "",
+            is17802_clause:   xref?.is17802    || "",
+            en301549_clause:  xref?.en301549   || "",
+            section508_ref:   xref?.section508 || "",
+            ada_ref:          xref?.ada        || "",
             rule_id: v.ruleId,
             rule_impact: v.impact || "",
             rule_description: v.description || "",
@@ -3284,7 +2961,6 @@ function buildReport(pages, meta) {
             xpath: (n.xpath || []).join(" "),
             html_snippet: n.html || "",
             failure_summary: n.failureSummary || "",
-            elementShotId: n.elementShotId || "",
             help_url: v.helpUrl || "",
             checks_any: n.any || [],
             checks_all: n.all || [],
@@ -3306,63 +2982,6 @@ function buildReport(pages, meta) {
       if (!failed.has(c.num)) {
         const st = criterionStats.get(c.num);
         if (st && !p.error) st.pagesPassed.add(pageUrl);
-      }
-    }
-
-    // Media & document inventory — one flat row per item. Keeps the per-item
-    // issue list (as emitted by media-checks.js) so the renderer can group
-    // findings under the item and the CSV can expose them as a pipe list.
-    const mi = p.mediaInventory;
-    if (mi && typeof mi === "object") {
-      const pushItem = (kindKey, it, extras) => {
-        mediaSummary[kindKey]++;
-        mediaSummary[`${kindKey === "iframeVideos" ? "iframe" : kindKey === "videos" ? "video" : kindKey === "audios" ? "audio" : "document"}Issues`] += (it.issues || []).length;
-        mediaRows.push({
-          url: pageUrl,
-          page_title: p.title || "",
-          kind: extras.kind,
-          subtype: it.subtype || "",
-          type_label: extras.typeLabel,
-          family: it.family || "",
-          media_url: it.url || "",
-          accessible_name: it.accessibleName || "",
-          link_text: it.linkText || "",
-          context: it.context || "",
-          selector: it.selector || "",
-          has_captions: it.hasCaptions ?? "",
-          has_descriptions: it.hasDescriptions ?? "",
-          has_controls: it.hasControls ?? "",
-          autoplay: it.autoplay ?? "",
-          muted: it.muted ?? "",
-          has_transcript: it.hasTranscript ?? "",
-          has_type_hint: it.hasTypeHint ?? "",
-          has_size_hint: it.hasSizeHint ?? "",
-          opens_in_new_tab: it.opensInNewTab ?? "",
-          has_new_tab_notice: it.hasNewTabNotice ?? "",
-          title_attr: it.title || it.titleAttr || "",
-          aria_label: it.ariaLabel || "",
-          duration_seconds: it.durationSeconds ?? "",
-          vendor_label: it.vendorLabel || "",
-          tracks: it.tracks || [],
-          issues: it.issues || [],
-          issue_count: (it.issues || []).length,
-          html_snippet: it.html || ""
-        });
-      };
-      for (const v of mi.videos || []) {
-        pushItem("videos", v, { kind: "video", typeLabel: "HTML5 Video" });
-      }
-      for (const a of mi.audios || []) {
-        pushItem("audios", a, { kind: "audio", typeLabel: "HTML5 Audio" });
-      }
-      for (const f of mi.iframeVideos || []) {
-        pushItem("iframeVideos", f, { kind: "iframe-video", typeLabel: f.vendorLabel || "Embedded Video" });
-      }
-      for (const d of mi.documents || []) {
-        pushItem("documents", d, { kind: "document", typeLabel: d.typeLabel || d.subtype || "Document" });
-        // Per-family rollup count so the summary tile can show "12 PDFs, 3 Excels".
-        const fam = d.family || "document";
-        if (mediaSummary[fam] != null) mediaSummary[fam]++;
       }
     }
   }
@@ -3494,8 +3113,8 @@ function buildReport(pages, meta) {
     }
     const conformance = applicable === 0 ? "N/A" :
       failed === 0 ? "Fully conformant" :
-        failed < applicable * 0.1 ? "Partially conformant (≥90% SCs pass)" :
-          "Does not conform";
+      failed < applicable * 0.1 ? "Partially conformant (≥90% SCs pass)" :
+      "Does not conform";
     return {
       profile_key: key,
       profile_label: p.label,
@@ -3535,13 +3154,7 @@ function sumNodes(rules) {
 async function downloadReportXlsx(reportId) {
   const report = await getReport(reportId);
   if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
-  let thumbnails = null;
-  try {
-    thumbnails = await buildThumbnailMap(report);
-  } catch (err) {
-    console.warn("[EU] report thumbnail pipeline failed — emitting xlsx without previews", err);
-  }
-  const blob = await buildReportXlsx(report, { thumbnails });
+  const blob = await buildReportXlsx(report);
   const dataUrl = await blobToDataUrl(blob);
   const host = safeHost(report.meta.seedUrl);
   const stamp = report.meta.generatedAt.replace(/[:.]/g, "-");
@@ -3704,18 +3317,7 @@ chrome.windows.onRemoved.addListener((winId) => {
 
 async function openCrawlerWindow() {
   try {
-    // We create the window off-screen so it does not obstruct the user's workspace,
-    // but in 'normal' state so that Chrome continues rendering content.
-    // Minimizing the window causes Chrome to halt page composition, making screenshots fail/timeout.
-    const win = await chrome.windows.create({
-      url: "about:blank",
-      focused: false,
-      state: "normal",
-      left: -9999,
-      top: -9999,
-      width: 1280,
-      height: 960
-    });
+    const win = await chrome.windows.create({ url: "about:blank", focused: false, state: "minimized" });
     _crawlerWindowId = win.id;
     console.log(`[EU] crawler window opened (id=${win.id})`);
   } catch (err) {
@@ -3728,7 +3330,7 @@ async function closeCrawlerWindow() {
   if (_crawlerWindowId == null) return;
   const id = _crawlerWindowId;
   _crawlerWindowId = null;
-  try { await chrome.windows.remove(id); } catch { }
+  try { await chrome.windows.remove(id); } catch {}
 }
 
 async function createWorkerTab(url) {
@@ -3758,7 +3360,7 @@ function checkpointCrawl(pages, meta) {
 }
 
 function clearCheckpoint() {
-  chrome.storage.local.remove(CHECKPOINT_KEY).catch(() => { });
+  chrome.storage.local.remove(CHECKPOINT_KEY).catch(() => {});
 }
 
 // Rebuild an inventory report from the last mid-crawl checkpoint. Invoked
@@ -3802,7 +3404,7 @@ async function adaptiveSettle(tabId) {
           obs = new MutationObserver(() => { lastMutation = Date.now(); });
           obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
         } catch { /* observer refused — the min/max timers below still apply */ }
-        const finish = () => { try { obs && obs.disconnect(); } catch { } resolve(); };
+        const finish = () => { try { obs && obs.disconnect(); } catch {} resolve(); };
         (function tick() {
           const now = Date.now();
           if (now - start >= maxMs) return finish();
@@ -3858,6 +3460,6 @@ function waitForTabComplete(tabId, timeoutMs) {
         chrome.tabs.onUpdated.removeListener(handler);
         resolve();
       }
-    }).catch(() => { });
+    }).catch(() => {});
   });
 }

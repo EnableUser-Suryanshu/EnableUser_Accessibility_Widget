@@ -9,8 +9,8 @@ at scan time, so it is always the truth for that specific run.
 
 The popup reads the checkboxes, saves them as your new defaults, and sends the
 scan message to the background service worker. Default recipe (first run):
-axe ✓ · media ✓ · PDF/Office ✓ · visual-states ✓ · dismiss overlays ✓ ·
-audit both ✓ · real pages only ✓ · broken-link detector ✓ · screenshots ✗.
+axe ✓ · media ✗ · PDF/Office ✗ · visual-states ✗ · dismiss overlays ✗ ·
+audit both ✗ · real pages only ✓ · broken-link detector ✓ · screenshots ✗.
 
 ## 1. Seed scan (your current tab)
 
@@ -62,10 +62,11 @@ link to it + anchor text) for the broken-link check in step 7.
 ## 5. Per-page audit (inside each tab)
 
 In order:
-1. Overlay dismissal (cookie/consent/modal) if enabled.
+1. Overlay dismissal (cookie/consent/modal) if enabled (default OFF).
 2. **axe-core 4.12.1** with the profile's WCAG tag set (2.0/2.1/2.2 A/AA).
-3. **Audit both** (default ON): a second axe pass so both the overlay-present
-   and overlay-dismissed states are covered. This doubles per-page audit time.
+3. **Audit both** (default OFF): a second axe pass so both the overlay-present
+   and overlay-dismissed states are covered. The extra pass only runs on pages
+   where an overlay was actually dismissed — plain pages get a single pass.
 4. Custom suites, all merged into the same violations/incomplete stream:
    - **india-checks** (if enabled): script/lang mismatches, RTL, per-passage lang.
    - **media-checks**: video captions/autoplay, audio transcripts, embed titles,

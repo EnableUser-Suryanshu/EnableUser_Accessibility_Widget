@@ -29,92 +29,6 @@ function stringifyData(d) {
   try { return JSON.stringify(d, null, 2); } catch { return String(d); }
 }
 
-const BLANK_IMG =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-
-async function readScreenshotFromStorage(id) {
-  try {
-    const key = `shot:${id}`;
-    const stored = await chrome.storage.local.get(key);
-    return stored[key] || null;
-  } catch (err) {
-    console.warn("[EU] storage.local read failed for screenshot", id, err);
-    return null;
-  }
-}
-
-const screenshotObserver = ("IntersectionObserver" in window)
-  ? new IntersectionObserver((entries, obs) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const img = entry.target;
-        obs.unobserve(img);
-        loadScreenshot(img);
-      }
-    }, { rootMargin: "400px 0px" })
-  : null;
-
-async function loadScreenshot(img) {
-  const id = img.getAttribute("data-shot-id");
-  if (!id || img.getAttribute("data-loaded") === "1") return;
-  img.setAttribute("data-loaded", "loading");
-  try {
-    let entry = await readScreenshotFromStorage(id);
-    if (!entry?.dataUrl) {
-      const res = await send({ type: "GET_SCREENSHOT", id });
-      if (res?.ok && res.dataUrl) entry = { dataUrl: res.dataUrl };
-    }
-    if (entry?.dataUrl) {
-      img.src = entry.dataUrl;
-      img.setAttribute("data-loaded", "1");
-    } else {
-      img.setAttribute("data-loaded", "error");
-      img.alt = "screenshot unavailable";
-      img.classList.add("screenshot-missing");
-    }
-  } catch (err) {
-    console.warn("[EU] screenshot fetch failed", err);
-    img.setAttribute("data-loaded", "error");
-  }
-}
-
-function renderScreenshot(shot, caption) {
-  if (!shot?.id) return null;
-  const wrap = el("div", { class: "screenshot-wrap" });
-  wrap.appendChild(el("div", { class: "check-group-label" }, [caption || "Full-page screenshot"]));
-  const img = el("img", {
-    class: "screenshot-thumb",
-    src: BLANK_IMG,
-    "data-shot-id": shot.id,
-    alt: "full-page screenshot (loading)"
-  });
-  img.addEventListener("click", () => {
-    img.classList.toggle("expanded");
-    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
-  });
-  wrap.appendChild(img);
-  if (screenshotObserver) screenshotObserver.observe(img);
-  else loadScreenshot(img);
-  return wrap;
-}
-
-function renderElementShot(id) {
-  if (!id) return el("span", { class: "muted" }, ["—"]);
-  const img = el("img", {
-    class: "screenshot-thumb element-shot-thumb",
-    src: BLANK_IMG,
-    "data-shot-id": id,
-    alt: "issue element screenshot (loading)"
-  });
-  img.addEventListener("click", () => {
-    img.classList.toggle("expanded");
-    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
-  });
-  if (screenshotObserver) screenshotObserver.observe(img);
-  else loadScreenshot(img);
-  return img;
-}
-
 // Render a check group (any/all/none) as a small table — every field
 // axe reports per check is surfaced: id, impact, message, data, relatedNodes.
 function renderCheckGroup(label, checks) {
@@ -222,7 +136,7 @@ function renderNodeDetails(i) {
   const res = await send({ type: "GET_REPORT", reportId });
   const report = res?.report;
   if (!report) {
-    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>This report could not be found or is no longer stored in local storage. Run a new scan from the popup.</p></div>";
+    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>This report is no longer stored — only the last 5 reports are kept. Run a new scan from the popup. (Since v0.4.8 reports survive browser restarts; if you see this on a fresh report, reload the extension and re-scan.)</p></div>";
     return;
   }
 
@@ -379,6 +293,7 @@ function renderNodeDetails(i) {
   renderMediaSection(report);
 
   // ── Pages table (expand to show scan metadata) ──
+  renderPageStatusTiles(report.pagesRows);
   const pagesBody = document.querySelector("#pages-table tbody");
   for (const p of report.pagesRows) {
     const a = el("a", { href: p.url, target: "_blank", rel: "noopener" }, [p.url]);
@@ -390,7 +305,7 @@ function renderNodeDetails(i) {
       el("td", {}, [p.source || ""]),
       el("td", {}, [p.template_id || ""]),
       el("td", {}, [p.url_cluster || ""]),
-      el("td", {}, [p.status]),
+      statusCell(classifyPageStatus(p)),
       el("td", {}, [String(p.violations)]),
       el("td", {}, [String(p.passes)]),
       el("td", {}, [String(p.incomplete)]),
@@ -427,32 +342,6 @@ function renderNodeDetails(i) {
     pagesBody.appendChild(detailRow);
   }
 
-  // ── Screenshots ──
-  const screenshotsSection = document.getElementById("screenshots-section");
-  const screenshotsGrid = document.getElementById("screenshots-grid");
-  if (screenshotsSection && screenshotsGrid) {
-    let count = 0;
-    for (const p of report.pages || []) {
-      if (p.screenshot?.id) {
-        count++;
-        const card = el("div", { class: "screenshot-card" });
-        const caption = el("div", { class: "screenshot-caption" }, [
-          el("div", { class: "screenshot-title" }, [p.title || "Untitled"]),
-          el("a", { class: "screenshot-url", href: p.url, target: "_blank", rel: "noopener" }, [p.url])
-        ]);
-        card.appendChild(caption);
-        const imgWrap = renderScreenshot(p.screenshot);
-        if (imgWrap) {
-          card.appendChild(imgWrap);
-          screenshotsGrid.appendChild(card);
-        }
-      }
-    }
-    if (count > 0) {
-      screenshotsSection.classList.remove("hidden");
-    }
-  }
-
   // ── Violations / Issues ──
   const issuesBody = document.querySelector("#issues-table tbody");
   for (const i of report.issueRows) {
@@ -465,11 +354,10 @@ function renderNodeDetails(i) {
     mainRow.appendChild(el("td", {}, [i.wcag_level]));
     mainRow.appendChild(el("td", {}, [i.rule_id]));
     mainRow.appendChild(el("td", { class: `impact-${i.impact || "minor"}` }, [i.impact || ""]));
-    mainRow.appendChild(el("td", { class: "element-shot-cell" }, [renderElementShot(i.elementShotId)]));
     mainRow.appendChild(el("td", {}, [i.failure_summary || i.wcag_name || i.rule_description || ""]));
 
     const detailRow = el("tr", { class: "issue-detail-row" });
-    const detailCell = el("td", { colspan: "7" });
+    const detailCell = el("td", { colspan: "6" });
     detailCell.appendChild(renderNodeDetails(i));
     detailRow.appendChild(detailCell);
 
@@ -591,6 +479,47 @@ function renderNodeDetails(i) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
 })();
+
+// Classify a scanned page by outcome — clean completion (0 violations),
+// completed with issues, or unreachable. pagesRows carry status ("scanned"
+// /"failed"), an optional error string, and a numeric violation count.
+function classifyPageStatus(p) {
+  if (p.error || p.status === "failed") {
+    return { key: "unreachable", label: "Unreachable", cls: "status-fail",
+             title: p.error ? `Not reachable — ${p.error}` : "Page could not be scanned" };
+  }
+  const violations = Number(p.violations) || 0;
+  if (violations > 0) {
+    return { key: "issues", label: "Issues", cls: "status-warn",
+             title: `Scan completed — ${violations} violation${violations === 1 ? "" : "s"} found` };
+  }
+  return { key: "clean", label: "Clean", cls: "status-ok",
+           title: "Scan completed successfully — 0 violations" };
+}
+
+function statusCell(s) {
+  return el("td", {}, [
+    el("span", { class: `status-pill ${s.cls}`, title: s.title }, [s.label])
+  ]);
+}
+
+// Roll-up tiles above the Pages table: how many pages completed, how many were
+// clean, how many still have issues, and how many were never reachable.
+function renderPageStatusTiles(pagesRows) {
+  const host = document.getElementById("pages-status-tiles");
+  if (!host) return;
+  let clean = 0, issues = 0, unreachable = 0;
+  for (const p of pagesRows || []) {
+    const k = classifyPageStatus(p).key;
+    if (k === "clean") clean++;
+    else if (k === "issues") issues++;
+    else unreachable++;
+  }
+  host.appendChild(makeStat("Completed", clean + issues, "ok"));
+  host.appendChild(makeStat("Clean (0 issues)", clean, "ok"));
+  host.appendChild(makeStat("With issues", issues, issues > 0 ? "warn" : ""));
+  host.appendChild(makeStat("Unreachable", unreachable, unreachable > 0 ? "fail" : ""));
+}
 
 function makeStat(label, value, cls = "") {
   const e = document.createElement("div");

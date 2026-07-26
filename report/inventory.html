@@ -15,6 +15,7 @@
           <button id="btn-download-xlsx">Download Inventory (.xlsx)</button>
           <button id="btn-download-html">Download Standalone HTML</button>
           <button id="btn-download-shots-zip">Download Screenshots (ZIP)</button>
+          <button id="btn-open-classic">Open Classic Report (criterion tables + CSV / JSON)</button>
         </div>
       </div>
     </header>
@@ -66,11 +67,12 @@
               <span id="pages-url-status" class="muted" aria-live="polite"></span>
             </div>
           </div>
-          <p class="hint">Full inventory. Click a row to expand element counts, actual component values (form fields, modal titles, tab labels, menu items), audit findings, and the full-page screenshot. <strong>Auditable URLs</strong> = successful scans only (errors, shell/soft-404 pages, and content-hash duplicates excluded).</p>
+          <p class="hint">Full inventory. Click a row to expand element counts, actual component values (form fields, modal titles, tab labels, menu items), audit findings, and the full-page screenshot. The <strong>Status</strong> column shows each page's scan outcome — <em>Clean</em> (completed, 0 violations), <em>Issues</em> (completed, violations found), or <em>Unreachable</em> (could not be scanned). <strong>Auditable URLs</strong> = successful scans only (errors, shell/soft-404 pages, and content-hash duplicates excluded).</p>
+          <div class="stats page-status-tiles" id="pages-status-tiles"></div>
           <table id="pages-table">
             <thead>
               <tr>
-                <th>URL</th><th>Template</th><th>Type</th>
+                <th>URL</th><th>Status</th><th>Template</th><th>Type</th>
                 <th>Depth</th><th>Source</th>
                 <th>Violations</th><th>Incomplete</th>
                 <th>Forms</th><th>Tables</th><th>Modals</th>

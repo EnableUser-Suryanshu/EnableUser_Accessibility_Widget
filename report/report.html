@@ -1,229 +1,167 @@
 <!doctype html>
 <html>
-
-<head>
-  <meta charset="utf-8" />
-  <title>Accessibility Report — EnableUser</title>
-  <link rel="stylesheet" href="report.css" />
-</head>
-
-<body>
-  <header>
-    <div class="wrap">
-      <h1>EnableUser Accessibility Report</h1>
-      <p class="meta" id="meta"></p>
-      <div class="actions">
-        <button id="btn-download" class="primary">Download CSV</button>
-        <button id="btn-download-xlsx">Download Excel</button>
-        <button id="btn-download-json">Download JSON (full payload)</button>
+  <head>
+    <meta charset="utf-8" />
+    <title>Accessibility Report — EnableUser</title>
+    <link rel="stylesheet" href="report.css" />
+  </head>
+  <body>
+    <header>
+      <div class="wrap">
+        <h1>EnableUser Accessibility Report</h1>
+        <p class="meta" id="meta"></p>
+        <div class="actions">
+          <button id="btn-download" class="primary">Download CSV</button>
+          <button id="btn-download-xlsx">Download Excel</button>
+          <button id="btn-download-json">Download JSON (full payload)</button>
+        </div>
       </div>
-    </div>
-  </header>
+    </header>
 
-  <main class="wrap">
-    <section id="summary-section">
-      <h2>Summary</h2>
-      <div class="stats" id="stats"></div>
-    </section>
+    <main class="wrap">
+      <section id="summary-section">
+        <h2>Summary</h2>
+        <div class="stats" id="stats"></div>
+      </section>
 
-    <section>
-      <h2 id="summary-heading">WCAG 2.1 AA — Criterion Status</h2>
-      <table id="summary-table">
-        <thead>
-          <tr>
-            <th>Criterion</th>
-            <th>Level</th>
-            <th>Name</th>
-            <th>Status</th>
-            <th>Pages Passed</th>
-            <th>Pages Failed</th>
-            <th>Total Violations</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2 id="summary-heading">WCAG 2.1 AA — Criterion Status</h2>
+        <table id="summary-table">
+          <thead>
+            <tr>
+              <th>Criterion</th><th>Level</th><th>Name</th><th>Status</th>
+              <th>Pages Passed</th><th>Pages Failed</th><th>Total Violations</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section id="profiles-section">
-      <h2>Conformance by Standard</h2>
-      <p class="hint">Each WCAG 2.1 SC is cross-referenced to IS 17802, EN 301 549, Section 508, and ADA. Click a row to
-        see which clauses fail.</p>
-      <table id="profiles-table">
-        <thead>
-          <tr>
-            <th>Profile</th>
-            <th>Applicable SCs</th>
-            <th>Passed</th>
-            <th>Failed</th>
-            <th>Violations</th>
-            <th>Conformance</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section id="profiles-section">
+        <h2>Conformance by Standard</h2>
+        <p class="hint">Each WCAG 2.1 SC is cross-referenced to IS 17802, EN 301 549, Section 508, and ADA. Click a row to see which clauses fail.</p>
+        <table id="profiles-table">
+          <thead>
+            <tr>
+              <th>Profile</th><th>Applicable SCs</th><th>Passed</th><th>Failed</th>
+              <th>Violations</th><th>Conformance</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Templates</h2>
-      <p class="hint">Pages sharing the same DOM fingerprint and URL shape are grouped into templates. Click a row to
-        see the pages in that template.</p>
-      <table id="templates-table">
-        <thead>
-          <tr>
-            <th>Template</th>
-            <th>URL Cluster</th>
-            <th>Pages</th>
-            <th>Sample URL</th>
-            <th>Violations</th>
-            <th>Critical</th>
-            <th>Serious</th>
-            <th>Moderate</th>
-            <th>Minor</th>
-            <th>Unique Rules</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Templates</h2>
+        <p class="hint">Pages sharing the same DOM fingerprint and URL shape are grouped into templates. Click a row to see the pages in that template.</p>
+        <table id="templates-table">
+          <thead>
+            <tr>
+              <th>Template</th><th>URL Cluster</th><th>Pages</th><th>Sample URL</th>
+              <th>Violations</th><th>Critical</th><th>Serious</th><th>Moderate</th><th>Minor</th><th>Unique Rules</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Pages Scanned</h2>
-      <p class="hint">Click a row to expand scan metadata (axe version, duration, template signals, element counts).</p>
-      <table id="pages-table">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Depth</th>
-            <th>Source</th>
-            <th>Template</th>
-            <th>URL Cluster</th>
-            <th>Status</th>
-            <th>Violations</th>
-            <th>Passes</th>
-            <th>Incomplete</th>
-            <th>Inapplicable</th>
-            <th>Error</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Pages Scanned</h2>
+        <p class="hint">Click a row to expand scan metadata (axe version, duration, template signals, element counts). The <strong>Status</strong> column shows each page's scan outcome — <em>Clean</em> (completed, 0 violations), <em>Issues</em> (completed, violations found), or <em>Unreachable</em> (could not be scanned).</p>
+        <div class="stats page-status-tiles" id="pages-status-tiles"></div>
+        <table id="pages-table">
+          <thead>
+            <tr>
+              <th>URL</th><th>Depth</th><th>Source</th><th>Template</th><th>URL Cluster</th>
+              <th>Status</th><th>Violations</th><th>Passes</th><th>Incomplete</th><th>Inapplicable</th><th>Error</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section id="media-section">
-      <h2>Media &amp; Documents <span class="muted" id="media-count"></span></h2>
-      <p class="hint">Every &lt;video&gt;, &lt;audio&gt;, embedded YouTube / Vimeo / Wistia player, and linked PDF /
-        Excel / Word / PowerPoint detected on the scanned pages. Captions, audio-description, autoplay, accessible name,
-        link-purpose, file-type and size hints are validated automatically. Each linked document is also flagged as
-        requiring a manual audit of its own content (tagging, alt text, table headers, reading order) — a web crawler
-        cannot audit the file itself.</p>
-      <div class="media-tiles" id="media-tiles"></div>
-      <div class="media-filters" id="media-filters"></div>
-      <table id="media-table">
-        <thead>
-          <tr>
-            <th>Type</th>
-            <th>URL / Source</th>
-            <th>Name / Link text</th>
-            <th>Page</th>
-            <th>Issues</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section id="media-section">
+        <h2>Media &amp; Documents <span class="muted" id="media-count"></span></h2>
+        <p class="hint">Every &lt;video&gt;, &lt;audio&gt;, embedded YouTube / Vimeo / Wistia player, and linked PDF / Excel / Word / PowerPoint detected on the scanned pages. Captions, audio-description, autoplay, accessible name, link-purpose, file-type and size hints are validated automatically. Each linked document is also flagged as requiring a manual audit of its own content (tagging, alt text, table headers, reading order) — a web crawler cannot audit the file itself.</p>
+        <div class="media-tiles" id="media-tiles"></div>
+        <div class="media-filters" id="media-filters"></div>
+        <table id="media-table">
+          <thead>
+            <tr>
+              <th>Type</th><th>URL / Source</th><th>Name / Link text</th><th>Page</th><th>Issues</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Violations</h2>
-      <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and
-        the complete any/all/none check results with messages and related nodes.</p>
-      <table id="issues-table">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>WCAG</th>
-            <th>Level</th>
-            <th>Rule</th>
-            <th>Impact</th>
-            <th>Screenshot</th>
-            <th>Summary</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Violations</h2>
+        <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and the complete any/all/none check results with messages and related nodes.</p>
+        <table id="issues-table">
+          <thead>
+            <tr>
+              <th>URL</th><th>WCAG</th><th>Level</th><th>Rule</th><th>Impact</th><th>Summary</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Incomplete <span class="muted" id="incomplete-count"></span></h2>
-      <p class="hint">Rules axe could not fully evaluate — usually needs manual review. Click a row to expand.</p>
-      <table id="incomplete-table">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Rule</th>
-            <th>Impact</th>
-            <th>Tags</th>
-            <th>Description</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Incomplete <span class="muted" id="incomplete-count"></span></h2>
+        <p class="hint">Rules axe could not fully evaluate — usually needs manual review. Click a row to expand.</p>
+        <table id="incomplete-table">
+          <thead>
+            <tr>
+              <th>URL</th><th>Rule</th><th>Impact</th><th>Tags</th><th>Description</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Passes <span class="muted" id="passes-count"></span></h2>
-      <p class="hint">Rules axe ran and the node satisfied. Collapsed by default. Click <a href="#"
-          id="toggle-passes">show / hide</a>.</p>
-      <table id="passes-table" class="hidden">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Rule</th>
-            <th>Tags</th>
-            <th>Description</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Passes <span class="muted" id="passes-count"></span></h2>
+        <p class="hint">Rules axe ran and the node satisfied. Collapsed by default. Click <a href="#" id="toggle-passes">show / hide</a>.</p>
+        <table id="passes-table" class="hidden">
+          <thead>
+            <tr>
+              <th>URL</th><th>Rule</th><th>Tags</th><th>Description</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Inapplicable <span class="muted" id="inapplicable-count"></span></h2>
-      <p class="hint">Rules axe checked but found no applicable nodes on the page. Collapsed by default. Click <a
-          href="#" id="toggle-inapplicable">show / hide</a>.</p>
-      <table id="inapplicable-table" class="hidden">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Rule</th>
-            <th>Tags</th>
-            <th>Description</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
+      <section>
+        <h2>Inapplicable <span class="muted" id="inapplicable-count"></span></h2>
+        <p class="hint">Rules axe checked but found no applicable nodes on the page. Collapsed by default. Click <a href="#" id="toggle-inapplicable">show / hide</a>.</p>
+        <table id="inapplicable-table" class="hidden">
+          <thead>
+            <tr>
+              <th>URL</th><th>Rule</th><th>Tags</th><th>Description</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
 
-    <section>
-      <h2>Scan Environment</h2>
-      <p class="hint">axe-core engine, browser, and window state for each page scanned.</p>
-      <table id="env-table">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>axe Version</th>
-            <th>Duration (ms)</th>
-            <th>Started</th>
-            <th>Window</th>
-            <th>Orientation</th>
-            <th>User Agent</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </section>
-  </main>
+      <section>
+        <h2>Scan Environment</h2>
+        <p class="hint">axe-core engine, browser, and window state for each page scanned.</p>
+        <table id="env-table">
+          <thead>
+            <tr>
+              <th>URL</th><th>axe Version</th><th>Duration (ms)</th><th>Started</th>
+              <th>Window</th><th>Orientation</th><th>User Agent</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
 
-  <script src="report.js"></script>
-</body>
-
+    <script src="report.js"></script>
+  </body>
 </html>

@@ -35,19 +35,33 @@ const DEFAULT_PROFILE = "wcag21aa";
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
 const VALID_PROFILES = ["wcag21aa", "wcag22aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "defaultsVer"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
   if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
   const c = s?.checks || {};
+  // v0.4.8 (rev 50) — one-time migration to the new default recipe: axe-core
+  // only. Media, PDF/Office, visual-state checks, overlay dismissal, and
+  // audit-both are all opt-in (default OFF). Preferences saved under the old
+  // defaults would otherwise pin the old recipe forever; after this runs
+  // once, whatever the operator ticks is saved and wins as usual.
+  if (s?.defaultsVer !== 50) {
+    c.media = false;
+    c.pdfOffice = false;
+    c.visual = false;
+    if (s) { s.dismissOverlays = false; s.auditBoth = false; }
+    chrome.storage?.local.set({ defaultsVer: 50 }).catch(() => {});
+  }
   if (chkAxe) chkAxe.checked = c.axe !== false;
   if (chkIndia) chkIndia.checked = c.india === true;
   if (chkIs17802) chkIs17802.checked = c.is17802 === true;
+  // v0.4.8 — media, PDF/Office, and visual-state checks plus overlay
+  // dismissal + audit-both are all opt-in (default OFF). Saved prefs win.
   if (chkMedia) chkMedia.checked = c.media === true;
   if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice === true;
-  if (chkVisual) chkVisual.checked = c.visual !== false;
-  if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
-  if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
+  if (chkVisual) chkVisual.checked = c.visual === true;
+  if (chkDismiss) chkDismiss.checked = s?.dismissOverlays === true;
+  if (chkAuditBoth) chkAuditBoth.checked = s?.auditBoth === true;
   // v0.4.5 — operator's default recipe: screenshots stay opt-in; real-pages
   // discovery is now the default (linked pages only, no sitemap/feed junk).
   if (chkScreenshots) chkScreenshots.checked = s?.screenshots === true;
@@ -80,9 +94,9 @@ function readScanOptions() {
     axe: chkAxe ? chkAxe.checked : true,
     india: chkIndia ? chkIndia.checked : true,
     is17802: chkIs17802 ? chkIs17802.checked : true,
-    media: chkMedia ? chkMedia.checked : true,
-    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : true,
-    visual: chkVisual ? chkVisual.checked : true
+    media: chkMedia ? chkMedia.checked : false,
+    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : false,
+    visual: chkVisual ? chkVisual.checked : false
   };
   const dismissOverlays = chkDismiss ? chkDismiss.checked : false;
   const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;
