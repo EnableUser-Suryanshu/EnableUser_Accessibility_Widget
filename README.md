@@ -19,7 +19,9 @@ for the full inventory and what was deliberately left behind.
 - **Excel** carries previews in three places: inline on each Violations row (the
   sheet auditors actually work in), on the Pages sheet, and on the dedicated
   Issue Screenshots sheet, which adds Impact / Success Criteria context and caps
-  at 300 images.
+  at 300 images. The **classic-report** workbook now carries them too — it
+  previously embedded no images at all, so exporting via "Open Classic Report"
+  silently dropped every screenshot the crawl had captured.
 - **Lazy-loaded content is now captured.** Before each capture the layout
   viewport is expanded to the full document height, which fires every
   `IntersectionObserver` on the page; we then wait for images to settle (bounded
@@ -54,9 +56,17 @@ Also in v0.5.0:
   both the classic report and the inventory.
 - **Reproject a crawl into the classic report** with no rescan — the inventory
   already holds the full axe payload.
+- **Release notes moved to [CHANGELOG.md](CHANGELOG.md).** They had been living
+  in the `manifest.json` `description` field, which had grown to ~6300
+  characters; Chrome documents a 132-character limit there and enforces it at
+  Web Store submission.
 - `test/viewer-harness/` — headless-Chrome harness for the report viewer, since
   Chrome 137+ blocks `--load-extension` and the extension's own
   `chrome.debugger` calls conflict with any external CDP driver.
+- `test/xlsx-drawings.test.mjs` — builds real workbooks in Node and asserts the
+  OOXML image plumbing, where an off-by-one silently points a preview at the
+  wrong screenshot rather than failing loudly. Run with
+  `node test/xlsx-drawings.test.mjs`.
 
 ## v0.4.8 — reports persist (no more "Report expired")
 

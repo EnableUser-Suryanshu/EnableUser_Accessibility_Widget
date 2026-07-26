@@ -2606,10 +2606,14 @@ async function buildThumbnailMap(inventory) {
   // issue-specific element screenshots referenced by violation nodes.
   const ids = [];
   const seen = new Set();
+  // Accepts either shape: inventory pages nest axe output under `audit`, while
+  // report pages (including ones reprojected by inventoryPagesToReportPages)
+  // carry `violations` at the top level. Handling both lets the classic-report
+  // workbook reuse this instead of duplicating the collection logic.
   for (const p of (inventory?.pages || [])) {
     if (p.error) continue;
     if (p.screenshot?.id && !seen.has(p.screenshot.id)) { seen.add(p.screenshot.id); ids.push(p.screenshot.id); }
-    for (const v of (p.audit?.violations || [])) {
+    for (const v of (p.violations || p.audit?.violations || [])) {
       for (const n of (v.nodes || [])) {
         if (n.elementShotId && !seen.has(n.elementShotId)) { seen.add(n.elementShotId); ids.push(n.elementShotId); }
       }
@@ -3357,6 +3361,10 @@ function buildReport(pages, meta) {
     depth: p.depth ?? "",
     source: p.source || "",
     status: p.error ? "failed" : "scanned",
+    // Handle to this page's full-page screenshot, so the Excel Pages sheet can
+    // embed the preview. The report viewer reads p.screenshot off report.pages
+    // instead; pagesRows is the flattened table/export shape and only needs the id.
+    screenshot_id: p.screenshot?.id || "",
     violations: sumNodes(p.violations),
     passes: sumNodes(p.passes),
     incomplete: sumNodes(p.incomplete),
@@ -3506,7 +3514,18 @@ function sumNodes(rules) {
 async function downloadReportXlsx(reportId) {
   const report = await getReport(reportId);
   if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
-  const blob = await buildReportXlsx(report);
+  // Thumbnail the screenshots this report references so the workbook carries
+  // the same evidence the on-screen report shows. Before this, exporting a
+  // report — including one reprojected from a crawl via Open Classic Report —
+  // silently dropped every screenshot. Returns null when the scan ran with
+  // screenshots off, and buildReportXlsx then emits the plain workbook.
+  let thumbnails = null;
+  try {
+    thumbnails = await buildThumbnailMap(report);
+  } catch (err) {
+    console.warn("[EU] report thumbnails failed — exporting without previews:", err?.message || err);
+  }
+  const blob = await buildReportXlsx(report, { thumbnails });
   const dataUrl = await blobToDataUrl(blob);
   const host = safeHost(report.meta.seedUrl);
   const stamp = report.meta.generatedAt.replace(/[:.]/g, "-");

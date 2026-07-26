@@ -131,17 +131,21 @@ coordinates were only correct *because* its override was active.
 
 ## Known rough edges
 
-- **`manifest.json` description is ~6300 characters.** Chrome's documented limit
-  is 132, enforced when publishing to the Web Store. This predates v0.5.0 (the
-  previous local description was 4686 chars, main's 4173) and loading unpacked
-  tolerates it, but it must be cut to a real one-liner before any Web Store
-  submission, with the changelog moved here or to the README.
-- **The classic-report Excel has no previews.** `buildReportXlsx` builds its
-  Violations sheet from `report.issueRows` via `objRowsToSheet` and embeds no
-  images; only the inventory workbook carries them. Reprojecting a crawl via
-  "Open Classic Report" and exporting from there therefore loses the previews.
 - **`package.json` still says `0.1.0`.** It has been out of step with the
   manifest for a long time; nothing reads it, but it is misleading.
+
+Both of the following were found while shipping v0.5.0 and have since been
+fixed:
+
+- ~~`manifest.json` description is ~6300 characters~~ — Chrome documents a
+  132-character limit on that field and enforces it at Web Store submission.
+  The changelog now lives in [CHANGELOG.md](CHANGELOG.md) and the description is
+  a 125-character one-liner.
+- ~~The classic-report Excel has no previews~~ — `buildReportXlsx` embedded no
+  images at all, so reprojecting a crawl through "Open Classic Report" and
+  exporting silently dropped every screenshot the crawl had captured. It now
+  takes the same `thumbnails` map as the inventory workbook and embeds previews
+  on both Violations and Pages.
 
 ---
 

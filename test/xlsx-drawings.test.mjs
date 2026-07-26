@@ -18,7 +18,7 @@ import { fileURLToPath } from "url";
 import { execFileSync } from "child_process";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const { buildInventoryXlsx } = await import(join(HERE, "..", "lib", "xlsx-writer.js"));
+const { buildInventoryXlsx, buildReportXlsx } = await import(join(HERE, "..", "lib", "xlsx-writer.js"));
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -140,6 +140,64 @@ check("no drawing or media parts without thumbnails",
   !/drawing\d+\.xml/.test(noEntries) && !/xl\/media/.test(noEntries));
 check("Violations header unchanged without thumbnails (starts at URL)",
   headerRow(noThumbs, 2)[0] === "URL", headerRow(noThumbs, 2).join(" | "));
+
+// ── Classic-report workbook (buildReportXlsx) ──
+// Until v0.5.0 this carried no imagery at all, so reprojecting a crawl through
+// "Open Classic Report" and exporting silently dropped every screenshot.
+console.log("");
+
+const report = {
+  meta: {
+    mode: "multi", seedUrl: "https://example.test/", generatedAt: new Date(0).toISOString(),
+    totalPages: 2, totalTemplates: 1, profileLabel: "WCAG 2.1 AA", wcagVersion: "2.1"
+  },
+  summaryRows: [], profilesRows: [], templatesRows: [], mediaRows: [], envRows: [],
+  passRows: [], incompleteRows: [], inapplicableRows: [], checkRows: [],
+  issueRows: [
+    { url: "https://example.test/", page_title: "Home", rule_id: "image-alt", impact: "critical", elementShotId: "shot-el-1" },
+    { url: "https://example.test/", page_title: "Home", rule_id: "color-contrast", impact: "serious", elementShotId: "shot-el-2" },
+    // No shot: must still emit a row, with an empty Preview cell.
+    { url: "https://example.test/two", page_title: "Two", rule_id: "link-name", impact: "serious", elementShotId: "" }
+  ],
+  pagesRows: [
+    { url: "https://example.test/", page_title: "Home", status: "scanned", violations: 2, screenshot_id: "shot-p1" },
+    { url: "https://example.test/two", page_title: "Two", status: "scanned", violations: 1, screenshot_id: "shot-p2" }
+  ],
+  pages: []
+};
+
+const reportWith = join(dir, "report-with-thumbs.xlsx");
+const reportNo = join(dir, "report-no-thumbs.xlsx");
+writeFileSync(reportWith, Buffer.from(await (await buildReportXlsx(report, { thumbnails })).arrayBuffer()));
+writeFileSync(reportNo, Buffer.from(await (await buildReportXlsx(report)).arrayBuffer()));
+
+check("classic report is a valid zip", intact(reportWith));
+const rNames = [...part(reportWith, "xl/workbook.xml").matchAll(/name="([^"]+)"/g)].map(m => m[1]);
+const rIdx1 = n => rNames.indexOf(n) + 1;
+const rEntries = list(reportWith);
+const rImages = [...rEntries.matchAll(/xl\/media\/(image\d+\.png)/g)].map(m => m[1]);
+check("classic report embeds 4 images (2 element crops + 2 page shots)",
+  rImages.length === 4, `got ${rImages.length}`);
+check("classic report Violations rels -> drawing1 (images 1..2)",
+  part(reportWith, `xl/worksheets/_rels/sheet${rIdx1("Violations")}.xml.rels`).includes("drawing1.xml") &&
+  [...part(reportWith, "xl/drawings/_rels/drawing1.xml.rels").matchAll(/image\d+\.png/g)].map(m => m[0]).join(",") === "image1.png,image2.png");
+check("classic report Pages rels -> drawing2 (images 3..4)",
+  part(reportWith, `xl/worksheets/_rels/sheet${rIdx1("Pages")}.xml.rels`).includes("drawing2.xml") &&
+  [...part(reportWith, "xl/drawings/_rels/drawing2.xml.rels").matchAll(/image\d+\.png/g)].map(m => m[0]).join(",") === "image3.png,image4.png");
+check("classic report Violations header starts with Preview",
+  headerRow(reportWith, rIdx1("Violations"))[0] === "Preview", headerRow(reportWith, rIdx1("Violations")).join(" | "));
+check("classic report Pages header starts with Preview",
+  headerRow(reportWith, rIdx1("Pages"))[0] === "Preview", headerRow(reportWith, rIdx1("Pages")).join(" | "));
+// The finding with no elementShotId must not shift or drop a row.
+check("row count preserved when a finding has no screenshot",
+  (part(reportWith, `xl/worksheets/sheet${rIdx1("Violations")}.xml`).match(/<row /g) || []).length === 4,
+  `rows incl. header: ${(part(reportWith, `xl/worksheets/sheet${rIdx1("Violations")}.xml`).match(/<row /g) || []).length}`);
+
+check("classic report without thumbnails is a valid zip", intact(reportNo));
+check("classic report without thumbnails emits no drawings or media",
+  !/drawing\d+\.xml/.test(list(reportNo)) && !/xl\/media/.test(list(reportNo)));
+check("classic report header unchanged without thumbnails",
+  headerRow(reportNo, rIdx1("Violations"))[0] === "URL", headerRow(reportNo, rIdx1("Violations")).join(" | "));
 
 console.log(`\n${failures === 0 ? "all checks passed" : failures + " check(s) FAILED"}`);
 process.exit(failures === 0 ? 0 : 1);
