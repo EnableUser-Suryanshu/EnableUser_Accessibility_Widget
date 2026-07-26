@@ -1384,13 +1384,136 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+// Measure the true document box. Several sources disagree on real pages
+// (transformed wrappers, absolutely-positioned footers, SPA roots that size
+// themselves late), so take the max of everything credible. The backwards scan
+// over the last 600 elements catches footers that outrun every scrollHeight.
+const PAGE_METRICS_EXPR = `(function() {
+  var heights = [
+    window.innerHeight,
+    document.body ? document.body.scrollHeight : 0,
+    document.documentElement ? document.documentElement.scrollHeight : 0,
+    document.body ? document.body.offsetHeight : 0,
+    document.documentElement ? document.documentElement.offsetHeight : 0
+  ];
+  try {
+    var wrappers = document.querySelectorAll('#root, #__next, [id*="app"], main, body > div');
+    for (var i = 0; i < wrappers.length; i++) {
+      heights.push(wrappers[i].scrollHeight || 0);
+      heights.push(wrappers[i].offsetHeight || 0);
+    }
+  } catch(e) {}
+  try {
+    var all = document.getElementsByTagName('*');
+    var maxBottom = 0, len = all.length, limit = Math.max(0, len - 600);
+    for (var i = len - 1; i >= limit; i--) {
+      var rect = all[i].getBoundingClientRect();
+      var bottom = rect.bottom + window.scrollY;
+      if (bottom > maxBottom && rect.width > 0 && rect.height > 0) maxBottom = bottom;
+    }
+    heights.push(maxBottom);
+  } catch(e) {}
+  return {
+    width: Math.ceil(window.innerWidth) | 0,
+    height: Math.ceil(Math.max.apply(null, heights)) | 0,
+    viewportHeight: Math.ceil(window.innerHeight) | 0,
+    dpr: window.devicePixelRatio || 1
+  };
+})()`;
+
+// Poll until every <img> has settled. Expanding the layout viewport to the whole
+// document makes every IntersectionObserver on the page fire at once, so
+// lazy-loaded images START loading here — capturing immediately would freeze
+// them mid-fetch as blank placeholders. Bounded: a page with a permanently
+// pending image must not stall the crawl.
+const LAZY_SETTLE_MAX_MS = 4_000;
+const LAZY_SETTLE_POLL_MS = 250;
+const IMAGES_SETTLED_EXPR = `(function(){
+  try {
+    var imgs = document.getElementsByTagName('img');
+    for (var i = 0; i < imgs.length; i++) {
+      if (!imgs[i].complete) return false;
+    }
+    return true;
+  } catch(e) { return true; }
+})()`;
+
+// Height of the document beyond which we don't expand the viewport. A 2x
+// scale factor on a 20000px-tall page is a multi-hundred-MB compositor
+// surface; Chrome either tiles it badly or the renderer dies.
+const MAX_OVERRIDE_HEIGHT = 20_000;
+
 async function captureFullPageScreenshot(tabId, violations = null) {
   const target = { tabId };
   let attached = false;
+  let overridden = false;
   try {
     await withTimeout(chrome.debugger.attach(target, "1.3"), DEBUGGER_ATTACH_TIMEOUT_MS, "debugger.attach");
     attached = true;
     await withTimeout(chrome.debugger.sendCommand(target, "Page.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Page.enable");
+    await withTimeout(chrome.debugger.sendCommand(target, "Runtime.enable"), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.enable");
+
+    // Expand the layout viewport to the full document height before capturing.
+    //
+    // captureBeyondViewport:true already reaches below-the-fold content, but it
+    // does NOT cause lazy-loaded content to render: an image whose
+    // IntersectionObserver never fired is still a placeholder in the capture, so
+    // evidence screenshots of long pages came back with blank hero images.
+    // Making the viewport cover the document fires every observer, then we wait
+    // for the images to actually arrive.
+    //
+    // Height only — the width stays exactly as the tab already had it. Forcing a
+    // width (as the screenshot branch did, clamping to 800-1920) silently
+    // crosses responsive breakpoints, so the evidence would show a layout no
+    // real user at that window size sees. Wrong evidence is worse than none.
+    let metrics = null;
+    try {
+      const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+        expression: PAGE_METRICS_EXPR, returnByValue: true
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(pageMetrics)");
+      metrics = evalRes?.result?.value || null;
+    } catch (err) {
+      console.warn("[EU] page metrics failed — capturing without viewport expansion:", err?.message || err);
+    }
+
+    // Only worth doing when there IS content below the fold. On a page that
+    // already fits, expanding the viewport changes nothing and just costs a
+    // relayout plus the settle wait.
+    if (metrics && metrics.width > 0 && metrics.height > metrics.viewportHeight) {
+      const height = Math.min(Math.max(600, metrics.height), MAX_OVERRIDE_HEIGHT);
+      if (metrics.height > MAX_OVERRIDE_HEIGHT) {
+        console.warn(`[EU] page is ${metrics.height}px tall — clamping capture viewport to ${MAX_OVERRIDE_HEIGHT}px`);
+      }
+      try {
+        await withTimeout(chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", {
+          width: metrics.width,
+          height,
+          // Keep the tab's real DPR so evidence stays sharp on HiDPI, but drop
+          // to 1 once the surface gets big enough that 2x risks the renderer.
+          deviceScaleFactor: (metrics.width * height > 8_000_000) ? 1 : (metrics.dpr || 1),
+          mobile: false
+        }), DEBUGGER_CMD_TIMEOUT_MS, "Emulation.setDeviceMetricsOverride");
+        overridden = true;
+      } catch (err) {
+        console.warn("[EU] viewport expansion failed — capturing as-is:", err?.message || err);
+      }
+    }
+
+    if (overridden) {
+      const deadline = Date.now() + LAZY_SETTLE_MAX_MS;
+      while (Date.now() < deadline) {
+        let settled = true;
+        try {
+          const r = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+            expression: IMAGES_SETTLED_EXPR, returnByValue: true
+          }), 5_000, "Runtime.evaluate(imagesSettled)");
+          settled = r?.result?.value !== false;
+        } catch { settled = true; }
+        if (settled) break;
+        await new Promise(r => setTimeout(r, LAZY_SETTLE_POLL_MS));
+      }
+    }
+
     const result = await withTimeout(
       chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
         format: "png",
@@ -1412,9 +1535,17 @@ async function captureFullPageScreenshot(tabId, violations = null) {
     // highlighted shot of each distinct violating element. Mutates the
     // violation nodes in place, tagging each with elementShotId so the report
     // and the Excel can show the issue exactly where it occurs.
+    //
+    // `overridden` is passed as skipScroll: with the layout viewport expanded to
+    // the whole document there is nothing to scroll (scrollX/scrollY are pinned
+    // at 0 and every element is already "in view"), so scrollIntoView is a
+    // no-op at best. Skipping it also avoids perturbing a page we've already
+    // settled. Note the crop maths in elementHighlightExpr uses PAGE
+    // coordinates, which stay correct either way — with the override, scrollX/Y
+    // are 0 so page and viewport coordinates coincide.
     if (Array.isArray(violations) && violations.length) {
       try {
-        const n = await captureElementShotsInSession(target, violations);
+        const n = await captureElementShotsInSession(target, violations, overridden);
         if (n) console.log(`[EU] captured ${n} element screenshot(s)`);
       } catch (err) {
         console.warn("[EU] element screenshots failed:", err?.message || err);
@@ -1422,6 +1553,18 @@ async function captureFullPageScreenshot(tabId, violations = null) {
     }
     return shot;
   } finally {
+    // Restore the real viewport BEFORE detaching. This matters most for
+    // scanCurrent, which runs against the operator's own visible tab — leaving
+    // a 12000px-tall emulated viewport behind would leave their page visibly
+    // broken. Detaching without clearing does not reliably reset it.
+    if (overridden) {
+      try {
+        await withTimeout(chrome.debugger.sendCommand(target, "Emulation.clearDeviceMetricsOverride"),
+          DEBUGGER_CMD_TIMEOUT_MS, "Emulation.clearDeviceMetricsOverride");
+      } catch (err) {
+        console.warn("[EU] failed to clear viewport override:", err?.message || err);
+      }
+    }
     if (attached) {
       try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {}
     }
@@ -1449,7 +1592,10 @@ const ELEMENT_SHOT_PAINT_MS = 150;
 // screenshot per DISTINCT violating element. Deduped by selector and capped so
 // a page with hundreds of nodes can't explode storage/time. Tags each matched
 // violation node with `elementShotId`. Returns the number captured.
-async function captureElementShotsInSession(target, violations) {
+// skipScroll is set when the caller has expanded the layout viewport to cover
+// the whole document: every element is already in view, scrollX/scrollY are
+// pinned at 0, and scrolling would only disturb a page we just settled.
+async function captureElementShotsInSession(target, violations, skipScroll = false) {
   const selToNodes = new Map();
   for (const v of violations) {
     for (const n of (v.nodes || [])) {
@@ -1467,15 +1613,18 @@ async function captureElementShotsInSession(target, violations) {
   // violating element. That was invisible while element shots only ran in
   // throwaway worker tabs, but scanCurrent runs against the operator's OWN
   // visible tab — leaving their page yanked to the bottom is user-visible
-  // damage. Restored in the finally below.
+  // damage. Restored in the finally below. Pointless when skipScroll is set,
+  // since nothing scrolls.
   let originalScroll = null;
-  try {
-    const scrollEval = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `({ x: window.scrollX, y: window.scrollY })`, returnByValue: true
-    }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(getScroll)");
-    originalScroll = scrollEval?.result?.value;
-  } catch (err) {
-    console.warn("[EU] could not read scroll position — will not restore:", err?.message || err);
+  if (!skipScroll) {
+    try {
+      const scrollEval = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+        expression: `({ x: window.scrollX, y: window.scrollY })`, returnByValue: true
+      }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(getScroll)");
+      originalScroll = scrollEval?.result?.value;
+    } catch (err) {
+      console.warn("[EU] could not read scroll position — will not restore:", err?.message || err);
+    }
   }
 
   let captured = 0;
@@ -1483,7 +1632,7 @@ async function captureElementShotsInSession(target, violations) {
     for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
       try {
         const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-          expression: elementHighlightExpr(sel), returnByValue: true
+          expression: elementHighlightExpr(sel, skipScroll), returnByValue: true
         }), DEBUGGER_CMD_TIMEOUT_MS, "Runtime.evaluate(highlight)");
         const rect = evalRes?.result?.value;
         if (!rect || !rect.ok) { await clearElementHighlight(target); continue; }
@@ -1550,15 +1699,18 @@ function elementSelectorOf(node) {
 // The crop is centred on the element and grown to ELEMENT_SHOT_MIN_W/H so a
 // small target still ships with legible surrounding context, then clamped to
 // the document box so we never ask for a negative or off-page region.
-function elementHighlightExpr(sel) {
+function elementHighlightExpr(sel, skipScroll = false) {
   return `(function(){
     try {
       var el = document.querySelector(${JSON.stringify(sel)});
       if (!el || !el.getBoundingClientRect) return { ok:false };
       // 'instant' so the scroll completes before we measure — a smooth scroll
-      // would still be animating and every rect below would be stale.
-      try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e){
-        try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e2){}
+      // would still be animating and every rect below would be stale. Skipped
+      // when the layout viewport already covers the whole document.
+      if (!${skipScroll ? "true" : "false"}) {
+        try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e){
+          try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e2){}
+        }
       }
       var r = el.getBoundingClientRect();
       if (!(r.width > 0 && r.height > 0)) return { ok:false };

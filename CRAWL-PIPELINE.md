@@ -81,7 +81,16 @@ In order:
    inventory and the Manual Checklist "Applies To" scoping.
 6. Rendered-DOM soft-404 check against the step-2 baseline.
 7. Template fingerprint (URL cluster + DOM simhash) for clustering.
-8. Screenshot — only if the screenshots checkbox is ON.
+8. Screenshot — only if the screenshots checkbox is ON. Three steps:
+   a. The layout viewport is expanded to the full document height (width left
+      alone, so responsive breakpoints don't shift). This fires every
+      `IntersectionObserver` on the page, which is what makes lazy-loaded
+      images below the fold actually load. Skipped when the page already fits.
+   b. Wait until every `<img>` reports `complete`, capped at 4 s — otherwise the
+      capture freezes lazy images mid-fetch as blank placeholders.
+   c. One full-page PNG, then one cropped + highlighted PNG per distinct
+      violating element (max 30 per page, 400×300 minimum crop so small targets
+      keep context). The viewport override is cleared before detaching.
 9. Links harvested for the queue (and the link graph), tab closed.
 
 ## 6. PDF / Office audits (after the crawl)

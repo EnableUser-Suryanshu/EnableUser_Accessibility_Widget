@@ -2,6 +2,62 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
+## v0.5.0 — screenshots end to end (and one codebase again)
+
+Two builds both called themselves v0.4.9: one added screenshot support, the other
+fixed paste-a-list concurrency and a batch of reporting work. Neither descended
+from the other. v0.5.0 is the unification — see [DIVERGENCE.md](DIVERGENCE.md)
+for the full inventory and what was deliberately left behind.
+
+**Screenshots now work from capture through to deliverable.**
+
+- **Report viewer** gains a Screenshots gallery and a Screenshot column in
+  Violations showing each offending element highlighted in place. Images load
+  lazily via `IntersectionObserver` — full-page PNGs run 1–3 MB, so a 200-page
+  crawl would otherwise push ~400 MB of base64 into the tab on open. Resolution
+  is storage-first, falling back to a message to the service worker.
+- **Excel** carries previews in three places: inline on each Violations row (the
+  sheet auditors actually work in), on the Pages sheet, and on the dedicated
+  Issue Screenshots sheet, which adds Impact / Success Criteria context and caps
+  at 300 images.
+- **Lazy-loaded content is now captured.** Before each capture the layout
+  viewport is expanded to the full document height, which fires every
+  `IntersectionObserver` on the page; we then wait for images to settle (bounded
+  at 4 s). `captureBeyondViewport` reaches below-the-fold content but never
+  triggers its lazy loading, so long pages used to capture blank hero images.
+  Width is left exactly as the tab had it — forcing a width would cross
+  responsive breakpoints and show a layout no real user at that size sees.
+- **Element crops are legible.** The highlight is drawn as an overlay box rather
+  than only an inline outline, because an outline is clipped by any ancestor with
+  `overflow: hidden` — precisely the containers that cause layout bugs. Crops
+  centre on the element and expand to a 400×300 minimum so a checkbox arrives
+  with context, and the original scroll position is restored afterwards.
+- **Single-page scans capture screenshots too.** Previously only the inventory
+  crawl did, so "Scan this page" produced findings with nothing to show a
+  stakeholder. This runs against your own visible tab, hence the scroll restore.
+- Screenshots referenced but no longer in storage now say so, instead of
+  rendering as a blank grey rectangle.
+
+Also in v0.5.0:
+
+- **Paste-a-list concurrency fixed.** The global cap was 200 — harmless on
+  single-origin crawls, where the 8-per-origin cap bound them, but on a
+  multi-domain paste list nothing held total tabs down. Pasting ~200 URLs opened
+  ~200 background tabs, collapsed Chrome's renderer/network pool, and reported
+  perfectly reachable links as unreachable. Global cap is now **10**;
+  single-origin crawls are unchanged at 8.
+- **WCAG 1.4.1 over-reporting fixed.** Link-in-text-block analysis now skips
+  nav / header / footer / breadcrumb / pagination chrome, and stays silent when
+  no stylesheet is readable (cross-origin CSS) rather than flagging every
+  colour-only link on the page.
+- **Per-page outcome** (Clean / Issues / Unreachable) with a summary tile row, in
+  both the classic report and the inventory.
+- **Reproject a crawl into the classic report** with no rescan — the inventory
+  already holds the full axe payload.
+- `test/viewer-harness/` — headless-Chrome harness for the report viewer, since
+  Chrome 137+ blocks `--load-extension` and the extension's own
+  `chrome.debugger` calls conflict with any external CDP driver.
+
 ## v0.4.8 — reports persist (no more "Report expired")
 
 Multi-page and single-page reports were held only in the service worker's memory; Chrome evicts an idle MV3 worker after ~30 s, after which the report tab showed "expired" and downloads failed. Reports now persist to chrome.storage.local (last 5 kept, older pruned) and are re-warmed on demand — the report tab, Excel, and CSV work indefinitely, across browser restarts. Viewer, Excel, and CSV all read the same persisted object, so what you see in the run result is exactly what lands in the Excel.

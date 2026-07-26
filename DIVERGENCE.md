@@ -43,9 +43,9 @@ no common ancestor recorded. Every comparison below was done by direct diff.
 | `report/report.js`, `report/report.html` | Report-viewer screenshot rendering | **Ported** in `8fe7d80`. Lazy `IntersectionObserver` loading, storage-first resolution with a `GET_SCREENSHOT` fallback, gallery section, Screenshot column in Violations. |
 | `background.js` | Element-shot quality: overlay box, `behavior:'instant'`, paint delay, 400×300 minimum context crop, scroll restore | **Ported** in `8fe7d80`, re-based onto page coordinates. |
 | `background.js` | Screenshot capture in `scanCurrent()` | **Ported** in `8fe7d80`. Single-page scans previously produced no imagery. |
-| `lib/xlsx-writer.js` | "Preview" column inline in the Violations sheet | **Not ported.** Equivalent capability, different layout — see Open decisions. |
-| `background.js` | `skipScroll` param | **Deliberately not ported.** Only meaningful alongside `Emulation.setDeviceMetricsOverride`, which this tree does not use. |
-| `background.js` | `Emulation.setDeviceMetricsOverride` in `captureFullPageScreenshot` | **Not ported.** Arrived together with the regression below. |
+| `lib/xlsx-writer.js` | "Preview" column inline in the Violations sheet | **Ported** in v0.5.0, alongside the dedicated sheet. |
+| `background.js` | `skipScroll` param | **Ported** in v0.5.0, once the viewport override gave it a meaning. |
+| `background.js` | `Emulation.setDeviceMetricsOverride` in `captureFullPageScreenshot` | **Concept ported, implementation rewritten** in v0.5.0 — height-only, plus a settle wait, and keeping the page capture main had lost. |
 
 Excel sheets are a strict superset locally: all 21 of main's sheets, plus
 "Issue Screenshots".
@@ -85,41 +85,73 @@ Two defects were also fixed on the local side during the port:
 
 ---
 
-## Open decisions
+## Decisions — settled in v0.5.0
 
-These are judgement calls, not defects. Nothing is blocked on them.
+**1. Default recipe — kept axe-only opt-in.** `main` enables media, PDF/Office,
+visual checks, overlay dismissal and audit-both by default; `audit both` alone
+doubles per-page audit time. The local `README.md` and `CRAWL-PIPELINE.md`
+already documented the opt-in defaults, so this tree is self-consistent —
+main's docs disagree with main's own code on this point.
 
-**1. Default recipe — keep axe-only opt-in, or main's everything-on?**
-The local tree defaults to axe-core only for scan speed; `main` enables media,
-PDF/Office, visual checks, overlay dismissal and audit-both by default for
-coverage. Recommend keeping the local default: `audit both` alone doubles
-per-page audit time. The local `README.md` and `CRAWL-PIPELINE.md` already
-document the opt-in defaults, so the tree is self-consistent — main's docs
-disagree with main's own code on this point.
+**2. Excel screenshot layout — took both.** The inline Preview column is now on
+the Violations sheet (main's approach) *and* the dedicated Issue Screenshots
+sheet is retained (this tree's), plus previews on Pages. Violations is the sheet
+auditors work in, so the preview belongs on the finding's own row; the dedicated
+sheet still earns its place by carrying Impact / Success Criteria context and
+enforcing the `MAX_ISSUE_SHOTS` cap. `drawingSpecs` already supported N sheets,
+so this was mechanical.
 
-**2. Excel screenshot layout — dedicated sheet, inline column, or both?**
-Local ships an "Issue Screenshots" sheet; `main` puts a "Preview" column
-directly in the Violations sheet. Both embed previews in the Pages sheet. The
-dedicated sheet carries more context per row and caps at 300 images.
-Recommend keeping it, and optionally adding main's inline Preview column as
-well — the two are additive, not conflicting.
+Note the same `shotId` is written once per drawing spec rather than shared —
+OOXML requires each drawing to own its image parts. Element crops are small and
+capped, so the duplication is cheap.
 
-**3. Full-page capture on very tall pages.** `main`'s device-metrics override
-expands the layout viewport to the whole document before capturing, which is
-a genuinely better approach for tall or lazy-loading pages than relying on
-`captureBeyondViewport` alone. The idea is worth taking even though main's
-implementation lost the capture call. Optional enhancement, not a fix.
+**3. Full-page capture on tall pages — took the idea, not the code.** The layout
+viewport is now expanded to the full document height before capture, which fires
+every `IntersectionObserver` and is what makes lazy-loaded below-the-fold content
+render. Two deliberate departures from main's version:
+
+- **Height only.** main forced width into an 800–1920 clamp, which silently
+  crosses responsive breakpoints — the evidence would then show a layout no user
+  at that window size sees. Wrong evidence is worse than none.
+- **A bounded wait for images to settle** (4 s) after expanding. main expanded
+  and captured immediately, which freezes lazy images mid-fetch — the capture
+  would show placeholders even though the expansion had triggered the loads.
+
+`deviceScaleFactor` keeps the tab's real DPR for sharpness, dropping to 1 once
+the surface exceeds ~8 MP so a 2× scale on a very tall page can't take the
+renderer down. Document height is clamped at 20000px.
+
+With the override active, `skipScroll` finally has a meaning and is wired up:
+scroll position is pinned at 0 and every element is in view, so `scrollIntoView`
+is pointless and would only disturb a page we just settled. The crop maths stays
+in **page** coordinates, which is correct either way — main's viewport
+coordinates were only correct *because* its override was active.
 
 ---
 
-## Path to one codebase
+## Known rough edges
 
-1. `port-viewer-screenshots` is the unified tree. Verify it in Chrome —
-   `test/viewer-harness/` covers the report viewer; the capture path
-   (`chrome.debugger`) still needs a manual run.
-2. Settle the open decisions above.
-3. Rewrite the `manifest.json` description to cover both feature sets, and
-   bump to **0.5.0** — the version carries two independent v0.4.9s plus fixes,
-   so reusing 0.4.9 would be a third meaning for the same number.
-4. Merge into `main` and tag. Keep `local-0.4.9` as the record of what the
-   out-of-git tree contained.
+- **`manifest.json` description is ~6300 characters.** Chrome's documented limit
+  is 132, enforced when publishing to the Web Store. This predates v0.5.0 (the
+  previous local description was 4686 chars, main's 4173) and loading unpacked
+  tolerates it, but it must be cut to a real one-liner before any Web Store
+  submission, with the changelog moved here or to the README.
+- **The classic-report Excel has no previews.** `buildReportXlsx` builds its
+  Violations sheet from `report.issueRows` via `objRowsToSheet` and embeds no
+  images; only the inventory workbook carries them. Reprojecting a crawl via
+  "Open Classic Report" and exporting from there therefore loses the previews.
+- **`package.json` still says `0.1.0`.** It has been out of step with the
+  manifest for a long time; nothing reads it, but it is misleading.
+
+---
+
+## Remaining work
+
+1. **Verify the capture path in Chrome.** This is the only real gap.
+   `test/viewer-harness/` covers the report viewer with 23 assertions, but
+   everything behind `chrome.debugger` — the viewport override, the settle wait,
+   the overlay box, the element crops, scroll restore, `scanCurrent` capture, and
+   the new Violations previews landing in the workbook — is unexercised. Load
+   unpacked, tick **Screenshots**, scan a long lazy-loading page.
+2. Merge into `main` and tag **v0.5.0**. Keep `local-0.4.9` as the record of what
+   the out-of-git tree contained.
