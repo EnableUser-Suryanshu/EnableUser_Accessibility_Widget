@@ -70,10 +70,14 @@ for (const [file, src, name] of [
 
 check("MAX_ELEMENT_SHOTS_PER_PAGE is gone from background.js",
   !/MAX_ELEMENT_SHOTS_PER_PAGE/.test(bg));
-check("element shots are bounded by time, not count",
-  /ELEMENT_SHOTS_BUDGET_MS/.test(bg) && /shotsDeadline/.test(bg));
-check("element-shot budget exhaustion is reported, not silent",
-  /skippedForBudget/.test(bg) && /budget exhausted/.test(bg));
+check("element shots are uncapped — no count or time budget",
+  !/ELEMENT_SHOTS_BUDGET_MS/.test(bg) && !/shotsDeadline/.test(bg));
+check("worker ceiling is screenshot-aware so uncapped shots cannot lose a page",
+  /WORKER_HARD_TIMEOUT_SHOTS_MS/.test(bg) && /function workerCeilingMs/.test(bg));
+check("the worker withTimeout uses the computed ceiling, not the bare constant",
+  /workerCeilingMs\(\),/.test(bg));
+check("partial element-shot capture is reported, not silent",
+  /distinct violating elements captured/.test(bg));
 
 // The specific inline slices/counters that used to truncate findings.
 const goneFromVisual = [

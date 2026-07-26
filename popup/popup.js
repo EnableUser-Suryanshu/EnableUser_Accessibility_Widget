@@ -20,6 +20,8 @@ const chkScreenshots = $("opt-screenshots");
 const chkLinksOnly = $("opt-links-only");
 const chkLinkCheck = $("opt-linkcheck");
 const btnRecover = $("btn-recover");
+const btnHighlight = $("btn-highlight");
+const btnClearHighlight = $("btn-clear-highlight");
 
 // First-run defaults — what the operator sees the first time they open the
 // popup with no stored preferences yet. WCAG 2.1 AA is the global baseline
@@ -163,6 +165,8 @@ function setBusy(busy) {
   if (btnInventory) btnInventory.disabled = busy;
   if (btnList) btnList.disabled = busy;
   if (btnRecover) btnRecover.disabled = busy;
+  if (btnHighlight) btnHighlight.disabled = busy;
+  if (btnClearHighlight) btnClearHighlight.disabled = busy;
 }
 
 // ── v0.4.3 — crash recovery ──────────────────────────────────────────────
@@ -223,6 +227,50 @@ btnCurrent.addEventListener("click", async () => {
   if (!res?.ok) { setStatus(res?.error || "Scan failed.", true); return; }
   setStatus("Opening report…");
   window.close();
+});
+
+// Annotate the current page in place. Unlike the scan buttons this deliberately
+// does NOT close the popup on success — the operator needs to read the result
+// line ("12 marked, 1 inside a nested frame") and may want the Remove button,
+// which only appears once something has been drawn.
+btnHighlight.addEventListener("click", async () => {
+  setStatus(null);
+  const tab = await getActiveTab();
+  if (!tab || !/^https?:/.test(tab.url || "")) {
+    setStatus("Open an http(s) page first.", true);
+    return;
+  }
+  const granted = await ensureHostPermission(tab.url);
+  if (!granted) { setStatus("Permission denied.", true); return; }
+
+  const opts = readScanOptions();
+  setBusy(true);
+  setStatus("Scanning this page for confirmed issues…");
+  const res = await send({ type: "HIGHLIGHT_ISSUES", tabId: tab.id, options: opts });
+  setBusy(false);
+  if (!res?.ok) { setStatus(res?.error || "Could not annotate this page.", true); return; }
+
+  if (!res.issues) {
+    setStatus("No confirmed violations on this page. (Needs-review findings are not drawn — run a full scan to see those.)");
+    btnClearHighlight.hidden = true;
+    return;
+  }
+  const bits = [`${res.issues} confirmed issue${res.issues === 1 ? "" : "s"} across ${res.rules} rule${res.rules === 1 ? "" : "s"}`];
+  if (res.unresolved) bits.push(`${res.unresolved} inside nested frames, listed but not marked`);
+  setStatus(`${bits.join(" · ")}. Annotations are on the page.`);
+  btnClearHighlight.hidden = false;
+});
+
+btnClearHighlight.addEventListener("click", async () => {
+  const tab = await getActiveTab();
+  if (!tab) return;
+  const res = await send({ type: "CLEAR_HIGHLIGHTS", tabId: tab.id });
+  if (res?.ok) {
+    btnClearHighlight.hidden = true;
+    setStatus("Annotations removed.");
+  } else {
+    setStatus(res?.error || "Could not remove annotations.", true);
+  }
 });
 
 btnMulti.addEventListener("click", async () => {

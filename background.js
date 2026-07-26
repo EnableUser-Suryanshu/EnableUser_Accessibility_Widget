@@ -83,6 +83,20 @@ const SETTLE_MAX_MS = 10_000;
 // force-abandon so the pool can move on instead of leaving the tab open
 // indefinitely. See withTimeout() below.
 const WORKER_HARD_TIMEOUT_MS = 150_000;
+// Screenshots change what "pathological" means. Element captures are uncapped —
+// every distinct violating element gets a crop — and each costs a debugger round
+// trip plus a paint wait, so a page with 300 violations legitimately needs a
+// couple of minutes. Under the 150s bound that page would be force-abandoned and
+// recorded as a bare error row with NO audit data, and it would increment
+// errorStreak; twenty of them trip ERROR_STREAK_LIMIT and stop the crawl
+// outright. Losing the audit in order to bound the screenshots is the wrong
+// trade, so screenshot runs get a looser ceiling instead of the shots getting a
+// cap. A genuinely stuck tab is still bounded, just later — and with 10 workers
+// in the pool, one slow tab does not stall the others.
+const WORKER_HARD_TIMEOUT_SHOTS_MS = 480_000;
+function workerCeilingMs() {
+  return ACTIVE_SCREENSHOTS ? WORKER_HARD_TIMEOUT_SHOTS_MS : WORKER_HARD_TIMEOUT_MS;
+}
 // Per-origin concurrency cap. CONCURRENT_TABS (10) is the GLOBAL worker
 // count; this caps how many of those may target the SAME host at once, so
 // a single-origin crawl can't slam one server's per-IP rate limit or
@@ -241,7 +255,7 @@ function settingsEcho(mode, { profile, maxUrls, crawlDepth } = {}) {
     "Page settle wait": `adaptive ${SETTLE_MIN_MS / 1000}–${SETTLE_MAX_MS / 1000}s (proceeds after ${SETTLE_QUIET_MS / 1000}s of DOM quiet)`,
     "Concurrency": `${CONCURRENT_TABS} tabs global / ${PER_ORIGIN_TABS} per origin`,
     "Tab load timeout": `${TAB_TIMEOUT_MS / 1000}s`,
-    "Worker hard timeout": `${WORKER_HARD_TIMEOUT_MS / 1000}s`
+    "Worker hard timeout": `${workerCeilingMs() / 1000}s${ACTIVE_SCREENSHOTS ? " (raised for screenshots)" : ""}`
   };
 }
 
@@ -422,6 +436,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "DOWNLOAD_INVENTORY_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "xlsx"));
       else if (msg.type === "DOWNLOAD_CLUSTERS_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "clusters"));
       else if (msg.type === "DOWNLOAD_AUDIT_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "audit"));
+      else if (msg.type === "HIGHLIGHT_ISSUES") sendResponse(await highlightIssuesOnTab(msg.tabId, msg.options));
+      else if (msg.type === "CLEAR_HIGHLIGHTS") sendResponse(await clearHighlightsOnTab(msg.tabId));
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (err) {
       console.error("[EU]", err);
@@ -447,6 +463,71 @@ async function getInventory(inventoryId) {
     }
   }
   return { ok: true, inventory };
+}
+
+// Annotate the operator's current tab in place with its CONFIRMED violations,
+// each carrying the offending markup and axe's remediation text.
+//
+// Deliberately re-runs axe rather than replaying selectors from a stored report.
+// A report can be minutes or days old; the page may have been edited, or be a
+// different render of the same URL, and a selector that no longer matches would
+// either mark the wrong element or silently vanish. Re-running costs a second and
+// guarantees every marker corresponds to a defect present right now.
+//
+// Only `violations` are passed to the overlay. Incomplete results are findings
+// axe could not prove — painting them on the page as defects is the
+// over-claiming this codebase avoids everywhere else.
+async function highlightIssuesOnTab(tabId, options) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!/^https?:/i.test(tab.url || "")) {
+    return { ok: false, error: "This page can't be scanned — open a normal http(s) page first." };
+  }
+
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  ACTIVE_AXE_TAGS = tagsForProfile(profile);
+  ACTIVE_CHECKS = checksFromOptions(options);
+  ACTIVE_DISMISS = !!(options && options.dismissOverlays);
+  ACTIVE_AUDIT_BOTH = !!(options && options.auditBoth);
+  // Never capture while highlighting: this is the operator's visible tab and the
+  // point is an instant annotation, not a report.
+  ACTIVE_SCREENSHOTS = false;
+
+  const result = await scanInExistingTab(tabId);
+  const violations = result?.violations || [];
+
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    files: ["lib/issue-overlay.js"],
+    world: "ISOLATED"
+  });
+  const [{ result: stats }] = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: false },
+    world: "ISOLATED",
+    func: (v) => (window.EU_IssueOverlay ? window.EU_IssueOverlay.render(v) : null),
+    args: [violations]
+  });
+
+  const nodeCount = violations.reduce((n, r) => n + (r.nodes || []).length, 0);
+  return {
+    ok: true,
+    rules: violations.length,
+    issues: nodeCount,
+    marked: stats?.marked ?? 0,
+    unresolved: stats?.unresolved ?? 0
+  };
+}
+
+async function clearHighlightsOnTab(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "ISOLATED",
+      func: () => { if (window.EU_IssueOverlay) window.EU_IssueOverlay.clear(); }
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
 }
 
 async function getScreenshot(id) {
@@ -801,7 +882,7 @@ async function scanInventory(tabId, options) {
       // v12.2 — hard ceiling so one stuck tab can't stall the whole pool.
       const result = await withTimeout(
         inventoryInNewTab(req.url, req.depth < crawlDepth, { queue, seenTextHashes }),
-        WORKER_HARD_TIMEOUT_MS,
+        workerCeilingMs(),
         `worker ${req.url}`
       );
       rateLimiter.reportSuccess(req.url);
@@ -1581,19 +1662,24 @@ async function captureFullPageScreenshot(tabId, violations = null) {
 
 // Per-page context padding (CSS px) for issue-specific element shots.
 //
-// The old MAX_ELEMENT_SHOTS_PER_PAGE = 30 is gone: a page with 80 violating
-// elements got crops for 30 of them and said nothing about the other 50, so the
-// Excel and the report both looked complete while missing most of the evidence.
+// There is no cap on how many element shots a page may produce. Every distinct
+// violating element gets one. The old MAX_ELEMENT_SHOTS_PER_PAGE = 30 meant a
+// page with 80 violating elements got 30 crops and said nothing about the other
+// 50, so the report and the Excel both looked complete while missing most of the
+// evidence.
 //
-// Removing it outright is not free, though — unlike the visual-checks caps, each
-// element shot costs a real CDP round trip plus ELEMENT_SHOT_PAINT_MS. At ~250ms
-// each, 600 elements would exceed WORKER_HARD_TIMEOUT_MS (150s) and the worker
-// would be force-abandoned, losing that page's ENTIRE audit, not just its
-// screenshots. So the bound is now on elapsed time rather than on count: capture
-// every element until the budget is spent, then stop and say so. A page with 200
-// violations gets 200 crops; a pathological one degrades to partial screenshots
-// with a warning instead of taking the whole page down with it.
-const ELEMENT_SHOTS_BUDGET_MS = 45_000;
+// The reason this needs a note: element shots are the one uncapped thing here
+// that costs real wall-clock — a CDP round trip plus ELEMENT_SHOT_PAINT_MS each,
+// call it ~250-400ms. That collides with the worker ceiling, and the collision is
+// expensive: withTimeout() wraps the ENTIRE per-page job, so blowing it records
+// the page as a bare error row with no audit data at all AND increments
+// errorStreak — twenty such pages trip ERROR_STREAK_LIMIT and abandon the whole
+// crawl. Losing the audit to save the screenshots would be a bad trade.
+//
+// Rather than cap the count, the ceiling itself is now screenshot-aware (see
+// workerCeilingMs). A run without screenshots keeps the tight 150s bound; a run
+// with them gets enough headroom that a legitimately slow page is not mistaken
+// for a stuck one.
 const ELEMENT_SHOT_PAD = 14;
 const ELEMENT_SHOT_MAX_DIM = 1600;
 // Minimum crop window for an element shot. A tight crop around a small target
@@ -1643,13 +1729,8 @@ async function captureElementShotsInSession(target, violations) {
   }
 
   let captured = 0;
-  let skippedForBudget = 0;
-  const shotsDeadline = Date.now() + ELEMENT_SHOTS_BUDGET_MS;
   try {
     for (const sel of selToNodes.keys()) {
-      // Time-bounded, not count-bounded. Anything skipped is reported below
-      // rather than leaving a partial set looking complete.
-      if (Date.now() > shotsDeadline) { skippedForBudget++; continue; }
       try {
         const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
           expression: elementHighlightExpr(sel), returnByValue: true
@@ -1689,8 +1770,8 @@ async function captureElementShotsInSession(target, violations) {
       }
     }
   }
-  if (skippedForBudget) {
-    console.warn(`[EU] element screenshots: ${captured} captured, ${skippedForBudget} skipped — ${ELEMENT_SHOTS_BUDGET_MS / 1000}s per-page budget exhausted (${selToNodes.size} distinct violating elements on this page)`);
+  if (captured < selToNodes.size) {
+    console.warn(`[EU] element screenshots: ${captured} of ${selToNodes.size} distinct violating elements captured — the rest failed individually (see warnings above)`);
   }
   return captured;
 }

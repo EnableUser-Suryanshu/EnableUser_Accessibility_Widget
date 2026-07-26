@@ -52,6 +52,22 @@ debugger round trip, but it is now a 45s per-page budget rather than a count of
 also disagreed between `background.js` (50) and the popup (500); all three
 sources now say 500, pinned by `test/limits.test.mjs`.
 
+**Annotate This Page.** A new popup action that marks every **confirmed**
+violation on the page in front of you — numbered badges on the elements
+themselves, plus a panel giving each one's rule, impact, WCAG criteria, the
+offending markup, and the fix axe recommends (with axe's any/all distinction
+preserved, since "any" means one fix suffices and "all" means every line is
+required). Clicking a badge jumps to its panel entry and vice versa. Nothing is
+saved and no report opens.
+
+Only violations are drawn. Needs-review findings are excluded by design —
+painting an unproven finding on the page as a defect is the over-claiming this
+codebase avoids everywhere else. It re-runs axe rather than replaying selectors
+from a stored report, because a report can be days old and a stale selector would
+either mark the wrong element or vanish silently. Markers are body-level
+absolutely-positioned siblings, never wrappers, so an `overflow: hidden` ancestor
+cannot clip them and the page's layout is untouched.
+
 Also in v0.5.0:
 
 - **Paste-a-list concurrency fixed.** The global cap was 200 — harmless on
@@ -75,6 +91,12 @@ Also in v0.5.0:
 - `test/viewer-harness/` — headless-Chrome harness for the report viewer, since
   Chrome 137+ blocks `--load-extension` and the extension's own
   `chrome.debugger` calls conflict with any external CDP driver.
+- `test/overlay-harness/page.html` — 19 assertions over the on-page overlay,
+  including that markers escape an `overflow: hidden` ancestor, that unmarkable
+  nodes (nested frames, stale selectors) are still listed rather than dropped,
+  and that `clear()` leaves no trace.
+- `test/limits.test.mjs` — pins the removed caps as removed and the deliberate
+  resource limits as present.
 - `test/xlsx-drawings.test.mjs` — builds real workbooks in Node and asserts the
   OOXML image plumbing, where an off-by-one silently points a preview at the
   wrong screenshot rather than failing loudly. Run with
