@@ -447,6 +447,25 @@ button.primary:hover { background: #1e3a8a; }
   max-width: 520px;
   max-height: none;
 }
+
+/* A screenshot the report references but storage no longer has: the run predates
+   report-level persistence, browser storage was cleared, or capture failed for
+   that element. The placeholder src loads fine, so the alt text never surfaces —
+   without these rules the reader just sees a blank grey rectangle and reasonably
+   concludes the report is broken. Mark the gap explicitly instead. */
+.screenshot-thumb.screenshot-missing {
+  border: 1px dashed #cbd5e1;
+  background: #f8fafc;
+  min-width: 120px;
+  min-height: 56px;
+}
+.screenshot-unavailable {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  font-style: italic;
+  color: #94a3b8;
+}
 .components-detail { margin-top: 14px; }
 .components-detail strong { font-size: 12px; }
 .form-block { margin: 6px 0 10px; padding: 8px; background: #f9fafb; border-radius: 4px; border: 1px solid #e5e7eb; }

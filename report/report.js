@@ -80,6 +80,13 @@ async function loadScreenshot(img) {
       img.setAttribute("data-loaded", "error");
       img.alt = "screenshot unavailable";
       img.classList.add("screenshot-missing");
+      // The placeholder src loads successfully, so the browser never falls back
+      // to showing alt text — a sighted reader would just see an empty box. Add
+      // a visible note alongside it (guarded so a re-run can't duplicate it).
+      const host = img.parentElement;
+      if (host && !host.querySelector(".screenshot-unavailable")) {
+        host.appendChild(el("span", { class: "screenshot-unavailable" }, ["Screenshot unavailable — not in local storage"]));
+      }
     }
   } catch (err) {
     console.warn("[EU] screenshot fetch failed", err);
