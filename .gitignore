@@ -2,3 +2,7 @@ node_modules/
 lib/axe.min.js
 *.log
 .DS_Store
+
+# Harness build output (regenerate with: node test/viewer-harness/makepng.js)
+test/viewer-harness/shots.js
+test/viewer-harness/*.png
