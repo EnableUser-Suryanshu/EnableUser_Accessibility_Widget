@@ -44,6 +44,7 @@ no common ancestor recorded. Every comparison below was done by direct diff.
 | `background.js` | Element-shot quality: overlay box, `behavior:'instant'`, paint delay, 400×300 minimum context crop, scroll restore | **Ported** in `8fe7d80`, re-based onto page coordinates. |
 | `background.js` | Screenshot capture in `scanCurrent()` | **Ported** in `8fe7d80`. Single-page scans previously produced no imagery. |
 | `lib/xlsx-writer.js` | "Preview" column inline in the Violations sheet | **Ported** in v0.5.0, alongside the dedicated sheet. |
+| `lib/xlsx-writer.js` | Previews in the **classic-report** workbook (`buildReportXlsx` took a `thumbnails` option and embedded on Violations + Pages) | **Ported** in v0.5.0. Originally missed in this inventory — recorded as a gap on this tree only, when in fact main had the feature and this tree did not. Reimplemented independently and covered by `test/xlsx-drawings.test.mjs`; this tree's version also keeps the Outcome column main's Pages sheet lacks. |
 | `background.js` | `skipScroll` param | **Ported** in v0.5.0, once the viewport override gave it a meaning. |
 | `background.js` | `Emulation.setDeviceMetricsOverride` in `captureFullPageScreenshot` | **Concept ported, implementation rewritten** in v0.5.0 — height-only, plus a settle wait, and keeping the page capture main had lost. |
 
@@ -145,7 +146,9 @@ fixed:
   images at all, so reprojecting a crawl through "Open Classic Report" and
   exporting silently dropped every screenshot the crawl had captured. It now
   takes the same `thumbnails` map as the inventory workbook and embeds previews
-  on both Violations and Pages.
+  on both Violations and Pages. (This was the one genuine omission from the
+  "Only in main" inventory above: main already had it, and the gap was recorded
+  as though it applied to both trees.)
 
 ---
 
