@@ -1,4 +1,4 @@
-# EnableUser Crawl Pipeline — what actually runs (v0.4.6)
+# EnableUser Crawl Pipeline — what actually runs (v0.5.0)
 
 A plain-language walkthrough of a Multi Page / Inventory scan, in execution
 order, with the real constants. Cross-check any report against its
@@ -48,7 +48,7 @@ link to it + anchor text) for the broken-link check in step 7.
 
 ## 4. The worker pool
 
-- Up to **200 tabs globally**, max **8 per origin** (rate limiter also backs
+- Up to **10 tabs globally**, max **8 per origin** (rate limiter also backs
   off on 429/503 and honours Retry-After).
 - Worker tabs open in a **dedicated minimized window** — not your tab strip.
 - Per tab: load (60 s timeout) → **adaptive settle**: minimum 1 s, proceeds
@@ -90,8 +90,10 @@ In order:
    b. Wait until every `<img>` reports `complete`, capped at 4 s — otherwise the
       capture freezes lazy images mid-fetch as blank placeholders.
    c. One full-page PNG, then one cropped + highlighted PNG per distinct
-      violating element (max 30 per page, 400×300 minimum crop so small targets
-      keep context). The viewport override is cleared before detaching.
+      violating element (every distinct one, bounded by a 45s per-page budget
+      rather than a count — anything skipped is logged; 400×300 minimum crop so
+      small targets keep context). Each element crop scrolls to its target and the original
+      scroll position is restored when the pass finishes.
 9. Links harvested for the queue (and the link graph), tab closed.
 
 ## 6. PDF / Office audits (after the crawl)
@@ -130,7 +132,12 @@ Scan Environment. Plus scope.docx.
 - Hover/focus findings from CSSOM are advisory: styles applied by JavaScript
   event handlers are invisible to the scan, so those land in Incomplete for
   human confirmation, never as hard violations.
-- Cross-origin stylesheets can't be read; visual-checks silently skips them.
+- Cross-origin stylesheets can't be read; visual-checks skips those rules
+  rather than guessing (a "cue not found" verdict would be unfounded).
+- No finding caps. visual-checks analyses every link and control and reports
+  every failing node; the Excel embeds every captured preview. Element
+  screenshots are the one exception, bounded by a 45s per-page budget because
+  each costs a debugger round trip — exhausting it is logged, never silent.
 - The link-status fetch layer uses your cookies but is not a rendered
   browser; sites that hard-block non-navigation requests may show
   `access-blocked` rows — the rendered-DOM layer still covers crawled pages.

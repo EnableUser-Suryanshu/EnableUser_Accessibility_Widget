@@ -27,6 +27,9 @@ const btnRecover = $("btn-recover");
 // large site (raise it once the site's size is known). Both are freely
 // editable per-scan and overridden by whatever the operator last saved to
 // chrome.storage.local.
+// Keep in step with background.js's DEFAULT_MAX_URLS and the value="" on
+// #opt-max-urls in popup.html. All three must agree or the effective default
+// depends on which one supplied it.
 const DEFAULT_MAX_URLS = 500;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
 const DEFAULT_PROFILE = "wcag21aa";

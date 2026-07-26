@@ -41,6 +41,17 @@ for the full inventory and what was deliberately left behind.
 - Screenshots referenced but no longer in storage now say so, instead of
   rendering as a blank grey rectangle.
 
+**No more silent truncation.** Every cap that quietly dropped findings is gone:
+per-rule node caps (was 25), links analysed for 1.4.1 (was 300), the hover-cue
+sample (100), boundary-contrast controls (150), the text-spacing sample (600),
+motion candidates (10), and Excel embedded previews (300). A truncated audit used
+to render identically to a complete one — the client fixed 25 issues, re-scanned,
+and 25 more appeared. Element screenshots keep a bound because each costs a real
+debugger round trip, but it is now a 45s per-page budget rather than a count of
+30, and exhausting it is logged instead of passing silently. `DEFAULT_MAX_URLS`
+also disagreed between `background.js` (50) and the popup (500); all three
+sources now say 500, pinned by `test/limits.test.mjs`.
+
 Also in v0.5.0:
 
 - **Paste-a-list concurrency fixed.** The global cap was 200 — harmless on

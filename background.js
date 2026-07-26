@@ -23,7 +23,13 @@ import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
 
-const DEFAULT_MAX_URLS = 50;
+// Must match popup.js's DEFAULT_MAX_URLS and the value="" on #opt-max-urls in
+// popup.html. This was 50 while both of those said 500, so the effective default
+// depended on whether the popup supplied maxUrls or this fallback did — a scan
+// started one way crawled 50 pages, the other way 500, with nothing explaining
+// the difference. 500 is the value the operator actually sees in the popup, so
+// that is the one that wins.
+const DEFAULT_MAX_URLS = 500;
 const DEFAULT_CRAWL_DEPTH = 1;
 // Intentionally NO HARD_MAX_URLS ceiling. The user's explicit direction: a
 // professional audit tool doesn't impose arbitrary limits on the operator.
@@ -1573,8 +1579,21 @@ async function captureFullPageScreenshot(tabId, violations = null) {
   }
 }
 
-// Per-page cap + context padding (CSS px) for issue-specific element shots.
-const MAX_ELEMENT_SHOTS_PER_PAGE = 30;
+// Per-page context padding (CSS px) for issue-specific element shots.
+//
+// The old MAX_ELEMENT_SHOTS_PER_PAGE = 30 is gone: a page with 80 violating
+// elements got crops for 30 of them and said nothing about the other 50, so the
+// Excel and the report both looked complete while missing most of the evidence.
+//
+// Removing it outright is not free, though — unlike the visual-checks caps, each
+// element shot costs a real CDP round trip plus ELEMENT_SHOT_PAINT_MS. At ~250ms
+// each, 600 elements would exceed WORKER_HARD_TIMEOUT_MS (150s) and the worker
+// would be force-abandoned, losing that page's ENTIRE audit, not just its
+// screenshots. So the bound is now on elapsed time rather than on count: capture
+// every element until the budget is spent, then stop and say so. A page with 200
+// violations gets 200 crops; a pathological one degrades to partial screenshots
+// with a warning instead of taking the whole page down with it.
+const ELEMENT_SHOTS_BUDGET_MS = 45_000;
 const ELEMENT_SHOT_PAD = 14;
 const ELEMENT_SHOT_MAX_DIM = 1600;
 // Minimum crop window for an element shot. A tight crop around a small target
@@ -1624,8 +1643,13 @@ async function captureElementShotsInSession(target, violations) {
   }
 
   let captured = 0;
+  let skippedForBudget = 0;
+  const shotsDeadline = Date.now() + ELEMENT_SHOTS_BUDGET_MS;
   try {
-    for (const sel of [...selToNodes.keys()].slice(0, MAX_ELEMENT_SHOTS_PER_PAGE)) {
+    for (const sel of selToNodes.keys()) {
+      // Time-bounded, not count-bounded. Anything skipped is reported below
+      // rather than leaving a partial set looking complete.
+      if (Date.now() > shotsDeadline) { skippedForBudget++; continue; }
       try {
         const evalRes = await withTimeout(chrome.debugger.sendCommand(target, "Runtime.evaluate", {
           expression: elementHighlightExpr(sel), returnByValue: true
@@ -1664,6 +1688,9 @@ async function captureElementShotsInSession(target, violations) {
         console.warn("[EU] failed to restore scroll position:", err?.message || err);
       }
     }
+  }
+  if (skippedForBudget) {
+    console.warn(`[EU] element screenshots: ${captured} captured, ${skippedForBudget} skipped — ${ELEMENT_SHOTS_BUDGET_MS / 1000}s per-page budget exhausted (${selToNodes.size} distinct violating elements on this page)`);
   }
   return captured;
 }
