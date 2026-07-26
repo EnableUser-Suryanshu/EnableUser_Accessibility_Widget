@@ -54,6 +54,16 @@ check("DEFAULT_MAX_URLS agrees across background.js, popup.js and popup.html",
   bgDefault === popupDefault && popupDefault === htmlDefault,
   `background=${bgDefault} popup.js=${popupDefault} popup.html=${htmlDefault}`);
 
+// ── manifest.json is the version of record; package.json must not drift ──
+// They disagreed for a long time (0.5.0 vs 0.1.0). Nothing reads package.json,
+// which is exactly why it rotted — and a stale version in the repo is the kind
+// of thing that gets copied into a release note.
+{
+  const mv = JSON.parse(read("manifest.json")).version;
+  const pv = JSON.parse(read("package.json")).version;
+  check("package.json version matches manifest.json", mv === pv, `manifest=${mv} package=${pv}`);
+}
+
 // ── Finding caps must stay unbounded ──
 const visual = code(read("lib/visual-checks.js"));
 const xlsx = code(read("lib/xlsx-writer.js"));

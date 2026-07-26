@@ -34,7 +34,7 @@ no common ancestor recorded. Every comparison below was done by direct diff.
 | `lib/visual-checks.js` | WCAG 1.4.1 nav-chrome exclusion | Nav / header / footer / breadcrumb / pagination links are excluded from link-in-text-block analysis, plus two guards that skip the check entirely when no CSS is readable (cross-origin stylesheets). Without these, every nav link on every page is flagged. |
 | `report/report.js`, `report/inventory.js` | Page status pills + tile roll-up | Clean / Issues / Unreachable per page, with a summary tile row. Distinguishes "completed with 0 violations" from "never reachable". |
 | `report/inventory.html` | "Open Classic Report" button | Entry point for `openClassicReport()`. |
-| `lib/xlsx-writer.js` | "Issue Screenshots" sheet | Dedicated sheet, one row per violating element with a preview plus URL / Rule ID / Impact / Target / Success Criteria, capped at `MAX_ISSUE_SHOTS = 300`. |
+| `lib/xlsx-writer.js` | "Issue Screenshots" sheet | Dedicated sheet, one row per violating element with a preview plus URL / Rule ID / Impact / Target / Success Criteria. (Originally capped at 300 images; the cap was removed in v0.5.0 along with the other silent truncations.) |
 
 ### Only in `main`
 
@@ -98,9 +98,9 @@ main's docs disagree with main's own code on this point.
 the Violations sheet (main's approach) *and* the dedicated Issue Screenshots
 sheet is retained (this tree's), plus previews on Pages. Violations is the sheet
 auditors work in, so the preview belongs on the finding's own row; the dedicated
-sheet still earns its place by carrying Impact / Success Criteria context and
-enforcing the `MAX_ISSUE_SHOTS` cap. `drawingSpecs` already supported N sheets,
-so this was mechanical.
+sheet still earns its place by carrying Impact / Success Criteria context per
+row, which an inline column has no space for. `drawingSpecs` already supported N
+sheets, so this was mechanical.
 
 Note the same `shotId` is written once per drawing spec rather than shared —
 OOXML requires each drawing to own its image parts. Element crops are small and
@@ -132,11 +132,13 @@ coordinates were only correct *because* its override was active.
 
 ## Known rough edges
 
-- **`package.json` still says `0.1.0`.** It has been out of step with the
-  manifest for a long time; nothing reads it, but it is misleading.
+None outstanding. All three found while shipping v0.5.0 have been fixed:
 
-Both of the following were found while shipping v0.5.0 and have since been
-fixed:
+- ~~`package.json` said `0.1.0`~~ while the manifest said `0.5.0`. Nothing reads
+  it, which is exactly why it rotted — and a stale version in the repo is the
+  kind of thing that ends up in a release note. Aligned, and pinned by
+  `test/limits.test.mjs` so it cannot drift again. `manifest.json` remains the
+  version of record.
 
 - ~~`manifest.json` description is ~6300 characters~~ — Chrome documents a
   132-character limit on that field and enforces it at Web Store submission.
