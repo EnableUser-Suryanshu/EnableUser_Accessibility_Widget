@@ -40,6 +40,29 @@ race a crawl's ACTIVE_* config.
 
 Also on this branch:
 
+Gap-closure pass (2026-08-18) — the six mechanisms the digest-vs-
+implementation audit left open, scoped-subtree re-scans deliberately
+excluded. (1) The workflow observer is now armed in ALL frames (both
+vendors do; iframe DOM changes — chat widgets, embedded checkouts — were
+previously invisible), re-armed after every scan as well as on navigation;
+subframe signals omit href/title so a frame's URL never becomes page
+identity. (2) scanOnUserActivity mode (BrowserStack's alternative
+trigger, Settings toggle `wfScanOnActivity`): no MutationObserver —
+click/keydown/wheel/scroll debounced 300 + 300 ms, then a DOM snapshot
+signature (tag-structure rolling hash + body length; pure twin
+`activitySignature` in lib/workflow.js) compared to the last, only a
+change signals. (3) Richer click metadata: coordinates, form-control
+value (truncated 80, passwords excluded), anchor href — stored on the
+step and surfaced in the Workflow sheet's Detail column. (4) Step rename:
+double-click a timeline row in the panel; the operator's name persists to
+report, workbook and AI bundle (`renamed` flag protects it). (5) Force-
+stop CTA after 8 s of continuous scanning (BrowserStack's threshold):
+discards the stuck scan's result, releases the lock, keeps recording.
+(6) MV3 keep-alive port (`eu-wf-keepalive`) held by the top-frame
+observer for the session's lifetime, so pending debounce timers survive
+worker eviction; torn down on stop. 14 new invariants in the workflow
+suite; live-verified 17/17 by the puppeteer harness.
+
 DevTools panel is now the FULL extension surface (light, card-based layout):
 Page Scan (scan + highlight/clear + open report), Workflow Analyzer (record
 user flow with live stats + timeline), Site Crawl with max-URLs/depth and
