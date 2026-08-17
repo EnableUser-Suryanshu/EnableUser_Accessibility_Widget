@@ -76,12 +76,13 @@ check("same node on another page counts separately", r4.newIssues === 1);
 check("issueHash is page-scoped",
   issueHash("<p>x</p>", '["#a"]', "r", "https://x.com/1") !== issueHash("<p>x</p>", '["#a"]', "r", "https://x.com/2"));
 
-// ── 4. Step cap ───────────────────────────────────────────────────────────
+// ── 4. No step cap (repo rule: finding caps must not exist) ──────────────
+check("MAX_STEPS is Infinity — sessions are unbounded", MAX_STEPS === Infinity);
 const s2 = newSession({ tabId: 2, testId: "t2", seedUrl: "https://y.com/", profile: "wcag21aa", settings: {} });
 const pg = recordPage(s2, "https://y.com/", "Y");
-for (let i = 0; i < MAX_STEPS + 10; i++) recordClick(s2, pg, { tag: "a", text: String(i) });
-check("step cap enforced", s2.steps.length === MAX_STEPS && s2.limitReached === true);
-check("capped session refuses scan steps", openScanStep(s2, STEP_ACTIONS.STATE_CHANGE, pg) === null);
+for (let i = 0; i < 500; i++) recordClick(s2, pg, { tag: "a", text: String(i) });
+check("500 steps recorded without a limit trip", s2.steps.length === 500 && s2.limitReached === false);
+check("scan steps still open past any former cap", openScanStep(s2, STEP_ACTIONS.STATE_CHANGE, pg) !== null);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log("\nall workflow invariants hold");

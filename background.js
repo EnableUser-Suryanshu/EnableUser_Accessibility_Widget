@@ -313,7 +313,7 @@ function recordLinksInto(linkGraph, sourceUrl, links) {
     if (!u) continue;
     let e = linkGraph.get(u);
     if (!e) { e = { sources: new Map() }; linkGraph.set(u, e); }
-    if (!e.sources.has(sourceUrl) && e.sources.size < 25) {
+    if (!e.sources.has(sourceUrl)) {
       e.sources.set(sourceUrl, String(l.text || "").slice(0, 120));
     }
   }
@@ -382,7 +382,7 @@ const rateLimiter = new RateLimiter({ perOriginMax: PER_ORIGIN_TABS });
 // chrome.storage.local (like inventories already were) and re-warmed into
 // memory on demand. The last 5 reports are kept; older ones are pruned so
 // storage doesn't grow without bound.
-const REPORT_KEEP = 5;
+const REPORT_KEEP = 25;
 // Resolve `<prefix>:<id>` manifest keys from an id index, so shot-ownership can
 // be checked without enumerating storage. `chrome.storage.local.get(null)` would
 // return every value including the inventories and their base64 PNGs, which is
@@ -750,7 +750,7 @@ async function scanCurrent(tabId, options) {
 // to zero scans instead of scanning forever.
 // ─────────────────────────────────────────────────────────────────────────
 const WF_DEBOUNCE_MS = 1_000;
-const WF_EVIDENCE_MAX = 40;   // evidence snapshots per session (≈1-2 MB each)
+const WF_EVIDENCE_MAX = Infinity; // no evidence cap — every step captured (repo rule: no silent caps)
 const WF_KEY = (tabId) => `wf:${tabId}`;
 
 // Injected into the page: serialize what the scan saw. DOM capped at 1.5 MB,
@@ -758,7 +758,7 @@ const WF_KEY = (tabId) => `wf:${tabId}`;
 // letting a heavy page blow up storage. Cross-origin stylesheets are skipped
 // (CSSOM throws); that limitation is recorded so the AI reviewer knows.
 function captureWfEvidence() {
-  const clip = (s, n) => { s = String(s || ""); return s.length > n ? s.slice(0, n) : s; };
+  const clip = (s) => String(s || "");  // no truncation — full evidence (repo rule: no silent caps)
   let css = "", cssSkipped = 0;
   try {
     for (const sheet of document.styleSheets) {
@@ -777,8 +777,8 @@ function captureWfEvidence() {
     capturedAt: new Date().toISOString(),
     viewport: { width: innerWidth, height: innerHeight },
     domBytes: (document.documentElement.outerHTML || "").length,
-    dom: clip(document.documentElement.outerHTML, 1_500_000),
-    css: clip(css, 300_000),
+    dom: clip(document.documentElement.outerHTML),
+    css: clip(css),
     crossOriginSheetsSkipped: cssSkipped
   };
 }
@@ -922,7 +922,7 @@ async function workflowStop(tabId) {
         (p.incomplete || []).map(r => ({
           pageUrl: p.url, step: p.workflowStep, ruleId: r.ruleId || r.id,
           description: r.description || "", help: r.help || "",
-          nodes: (r.nodes || []).slice(0, 20).map(n => ({ html: n.html, target: n.target, failureSummary: n.failureSummary }))
+          nodes: (r.nodes || []).map(n => ({ html: n.html, target: n.target, failureSummary: n.failureSummary }))
         }))),
       evidence
     };
@@ -4222,7 +4222,7 @@ function sumNodes(rules) {
 
 async function downloadReportXlsx(reportId) {
   const report = await getReport(reportId);
-  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
+  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 25 are kept) or storage was cleared. Run a new scan." };
   // Thumbnail the screenshots this report references so the workbook carries
   // the same evidence the on-screen report shows. Before this, exporting a
   // report — including one reprojected from a crawl via Open Classic Report —
@@ -4248,7 +4248,7 @@ async function downloadReportXlsx(reportId) {
 
 async function downloadCsv(reportId) {
   const report = await getReport(reportId);
-  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 5 are kept) or storage was cleared. Run a new scan." };
+  if (!report) return { ok: false, error: "Report not found — it was pruned (only the last 25 are kept) or storage was cleared. Run a new scan." };
 
   // Shared column sets — full fidelity, no truncation. Objects/arrays are
   // serialised by toCsv via JSON.stringify in wrapCell (see csv-writer.js).

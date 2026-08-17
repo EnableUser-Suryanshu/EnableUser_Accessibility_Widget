@@ -40,6 +40,19 @@ race a crawl's ACTIVE_* config.
 
 Also on this branch:
 
+Cap removal pass, honouring the v0.5.1 no-silent-caps rule across the new
+workflow/AI code: MAX_STEPS 200 → Infinity (sessions unbounded; the
+mutation-fingerprint dedup, not a ceiling, is what protects against
+auto-refreshing pages), evidence snapshots uncapped (was 40/session) and
+untruncated (was 1.5 MB DOM / 300 KB CSS clips — now full DOM + full
+readable CSS, cross-origin skips still counted), AI-bundle review items
+carry every node (was 20/rule), broken-link 'Found On' lists every linking
+page (was 25), link-check default target cap removed (was 8,000; explicit
+caller bounds still report truncation), report retention raised 5 → 25.
+Kept, with reasons: the observer's 5,000-fingerprint FIFO (bounds memory,
+not findings — eviction can only cause an EXTRA scan, never a missed one)
+and selector-walk depth limits (algorithmic, not result caps).
+
 Critical fix, found by live end-to-end testing: Chrome silently no-ops a
 second chrome.scripting.executeScript({files}) of the same file into the
 same document+world — verified on Chrome 152 (the call resolves in 0 ms,
