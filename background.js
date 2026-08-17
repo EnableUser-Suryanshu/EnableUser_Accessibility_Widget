@@ -808,13 +808,27 @@ function wfRuntime(tabId) {
   return r;
 }
 
+// Arm the observer in EVERY frame (both vendors do — iframe DOM changes are
+// otherwise never seen). The file is idempotent per document
+// (window.__euWfObserver), and Chrome's repeat-file-injection dedup (the
+// 7a50bc9 trap) only no-ops documents that already ran it — new documents
+// and freshly created iframes execute normally, which is exactly the re-arm
+// we want.
 async function wfInjectObserver(tabId) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["lib/workflow-observer.js"] });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["lib/workflow-observer.js"] });
     return true;
   } catch (err) {
-    console.warn(`[EU] workflow observer injection failed (tab ${tabId}):`, err?.message || err);
-    return false;
+    // A single inaccessible frame (e.g. a chrome-extension:// iframe) can
+    // fail the whole allFrames call — fall back to the top frame rather
+    // than losing observation entirely.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["lib/workflow-observer.js"] });
+      return true;
+    } catch (err2) {
+      console.warn(`[EU] workflow observer injection failed (tab ${tabId}):`, err2?.message || err2);
+      return false;
+    }
   }
 }
 
@@ -862,7 +876,7 @@ async function workflowStop(tabId) {
   _wfRuntime.delete(tabId);
   try {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },  // observers are armed in every frame
       func: () => { try { window.__euWfObserver && window.__euWfObserver.stop(); } catch {} }
     });
   } catch {}
@@ -1012,7 +1026,16 @@ async function workflowOnClick(sender, msg) {
   if (!tabId) return { ok: false };
   const session = await wfSession(tabId);
   if (!session || session.limitReached) return { ok: true, ignored: true };
-  const page = recordPage(session, msg?.href || session.seedUrl, msg?.title || "");
+  // Subframe clicks arrive without href (a frame's own URL must never become
+  // page identity) — resolve the TAB's current URL instead of falling back
+  // to the stale seedUrl.
+  let href = msg?.href, title = msg?.title || "";
+  if (!href) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    href = tab?.url || session.seedUrl;
+    title = title || tab?.title || "";
+  }
+  const page = recordPage(session, href, title);
   recordClick(session, page, msg?.info || {});
   await wfPersist(session);
   return { ok: true };
@@ -1111,6 +1134,10 @@ async function wfScan(tabId, action, href, title) {
     console.warn("[EU] workflow scan failed:", err?.message || err);
   } finally {
     rt.scanning = false;
+    // Re-arm all frames after every scan (axe's re-arm-on-every-event
+    // lesson): iframes created since the last arming get observed. Cheap and
+    // idempotent — already-armed documents no-op.
+    if (await wfSession(tabId)) await wfInjectObserver(tabId);
     if (rt.retrigger) {
       rt.retrigger = false;
       wfTrigger(tabId, STEP_ACTIONS.STATE_CHANGE);
