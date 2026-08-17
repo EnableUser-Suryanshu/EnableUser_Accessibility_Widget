@@ -546,6 +546,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "WORKFLOW_STATUS") sendResponse(await workflowStatus(msg.tabId));
       else if (msg.type === "WORKFLOW_DETAIL") sendResponse(await workflowDetail(msg.tabId));
       else if (msg.type === "WORKFLOW_RENAME_STEP") sendResponse(await workflowRenameStep(msg.tabId, msg.stepId, msg.name));
+      else if (msg.type === "WORKFLOW_FORCE_STOP") sendResponse(workflowForceStop(msg.tabId));
       else if (msg.type === "PANEL_SCAN_PAGE") sendResponse(await panelScanPage(msg.tabId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
@@ -805,7 +806,7 @@ async function wfSession(tabId) {
 
 function wfRuntime(tabId) {
   let r = _wfRuntime.get(tabId);
-  if (!r) { r = { timer: null, scanning: false, retrigger: false, pending: null }; _wfRuntime.set(tabId, r); }
+  if (!r) { r = { timer: null, scanning: false, retrigger: false, pending: null, lastScanStartedAt: 0, forceStop: false }; _wfRuntime.set(tabId, r); }
   return r;
 }
 
@@ -1006,7 +1007,10 @@ async function workflowDetail(tabId) {
   const activity = {
     settling: !!rt?.timer,
     scanning: !!rt?.scanning,
-    pendingAction: rt?.pending?.action || null
+    pendingAction: rt?.pending?.action || null,
+    // Exposed so the panel can offer "Force stop scan" when a scan has been
+    // in flight suspiciously long (> 8 s — BrowserStack's threshold).
+    scanStartedAt: rt?.scanning ? (rt.lastScanStartedAt || null) : null
   };
   if (!session) return { ok: true, active: false, steps: [], activity };
   return {
@@ -1019,6 +1023,20 @@ async function workflowDetail(tabId) {
     limitReached: session.limitReached,
     activity
   };
+}
+
+// Operator force-stops a stuck scan (panel CTA shown after 8 s of
+// continuous scanning — BrowserStack's FORCE_STOP_TIMEOUT). We cannot abort
+// the content-side axe run, but we CAN guarantee its result is discarded
+// and the lock releases: wfScan consults the flag when the in-flight call
+// returns. Flag only set while a scan is actually running — a late click
+// must never poison the NEXT scan.
+function workflowForceStop(tabId) {
+  const rt = _wfRuntime.get(tabId);
+  if (!rt || !rt.scanning) return { ok: true, idle: true };
+  rt.forceStop = true;
+  rt.retrigger = false;  // no follow-up scan out of a force-stopped one
+  return { ok: true };
 }
 
 // Operator renames a timeline step (double-click in the panel) — the local
@@ -1109,6 +1127,7 @@ async function wfScan(tabId, action, href, title) {
   const rt = wfRuntime(tabId);
   if (rt.scanning) { rt.retrigger = true; return; }
   rt.scanning = true;
+  rt.lastScanStartedAt = Date.now();  // panel's force-stop CTA keys off this
   try {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || !/^https?:/.test(tab.url || "")) return;
@@ -1125,6 +1144,15 @@ async function wfScan(tabId, action, href, title) {
       ACTIVE_SCREENSHOTS = false;     // findings-only in workflow mode (v1)
       return scanInExistingTab(tabId);
     });
+    // Operator force-stopped a stuck scan: discard the in-flight result
+    // entirely — no step, no ingest, no evidence — clear the flag and let
+    // finally release the lock cleanly. rt.scanning can never stay stuck.
+    if (rt.forceStop) {
+      rt.forceStop = false;
+      rt.retrigger = false;
+      console.warn("[EU] workflow scan force-stopped by operator — result discarded");
+      return;
+    }
     if (!res || res.ok === false) { console.warn("[EU] workflow scan skipped:", res?.error || "no result"); return; }
 
     const page = recordPage(session, pageUrl, title || tab.title || "");

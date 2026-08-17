@@ -103,6 +103,13 @@ function render(detail, progress) {
   btnList.disabled = active || !!localBusy;
   setActivity(activityText(detail, progress));
 
+  // A workflow scan continuously in flight for > 8 s (BrowserStack's
+  // force-stop threshold) gets an escape hatch: discard the stuck scan's
+  // result and release the lock, without ending the session.
+  const act = detail?.activity || {};
+  $("btn-force-stop").hidden =
+    !(active && act.scanning && act.scanStartedAt && Date.now() - act.scanStartedAt > 8000);
+
   const steps = Array.isArray(detail?.steps) ? detail.steps : [];
   $("stats").hidden = !active && steps.length === 0;
   $("st-pages").textContent = detail?.pages?.length ?? 0;
@@ -241,6 +248,13 @@ btnRecover.addEventListener("click", async () => {
 });
 btnReport.addEventListener("click", () => {
   if (lastReportId) chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${lastReportId}`) });
+});
+
+$("btn-force-stop").addEventListener("click", async () => {
+  $("btn-force-stop").hidden = true;
+  const res = await send({ type: "WORKFLOW_FORCE_STOP", tabId });
+  setStatus(res?.ok ? "Scan force-stopped — its result will be discarded. Recording continues." : (res?.error || "Force stop failed."));
+  refresh();
 });
 
 // Double-click a timeline row → rename the step (axe's state-rename,
