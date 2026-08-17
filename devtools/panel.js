@@ -113,6 +113,9 @@ function render(detail, progress) {
 
   const items = steps.slice().reverse().map((st) => {
     const li = document.createElement("li");
+    li.dataset.stepId = st.stepId;
+    li.dataset.detail = st.detail || "";
+    li.title = "Double-click to rename this step";
     const glyph = document.createElement("span");
     glyph.className = "glyph";
     glyph.textContent = st.action === "Clicked" ? "☞" : st.action === "Full page scan" ? "▣" : "≈";
@@ -238,6 +241,18 @@ btnRecover.addEventListener("click", async () => {
 });
 btnReport.addEventListener("click", () => {
   if (lastReportId) chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${lastReportId}`) });
+});
+
+// Double-click a timeline row → rename the step (axe's state-rename,
+// locally). The live "Analyzing…" row carries no stepId and is ignored.
+$("timeline").addEventListener("dblclick", async (e) => {
+  const li = e.target.closest ? e.target.closest("li[data-step-id]") : null;
+  if (!li || !li.dataset.stepId) return;
+  const name = prompt("Step name:", li.dataset.detail || "");
+  if (name === null) return;  // cancelled
+  const res = await send({ type: "WORKFLOW_RENAME_STEP", tabId, stepId: li.dataset.stepId, name });
+  setStatus(res?.ok ? "Step renamed." : (res?.error || "Rename failed."));
+  refresh();
 });
 
 loadSettings().then(refresh);

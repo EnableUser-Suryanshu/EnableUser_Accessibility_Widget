@@ -22,7 +22,7 @@ import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js"
 import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
-import { newSession, recordPage, openScanStep, recordClick, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS } from "./lib/workflow.js";
+import { newSession, recordPage, openScanStep, recordClick, renameStep, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS } from "./lib/workflow.js";
 
 // Must match popup.js's DEFAULT_MAX_URLS and the value="" on #opt-max-urls in
 // popup.html. This was 50 while both of those said 500, so the effective default
@@ -545,6 +545,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "WORKFLOW_STOP") sendResponse(await workflowStop(msg.tabId));
       else if (msg.type === "WORKFLOW_STATUS") sendResponse(await workflowStatus(msg.tabId));
       else if (msg.type === "WORKFLOW_DETAIL") sendResponse(await workflowDetail(msg.tabId));
+      else if (msg.type === "WORKFLOW_RENAME_STEP") sendResponse(await workflowRenameStep(msg.tabId, msg.stepId, msg.name));
       else if (msg.type === "PANEL_SCAN_PAGE") sendResponse(await panelScanPage(msg.tabId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
@@ -1018,6 +1019,18 @@ async function workflowDetail(tabId) {
     limitReached: session.limitReached,
     activity
   };
+}
+
+// Operator renames a timeline step (double-click in the panel) — the local
+// equivalent of axe's upsert-page-state. Mutates the live session and
+// persists, so the report/bundle built at Stop carry the operator's names.
+async function workflowRenameStep(tabId, stepId, name) {
+  const session = await wfSession(tabId);
+  if (!session) return { ok: false, error: "No workflow session on this tab." };
+  const step = renameStep(session, stepId, name);
+  if (!step) return { ok: false, error: `No step ${stepId} in this session.` };
+  await wfPersist(session);
+  return { ok: true, stepId: step.stepId, detail: step.detail };
 }
 
 // Panel-initiated single-page scan — the panel is a full surface, not a

@@ -15,7 +15,7 @@
 
 import {
   normalizePageUrl, issueHash, newSession, recordPage, openScanStep,
-  recordClick, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS, MAX_STEPS,
+  recordClick, renameStep, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS, MAX_STEPS,
   activitySignature
 } from "../lib/workflow.js";
 
@@ -99,7 +99,14 @@ check("value truncated to 80", recordClick(s3, pg3, { tag: "input", value: "x".r
 const bare = recordClick(s3, pg3, { tag: "button", text: "Go" });
 check("absent metadata adds no fields", !("coordinates" in bare) && !("value" in bare) && !("href" in bare));
 
-// ── 6. Activity-mode snapshot signature (scanOnUserActivity) ─────────────
+// ── 6. Step rename (operator names survive on the step) ──────────────────
+const renamed = renameStep(s3, clk.stepId, "  Open the documentation page  ");
+check("rename mutates the step in place", renamed === clk && clk.detail === "Open the documentation page");
+check("rename marks the step operator-named", clk.renamed === true);
+check("rename of unknown step returns null", renameStep(s3, "s999", "x") === null);
+check("rename truncates at 140", renameStep(s3, clk.stepId, "y".repeat(300)).detail.length === 140);
+
+// ── 7. Activity-mode snapshot signature (scanOnUserActivity) ─────────────
 // The injected observer's inline copy must detect exactly what this pure
 // twin detects: a structural change OR a serialized-length change flips the
 // signature; identical snapshots compare equal (no false re-scans).
