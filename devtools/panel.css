@@ -1,0 +1,57 @@
+/* DevTools panel — dark-first (DevTools panels inherit no page theme; axe
+   ships theme-dark as its default and so do we). Compact type to match the
+   DevTools chrome around it. */
+:root {
+  --bg: #1e1f22; --bg2: #26272b; --line: #3a3b40;
+  --fg: #e8e8ea; --muted: #9a9ba2;
+  --accent: #4f7dff; --rec: #e11d48; --ok: #23b450;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 12px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: flex; flex-direction: column;
+}
+.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--line);
+}
+.foot { border-top: 1px solid var(--line); border-bottom: none; min-height: 30px; }
+.brand { display: flex; align-items: center; gap: 8px; }
+.muted { color: var(--muted); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--rec); animation: pulse 1.2s infinite; }
+@keyframes pulse { 50% { opacity: 0.35; } }
+button {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 12px; font: inherit; cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary.recording { background: var(--rec); border-color: var(--rec); }
+.actions { display: flex; gap: 8px; }
+.stats {
+  display: flex; gap: 18px; padding: 10px 14px;
+  background: var(--bg2); border-bottom: 1px solid var(--line);
+}
+.stat { display: flex; flex-direction: column; align-items: center; min-width: 54px; }
+.stat span { font-size: 17px; font-weight: 600; }
+.stat label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.stat.accent span { color: var(--accent); }
+.stat.muted span { color: var(--muted); }
+main { flex: 1; overflow-y: auto; padding: 10px 14px; }
+.empty { color: var(--muted); max-width: 62ch; padding: 18px 4px; }
+.timeline { list-style: none; }
+.timeline li {
+  display: grid; grid-template-columns: 20px 1fr auto; gap: 10px;
+  padding: 7px 4px; border-bottom: 1px solid var(--line); align-items: baseline;
+}
+.timeline .glyph { color: var(--muted); text-align: center; }
+.timeline .action { font-weight: 600; }
+.timeline .action.scan { color: var(--ok); }
+.timeline .action.change { color: var(--accent); }
+.timeline .detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.timeline .url { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timeline .count { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timeline .count.new { color: var(--ok); font-weight: 600; }
+.timeline .count.zero { color: var(--muted); }

@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>EnableUser</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body class="theme-dark">
+    <header class="bar">
+      <div class="brand">
+        <span class="dot" id="rec-dot" hidden></span>
+        <strong>EnableUser</strong>
+        <span class="muted">Workflow Analyzer</span>
+      </div>
+      <div class="actions">
+        <button id="btn-record" class="primary">Start recording</button>
+        <button id="btn-report" hidden>Open report</button>
+      </div>
+    </header>
+
+    <section class="stats" id="stats" hidden>
+      <div class="stat"><span id="st-pages">0</span><label>pages</label></div>
+      <div class="stat"><span id="st-steps">0</span><label>steps</label></div>
+      <div class="stat"><span id="st-scans">0</span><label>scans</label></div>
+      <div class="stat accent"><span id="st-issues">0</span><label>unique issues</label></div>
+      <div class="stat muted"><span id="st-dupes">0</span><label>repeats suppressed</label></div>
+    </section>
+
+    <main>
+      <p id="empty" class="empty">
+        Start recording, then browse the journey in the inspected tab — log in,
+        fill the form, check out. Every page load and page change is scanned
+        automatically; repeated issues are counted once. Stop for the timeline
+        report and the AI evidence bundle.
+      </p>
+      <ol id="timeline" class="timeline" reversed></ol>
+    </main>
+
+    <footer class="bar foot">
+      <span id="status" class="muted"></span>
+    </footer>
+
+    <script src="panel.js"></script>
+  </body>
+</html>

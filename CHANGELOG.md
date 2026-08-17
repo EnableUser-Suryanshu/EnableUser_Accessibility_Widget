@@ -38,6 +38,28 @@ lib/workflow-observer.js (injected observer). Scan execution reuses
 scanInExistingTab under the shared-operation guard, so workflow scans cannot
 race a crawl's ACTIVE_* config.
 
+Also on this branch:
+
+DevTools panel — `devtools/` registers an "EnableUser" panel
+(chrome.devtools.panels.create, inspected tabId passed via query string, the
+BrowserStack pattern) with a live workflow surface: Start/Stop, recording
+pulse, stat tiles (pages / steps / scans / unique issues / repeats
+suppressed), and a reverse-chronological step timeline polling
+WORKFLOW_DETAIL every 1.5 s. Dark theme, no chrome.devtools APIs beyond
+panel creation — the background stays the single source of truth.
+
+AI evidence capture + local Claude review (the vendors' server-AI layer,
+done locally) — once per step the rendered DOM (≤1.5 MB) and accessible CSS
+(≤300 KB) are serialized and stored (≤40 snapshots/session); on Stop an
+`enableuser-workflow-ai-bundle-<testId>.json` downloads next to the report:
+timeline + every needs-review (incomplete) finding + evidence.
+`tools/ai-review/prepare.mjs` splits it into per-case prompts with the DOM
+excerpt around each flagged node; Claude writes strict JSON verdicts;
+`tools/ai-review/merge.mjs` buckets them — confirmed (tagged EU-ai, only at
+or above the 0.7 confidence threshold), dismissed, human review queue.
+Verdicts never override engine results; they settle only what the engines
+marked incomplete. Pipeline contract pinned by test/ai-review.test.mjs.
+
 ## v0.5.0
 
 unifies two independently-developed v0.4.9 builds. Screenshots are now end-to-end: full-page captures plus one highlighted, cropped shot per violating element, embedded in the Excel (inline Preview column on the Violations sheet, on the Pages sheet, and a dedicated Issue Screenshots sheet) and rendered lazily in the report viewer (gallery section plus a Screenshot column, IntersectionObserver-backed so a 200-page crawl does not push hundreds of MB of base64 into the tab up front). Before capturing, the layout viewport is expanded to the full document height so lazy-loaded content below the fold actually renders: captureBeyondViewport reaches that content but never fires its IntersectionObservers, so long pages previously captured blank hero images. Width is left exactly as the tab had it, so evidence never crosses a responsive breakpoint the user was not at. Element captures highlight via an overlay box (an outline alone is clipped by any ancestor with overflow:hidden), crop to a 400x300 minimum so small targets carry legible context, and restore the original scroll position. Single-page scans capture screenshots too, and they run against your own visible tab. Paste-a-list no longer opens every pasted URL at once: the global concurrency cap was 200, harmless on single-origin crawls (the 8-per-origin cap bound them) but on a multi-domain paste list nothing held total tabs down, so ~200 URLs opened ~200 background tabs, collapsed the Chrome renderer pool, and made reachable links fail as unreachable. Global cap is now 10; single-origin behaviour is unchanged. Cookie/consent dismissal pierces open shadow roots (Usercentrics-style CMPs render entirely inside one) and recognises Hindi accept/close labels. WCAG 1.4.1 link analysis now skips nav/header/footer/breadcrumb chrome and stays silent when no stylesheet is readable, instead of flagging every navigation link on every page. Reports and the inventory carry a per-page outcome (Clean / Issues / Unreachable) with a summary tile row, and a completed crawl inventory can be reprojected into the classic criterion-table report with no rescan. Default recipe is axe-core only; media, PDF/Office, visual-state checks, overlay dismissal and audit-both are opt-in.

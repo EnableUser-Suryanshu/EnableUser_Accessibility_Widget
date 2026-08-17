@@ -544,6 +544,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "WORKFLOW_START") sendResponse(await workflowStart(msg.tabId, msg.options));
       else if (msg.type === "WORKFLOW_STOP") sendResponse(await workflowStop(msg.tabId));
       else if (msg.type === "WORKFLOW_STATUS") sendResponse(await workflowStatus(msg.tabId));
+      else if (msg.type === "WORKFLOW_DETAIL") sendResponse(await workflowDetail(msg.tabId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
       else sendResponse({ ok: false, error: "unknown message" });
@@ -748,7 +749,38 @@ async function scanCurrent(tabId, options) {
 // to zero scans instead of scanning forever.
 // ─────────────────────────────────────────────────────────────────────────
 const WF_DEBOUNCE_MS = 1_000;
+const WF_EVIDENCE_MAX = 40;   // evidence snapshots per session (≈1-2 MB each)
 const WF_KEY = (tabId) => `wf:${tabId}`;
+
+// Injected into the page: serialize what the scan saw. DOM capped at 1.5 MB,
+// CSS at 300 KB — enough for AI review of structure/labels/headings without
+// letting a heavy page blow up storage. Cross-origin stylesheets are skipped
+// (CSSOM throws); that limitation is recorded so the AI reviewer knows.
+function captureWfEvidence() {
+  const clip = (s, n) => { s = String(s || ""); return s.length > n ? s.slice(0, n) : s; };
+  let css = "", cssSkipped = 0;
+  try {
+    for (const sheet of document.styleSheets) {
+      try {
+        for (const rule of sheet.cssRules) {
+          css += rule.cssText + "\n";
+          if (css.length > 300_000) break;
+        }
+      } catch { cssSkipped++; }
+      if (css.length > 300_000) break;
+    }
+  } catch {}
+  return {
+    url: location.href,
+    title: document.title,
+    capturedAt: new Date().toISOString(),
+    viewport: { width: innerWidth, height: innerHeight },
+    domBytes: (document.documentElement.outerHTML || "").length,
+    dom: clip(document.documentElement.outerHTML, 1_500_000),
+    css: clip(css, 300_000),
+    crossOriginSheetsSkipped: cssSkipped
+  };
+}
 const workflowSessions = new Map();   // tabId → session (lib/workflow.js shape)
 const _wfRuntime = new Map();         // tabId → { timer, scanning, retrigger }
 
@@ -790,6 +822,14 @@ async function workflowStart(tabId, options) {
   if (existing) return { ok: false, error: "A workflow session is already recording on this tab. Stop it first." };
   const tab = await chrome.tabs.get(tabId);
   if (!/^https?:/.test(tab.url || "")) return { ok: false, error: "Open an http(s) page first." };
+  // The DevTools panel starts sessions without options — fall back to the
+  // operator's saved popup preferences so both entry points behave alike.
+  if (!options) {
+    try {
+      const saved = await chrome.storage.local.get(["profile", "checks", "dismissOverlays"]);
+      options = { profile: saved.profile, checks: saved.checks, dismissOverlays: saved.dismissOverlays };
+    } catch { options = {}; }
+  }
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const session = newSession({
     tabId,
@@ -850,6 +890,49 @@ async function workflowStop(tabId) {
   reports.set(reportId, report);
   await persistReport(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
+
+  // AI evidence bundle (digest Part V — Claude replaces the vendors' server
+  // AI): one JSON with the session timeline, the deduplicated findings that
+  // need judgment, and the per-step DOM/CSS snapshots. Processed offline by
+  // tools/ai-review/. Downloaded automatically; wfev:* keys cleaned after.
+  try {
+    const evKeys = (session.evidenceSteps || []).map(id => `wfev:${session.testId}:${id}`);
+    const stored = evKeys.length ? await chrome.storage.local.get(evKeys) : {};
+    const evidence = evKeys.map(k => stored[k]).filter(Boolean);
+    const bundle = {
+      generator: `EnableUser Accessibility Widget ${chrome.runtime.getManifest().version} — workflow AI evidence bundle v1`,
+      schema: "tools/ai-review/README.md documents the processing contract",
+      testId: session.testId,
+      profile: session.profile,
+      startedAt: session.startedAt,
+      endedAt: session.endedAt,
+      seedUrl: session.seedUrl,
+      pages: session.pages,
+      steps: session.steps,
+      counts: session.counts,
+      // Judgment queue: everything the engines could not decide — the exact
+      // category the vendors ship to their servers. Violations are settled
+      // facts and stay in the report; AI review targets `incomplete`.
+      reviewItems: session.resultsPages.flatMap(p =>
+        (p.incomplete || []).map(r => ({
+          pageUrl: p.url, step: p.workflowStep, ruleId: r.ruleId || r.id,
+          description: r.description || "", help: r.help || "",
+          nodes: (r.nodes || []).slice(0, 20).map(n => ({ html: n.html, target: n.target, failureSummary: n.failureSummary }))
+        }))),
+      evidence
+    };
+    const blob = new Blob([JSON.stringify(bundle)], { type: "application/json" });
+    const dataUrl = await blobToDataUrl(blob);
+    await chrome.downloads.download({
+      url: dataUrl,
+      filename: `enableuser-workflow-ai-bundle-${session.testId}.json`,
+      saveAs: false
+    });
+    if (evKeys.length) await chrome.storage.local.remove(evKeys);
+  } catch (err) {
+    console.warn("[EU] AI evidence bundle export failed (report is unaffected):", err?.message || err);
+  }
+
   return { ok: true, reportId, pages: session.pages.length, steps: session.steps.length, newIssues: session.counts.newIssues };
 }
 
@@ -865,6 +948,22 @@ async function workflowStatus(tabId) {
     scans: session.counts.scans,
     newIssues: session.counts.newIssues,
     suppressedDuplicates: session.counts.suppressedDuplicates,
+    limitReached: session.limitReached
+  };
+}
+
+// Full step/page detail for the DevTools panel's live timeline. resultsPages
+// (the heavy axe payloads) stay out — the panel renders counts, not nodes.
+async function workflowDetail(tabId) {
+  const session = await wfSession(tabId);
+  if (!session) return { ok: true, active: false, steps: [] };
+  return {
+    ok: true,
+    active: !session.endedAt,
+    testId: session.testId,
+    pages: session.pages,
+    steps: session.steps,
+    counts: session.counts,
     limitReached: session.limitReached
   };
 }
@@ -936,6 +1035,23 @@ async function wfScan(tabId, action, href, title) {
     storeSeenSet(session, seen);
     await wfPersist(session);
     console.log(`[EU] workflow scan (${action}) ${page.url} — ${newIssues} new, ${suppressed} duplicate(s) suppressed`);
+
+    // Evidence capture (Claude-as-the-server layer, digest Part V): serialize
+    // the rendered DOM + accessible CSS once per step, so post-session AI
+    // review sees exactly what the scan saw. Capped per session — evidence is
+    // MBs, and an unbounded session must not fill storage.
+    if (step.scans === 1 && (session.evidenceSteps?.length || 0) < WF_EVIDENCE_MAX) {
+      try {
+        const [inj] = await chrome.scripting.executeScript({ target: { tabId }, func: captureWfEvidence });
+        if (inj?.result) {
+          await chrome.storage.local.set({ [`wfev:${session.testId}:${step.stepId}`]: { stepId: step.stepId, action, ...inj.result } });
+          session.evidenceSteps = [...(session.evidenceSteps || []), step.stepId];
+          await wfPersist(session);
+        }
+      } catch (err) {
+        console.warn("[EU] workflow evidence capture failed:", err?.message || err);
+      }
+    }
   } catch (err) {
     console.warn("[EU] workflow scan failed:", err?.message || err);
   } finally {
