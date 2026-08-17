@@ -85,7 +85,21 @@ for (let i = 0; i < 500; i++) recordClick(s2, pg, { tag: "a", text: String(i) })
 check("500 steps recorded without a limit trip", s2.steps.length === 500 && s2.limitReached === false);
 check("scan steps still open past any former cap", openScanStep(s2, STEP_ACTIONS.STATE_CHANGE, pg) !== null);
 
-// ── 5. Activity-mode snapshot signature (scanOnUserActivity) ─────────────
+// ── 5. Click metadata (BrowserStack's step-object fields) ────────────────
+const s3 = newSession({ tabId: 3, testId: "t3", seedUrl: "https://z.com/", profile: "wcag21aa", settings: {} });
+const pg3 = recordPage(s3, "https://z.com/", "Z");
+const clk = recordClick(s3, pg3, {
+  tag: "a", text: "Docs", selector: "a.docs",
+  coordinates: { x: 10, y: 20 }, value: "search term", href: "https://z.com/docs"
+});
+check("click stores coordinates", clk.coordinates?.x === 10 && clk.coordinates?.y === 20);
+check("click stores value", clk.value === "search term");
+check("click stores href", clk.href === "https://z.com/docs");
+check("value truncated to 80", recordClick(s3, pg3, { tag: "input", value: "x".repeat(200) }).value.length === 80);
+const bare = recordClick(s3, pg3, { tag: "button", text: "Go" });
+check("absent metadata adds no fields", !("coordinates" in bare) && !("value" in bare) && !("href" in bare));
+
+// ── 6. Activity-mode snapshot signature (scanOnUserActivity) ─────────────
 // The injected observer's inline copy must detect exactly what this pure
 // twin detects: a structural change OR a serialized-length change flips the
 // signature; identical snapshots compare equal (no false re-scans).
