@@ -12,6 +12,32 @@ see [DIVERGENCE.md](DIVERGENCE.md).
 
 Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA, IS 17802 (Ch 7 / 9 / 10 / 12 / 13), EN 301 549, Section 508, and ADA Title III using axe-core plus India-specific and IS 17802 site-governance checks. Audits linked PDF and Office (docx/xlsx/pptx) documents for structural accessibility. Classifies crawled pages by URL-template shape and DOM simhash (Hamming-distance clustering). Produces a CSV report, scope docx, component inventory, and one-click copy/download of the auditable-URL list.
 
+## Unreleased (workflow-mode branch)
+
+Workflow Analyzer — record-as-you-browse scanning, mechanism mirrored from the
+forensic digest of axe DevTools 4.131.2 (User Flow Analysis) and BrowserStack
+Accessibility Toolkit 8.25 (see `_Workroom/2026-08-17_extension-mechanism-digest`
+for the evidence). Start recording from the popup, browse the journey (login,
+forms, checkout), stop for a timeline report. Hard navigations are caught by
+`tabs.onUpdated status:"complete"` (no webNavigation — both vendors proved it
+unnecessary); SPA/state changes by a body MutationObserver with BrowserStack's
+`attributeFilter:["class"]` config, self-overlay filtering, and hierarchical
+mutation fingerprints so repeated churn (carousels, tickers) never re-triggers.
+Scans are paced by a suppressing 1 s debounce with an in-flight lock plus one
+trailing re-check. The session model is pages[] (normalized-URL identity,
+query/hash stripped) + steps[] ("Full page scan" / "State change detected" /
+"Clicked") with the step-reuse rule — a continuous burst of DOM changes
+collapses into one step. Issues are deduplicated session-wide by
+hash(node html + selector + rule id + page URL), so a violation re-found on a
+later scan counts once; repeats are reported as suppressed-duplicate counts.
+Sessions checkpoint to chrome.storage per step (service-worker-eviction safe),
+cap at 200 steps, and produce the standard report plus a new "Workflow" Excel
+sheet (per-step timeline with new-issue counts). New files: lib/workflow.js
+(session model, 19-invariant test in test/workflow.test.mjs),
+lib/workflow-observer.js (injected observer). Scan execution reuses
+scanInExistingTab under the shared-operation guard, so workflow scans cannot
+race a crawl's ACTIVE_* config.
+
 ## v0.5.0
 
 unifies two independently-developed v0.4.9 builds. Screenshots are now end-to-end: full-page captures plus one highlighted, cropped shot per violating element, embedded in the Excel (inline Preview column on the Violations sheet, on the Pages sheet, and a dedicated Issue Screenshots sheet) and rendered lazily in the report viewer (gallery section plus a Screenshot column, IntersectionObserver-backed so a 200-page crawl does not push hundreds of MB of base64 into the tab up front). Before capturing, the layout viewport is expanded to the full document height so lazy-loaded content below the fold actually renders: captureBeyondViewport reaches that content but never fires its IntersectionObservers, so long pages previously captured blank hero images. Width is left exactly as the tab had it, so evidence never crosses a responsive breakpoint the user was not at. Element captures highlight via an overlay box (an outline alone is clipped by any ancestor with overflow:hidden), crop to a 400x300 minimum so small targets carry legible context, and restore the original scroll position. Single-page scans capture screenshots too, and they run against your own visible tab. Paste-a-list no longer opens every pasted URL at once: the global concurrency cap was 200, harmless on single-origin crawls (the 8-per-origin cap bound them) but on a multi-domain paste list nothing held total tabs down, so ~200 URLs opened ~200 background tabs, collapsed the Chrome renderer pool, and made reachable links fail as unreachable. Global cap is now 10; single-origin behaviour is unchanged. Cookie/consent dismissal pierces open shadow roots (Usercentrics-style CMPs render entirely inside one) and recognises Hindi accept/close labels. WCAG 1.4.1 link analysis now skips nav/header/footer/breadcrumb chrome and stays silent when no stylesheet is readable, instead of flagging every navigation link on every page. Reports and the inventory carry a per-page outcome (Clean / Issues / Unreachable) with a summary tile row, and a completed crawl inventory can be reprojected into the classic criterion-table report with no rescan. Default recipe is axe-core only; media, PDF/Office, visual-state checks, overlay dismissal and audit-both are opt-in.

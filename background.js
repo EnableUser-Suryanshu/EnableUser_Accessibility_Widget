@@ -22,6 +22,7 @@ import { classifyTemplate, templateSlugKey } from "./lib/template-classifier.js"
 import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
+import { newSession, recordPage, openScanStep, recordClick, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS } from "./lib/workflow.js";
 
 // Must match popup.js's DEFAULT_MAX_URLS and the value="" on #opt-max-urls in
 // popup.html. This was 50 while both of those said 500, so the effective default
@@ -539,6 +540,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "DOWNLOAD_AUDIT_XLSX") sendResponse(await downloadInventoryFile(msg.inventoryId, "audit"));
       else if (msg.type === "HIGHLIGHT_ISSUES") sendResponse(await highlightIssuesOnTab(msg.tabId, msg.options));
       else if (msg.type === "CLEAR_HIGHLIGHTS") sendResponse(await clearHighlightsOnTab(msg.tabId));
+      // Workflow mode (see lib/workflow.js + _Workroom mechanism digest).
+      else if (msg.type === "WORKFLOW_START") sendResponse(await workflowStart(msg.tabId, msg.options));
+      else if (msg.type === "WORKFLOW_STOP") sendResponse(await workflowStop(msg.tabId));
+      else if (msg.type === "WORKFLOW_STATUS") sendResponse(await workflowStatus(msg.tabId));
+      else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
+      else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (err) {
       console.error("[EU]", err);
@@ -720,6 +727,247 @@ async function scanCurrent(tabId, options) {
 // function used to build is still available on demand — see
 // openClassicReport(), which adapts a stored inventory back into
 // buildReport's page shape.
+
+// ─────────────────────────────────────────────────────────────────────────
+// Workflow mode — scan as the operator browses. Mechanism mirrored from the
+// axe DevTools UFA skeleton + BrowserStack Workflow Analyzer dedup layers
+// (forensic digest: _Workroom/2026-08-17_extension-mechanism-digest).
+//
+// Lifecycle: WORKFLOW_START arms a session for ONE tab — immediate full
+// scan, observer injected. While active: tabs.onUpdated status:"complete"
+// re-injects the observer and triggers a navigation scan; WF_MUTATED from
+// the observer triggers a debounced state-change scan; WF_CLICK records
+// timeline context. WORKFLOW_STOP builds a standard report (deduped issues)
+// with the step timeline attached, and opens it.
+//
+// Pacing (axe's pattern): a SUPPRESSING debounce — the first trigger
+// schedules a scan WF_DEBOUNCE_MS later; further triggers while the timer or
+// the scan itself is pending are dropped, then one trailing re-check runs if
+// triggers arrived mid-scan. Combined with the observer's fingerprint dedup
+// (a burst with nothing new never signals at all), an animated page settles
+// to zero scans instead of scanning forever.
+// ─────────────────────────────────────────────────────────────────────────
+const WF_DEBOUNCE_MS = 1_000;
+const WF_KEY = (tabId) => `wf:${tabId}`;
+const workflowSessions = new Map();   // tabId → session (lib/workflow.js shape)
+const _wfRuntime = new Map();         // tabId → { timer, scanning, retrigger }
+
+async function wfPersist(session) {
+  try { await chrome.storage.local.set({ [WF_KEY(session.tabId)]: session }); }
+  catch (err) { console.warn("[EU] workflow persist failed", err?.message || err); }
+}
+
+// Sessions survive service-worker eviction: rehydrate from storage on demand.
+async function wfSession(tabId) {
+  let s = workflowSessions.get(tabId);
+  if (s) return s;
+  try {
+    const got = await chrome.storage.local.get(WF_KEY(tabId));
+    s = got?.[WF_KEY(tabId)] || null;
+    if (s && !s.endedAt) { workflowSessions.set(tabId, s); return s; }
+  } catch {}
+  return null;
+}
+
+function wfRuntime(tabId) {
+  let r = _wfRuntime.get(tabId);
+  if (!r) { r = { timer: null, scanning: false, retrigger: false }; _wfRuntime.set(tabId, r); }
+  return r;
+}
+
+async function wfInjectObserver(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["lib/workflow-observer.js"] });
+    return true;
+  } catch (err) {
+    console.warn(`[EU] workflow observer injection failed (tab ${tabId}):`, err?.message || err);
+    return false;
+  }
+}
+
+async function workflowStart(tabId, options) {
+  const existing = await wfSession(tabId);
+  if (existing) return { ok: false, error: "A workflow session is already recording on this tab. Stop it first." };
+  const tab = await chrome.tabs.get(tabId);
+  if (!/^https?:/.test(tab.url || "")) return { ok: false, error: "Open an http(s) page first." };
+  const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
+  const session = newSession({
+    tabId,
+    testId: `wf-${Date.now()}`,
+    seedUrl: tab.url,
+    seedTitle: tab.title || "",
+    profile,
+    settings: {
+      profile,
+      checks: options?.checks || {},
+      dismissOverlays: !!options?.dismissOverlays
+    }
+  });
+  workflowSessions.set(tabId, session);
+  await wfPersist(session);
+  await wfInjectObserver(tabId);
+  // Immediate first scan — the "Full page scan" step (axe's initial:true).
+  await wfScan(tabId, STEP_ACTIONS.FULL_SCAN);
+  return { ok: true, testId: session.testId };
+}
+
+async function workflowStop(tabId) {
+  const session = await wfSession(tabId);
+  if (!session) return { ok: false, error: "No workflow session on this tab." };
+  const rt = wfRuntime(tabId);
+  if (rt.timer) { clearTimeout(rt.timer); rt.timer = null; }
+  session.endedAt = new Date().toISOString();
+  workflowSessions.delete(tabId);
+  _wfRuntime.delete(tabId);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => { try { window.__euWfObserver && window.__euWfObserver.stop(); } catch {} }
+    });
+  } catch {}
+  await chrome.storage.local.remove(WF_KEY(tabId)).catch(() => {});
+
+  if (!session.resultsPages.length) return { ok: false, error: "Session recorded no scans — nothing to report." };
+  const report = buildReport(session.resultsPages, {
+    mode: "workflow",
+    seedUrl: session.seedUrl,
+    profile: session.profile,
+    stopReason: session.limitReached ? `step limit reached (${session.steps.length})` : "stopped by operator"
+  });
+  report.workflow = {
+    testId: session.testId,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    pages: session.pages,
+    steps: session.steps,
+    counts: session.counts,
+    limitReached: session.limitReached
+  };
+  report.settings = settingsEcho("workflow session", {
+    profile: session.profile, maxUrls: session.pages.length, crawlDepth: 0
+  });
+  const reportId = `r-${Date.now()}`;
+  reports.set(reportId, report);
+  await persistReport(reportId, report);
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
+  return { ok: true, reportId, pages: session.pages.length, steps: session.steps.length, newIssues: session.counts.newIssues };
+}
+
+async function workflowStatus(tabId) {
+  const session = await wfSession(tabId);
+  if (!session) return { ok: true, active: false };
+  return {
+    ok: true,
+    active: true,
+    testId: session.testId,
+    pages: session.pages.length,
+    steps: session.steps.length,
+    scans: session.counts.scans,
+    newIssues: session.counts.newIssues,
+    suppressedDuplicates: session.counts.suppressedDuplicates,
+    limitReached: session.limitReached
+  };
+}
+
+async function workflowOnMutated(sender, msg) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return { ok: false };
+  const session = await wfSession(tabId);
+  if (!session || session.limitReached) return { ok: true, ignored: true };
+  wfTrigger(tabId, STEP_ACTIONS.STATE_CHANGE, msg?.href, msg?.title);
+  return { ok: true };
+}
+
+async function workflowOnClick(sender, msg) {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return { ok: false };
+  const session = await wfSession(tabId);
+  if (!session || session.limitReached) return { ok: true, ignored: true };
+  const page = recordPage(session, msg?.href || session.seedUrl, msg?.title || "");
+  recordClick(session, page, msg?.info || {});
+  await wfPersist(session);
+  return { ok: true };
+}
+
+// Suppressing debounce + in-flight lock, with one trailing re-check: triggers
+// during a scan set `retrigger` so a change that landed mid-scan still gets
+// scanned once afterwards (axe drops these entirely; the trailing pass closes
+// that small gap without allowing storms).
+function wfTrigger(tabId, action, href, title) {
+  const rt = wfRuntime(tabId);
+  if (rt.scanning) { rt.retrigger = true; return; }
+  if (rt.timer) return;
+  rt.timer = setTimeout(async () => {
+    rt.timer = null;
+    await wfScan(tabId, action, href, title);
+  }, WF_DEBOUNCE_MS);
+}
+
+async function wfScan(tabId, action, href, title) {
+  const session = await wfSession(tabId);
+  if (!session || session.limitReached) return;
+  const rt = wfRuntime(tabId);
+  if (rt.scanning) { rt.retrigger = true; return; }
+  rt.scanning = true;
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || !/^https?:/.test(tab.url || "")) return;
+    const pageUrl = href || tab.url;
+    const page = recordPage(session, pageUrl, title || tab.title || "");
+    const step = openScanStep(session, action, page);
+    if (!step) { await wfPersist(session); return; }  // step limit hit
+
+    // Same shared-config discipline as every other scan path: claim the
+    // operation so a concurrent crawl can't have its ACTIVE_* flipped under
+    // it. If something else is running, skip this cycle — the next trigger
+    // retries.
+    const res = await withOperation("workflow-scan", async () => {
+      ACTIVE_AXE_TAGS = tagsForProfile(session.profile);
+      ACTIVE_CHECKS = checksFromOptions(session.settings);
+      ACTIVE_DISMISS = !!session.settings.dismissOverlays;
+      ACTIVE_AUDIT_BOTH = false;      // one pass per state — speed matters here
+      ACTIVE_SCREENSHOTS = false;     // findings-only in workflow mode (v1)
+      return scanInExistingTab(tabId);
+    });
+    if (!res || res.ok === false) { console.warn("[EU] workflow scan skipped:", res?.error || "no result"); return; }
+
+    const seen = seenSetFrom(session);
+    const { newIssues, suppressed } = ingestScan(session, step, res, page.url, seen);
+    storeSeenSet(session, seen);
+    await wfPersist(session);
+    console.log(`[EU] workflow scan (${action}) ${page.url} — ${newIssues} new, ${suppressed} duplicate(s) suppressed`);
+  } catch (err) {
+    console.warn("[EU] workflow scan failed:", err?.message || err);
+  } finally {
+    rt.scanning = false;
+    if (rt.retrigger) {
+      rt.retrigger = false;
+      wfTrigger(tabId, STEP_ACTIONS.STATE_CHANGE);
+    }
+  }
+}
+
+// Hard navigations: the document (and its observer) died — re-inject and
+// scan the fresh page. Fires only while a session is active on that tab.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  (async () => {
+    const session = await wfSession(tabId);
+    if (!session || session.limitReached) return;
+    await wfInjectObserver(tabId);
+    wfTrigger(tabId, STEP_ACTIONS.FULL_SCAN, tab?.url, tab?.title);
+  })();
+});
+
+// Tab closed mid-session: keep the persisted session so WORKFLOW_STOP-style
+// recovery remains possible from the popup (it reads storage), but drop the
+// in-memory runtime.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const rt = _wfRuntime.get(tabId);
+  if (rt?.timer) clearTimeout(rt.timer);
+  _wfRuntime.delete(tabId);
+  workflowSessions.delete(tabId);
+});
 
 // Rebuild the classic report.html presentation (WCAG criterion status,
 // conformance by standard, media & documents, passes/incomplete/inapplicable

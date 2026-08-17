@@ -22,6 +22,56 @@ const chkLinkCheck = $("opt-linkcheck");
 const btnRecover = $("btn-recover");
 const btnHighlight = $("btn-highlight");
 const btnClearHighlight = $("btn-clear-highlight");
+const btnWorkflow = $("btn-workflow");
+
+// ── Workflow mode ────────────────────────────────────────────────────────
+// One button, two states: Record (no session on the current tab) ↔ Stop
+// (session recording). Status is read from background on open so the button
+// reflects reality even after the popup was closed mid-session.
+async function refreshWorkflowButton() {
+  if (!btnWorkflow) return;
+  const tab = await getActiveTab();
+  if (!tab) return;
+  const st = await send({ type: "WORKFLOW_STATUS", tabId: tab.id });
+  if (st?.active) {
+    btnWorkflow.textContent = "Stop";
+    btnWorkflow.dataset.active = "1";
+    setStatus(`Recording — ${st.pages} page(s), ${st.steps} step(s), ${st.newIssues} unique issue(s)` +
+      (st.suppressedDuplicates ? ` (${st.suppressedDuplicates} duplicates suppressed)` : "") +
+      (st.limitReached ? " — step limit reached, stop to get the report" : ""));
+  } else {
+    btnWorkflow.textContent = "Record";
+    delete btnWorkflow.dataset.active;
+  }
+}
+
+btnWorkflow?.addEventListener("click", async () => {
+  const tab = await getActiveTab();
+  if (!tab || !/^https?:/.test(tab.url || "")) { setStatus("Open an http(s) page first.", true); return; }
+  if (btnWorkflow.dataset.active) {
+    setBusy(true);
+    setStatus("Stopping — building the workflow report…");
+    const res = await send({ type: "WORKFLOW_STOP", tabId: tab.id });
+    setBusy(false);
+    if (!res?.ok) { setStatus(res?.error || "Stop failed.", true); return; }
+    setStatus(`Report opening — ${res.pages} page(s), ${res.steps} step(s), ${res.newIssues} unique issue(s).`);
+    window.close();
+    return;
+  }
+  const granted = await ensureHostPermission(tab.url);
+  if (!granted) { setStatus("Permission denied.", true); return; }
+  const opts = readScanOptions();
+  setStatus("Starting workflow recording — first scan running…");
+  const res = await send({
+    type: "WORKFLOW_START", tabId: tab.id,
+    options: { profile: opts.profile, checks: opts.checks, dismissOverlays: opts.dismissOverlays }
+  });
+  if (!res?.ok) { setStatus(res?.error || "Start failed.", true); return; }
+  setStatus("Recording. Browse the journey in this tab — every page load and change is scanned. Reopen this popup and press Stop for the report.");
+  await refreshWorkflowButton();
+});
+
+refreshWorkflowButton().catch(() => {});
 
 // First-run defaults — what the operator sees the first time they open the
 // popup with no stored preferences yet. WCAG 2.1 AA is the global baseline
