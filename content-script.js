@@ -4,7 +4,8 @@
 // Also computes a SiteScope-style DOM fingerprint + URL cluster + text hash
 // so the background can cluster pages into templates in the report.
 
-(async () => {
+async function __euScan() {
+  window.__euScanRunning = true;
   try {
     // Operator's scan options (tag set, per-check toggles, overlay dismissal)
     // handed in by background.js via window.__EU_SCAN_OPTS in this ISOLATED world.
@@ -45,7 +46,6 @@
         setTimeout(tick, 150);
       })();
     });
-
     const started = performance.now();
     const startedAt = new Date().toISOString();
 
@@ -205,7 +205,7 @@
       passes: normRules(res.passes),
       incomplete: normRules(res.incomplete),
       inapplicable: normRules(res.inapplicable),
-      template: await computeTemplateSignals(),
+      template: (await computeTemplateSignals()),
       // Flat inventory of every video / audio / embedded player / document
       // link found on this page. Feeds the report's Media & Documents section.
       mediaInventory,
@@ -214,14 +214,33 @@
       // counts on every page. null if the check module didn't run.
       is17802Site
     };
-
     chrome.runtime.sendMessage({ type: "SCAN_RESULT", payload });
   } catch (err) {
     chrome.runtime.sendMessage({
       type: "SCAN_ERROR",
       payload: { reason: String(err?.message || err), stack: err?.stack || "" }
     });
+  } finally {
+    window.__euScanRunning = false;
   }
+}
+
+// Re-scan support. Chrome silently no-ops a second
+// chrome.scripting.executeScript({files:[...]}) of the same file into the
+// same document + world — verified empirically (Chrome 152): the call
+// resolves in 0 ms and the script body never executes. So the FIRST
+// injection wires a persistent EU_RESCAN listener and runs the scan; every
+// later scan of this document is triggered by message instead of
+// re-injection (see runContentScan). The latch stops overlapping runs —
+// axe.run throws if started while a run is in flight.
+(() => {
+  if (!window.__euScanWired) {
+    window.__euScanWired = true;
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === "EU_RESCAN" && !window.__euScanRunning) __euScan();
+    });
+  }
+  __euScan();
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -40,6 +40,19 @@ race a crawl's ACTIVE_* config.
 
 Also on this branch:
 
+Critical fix, found by live end-to-end testing: Chrome silently no-ops a
+second chrome.scripting.executeScript({files}) of the same file into the
+same document+world — verified on Chrome 152 (the call resolves in 0 ms,
+the script never runs). Any SECOND scan of the same document therefore hung
+until the 60 s timeout — latent since v0.4.x (the crawler opens a fresh tab
+per URL so it never re-scans a document; workflow mode re-scans constantly
+and exposed it, and it also broke a repeated popup 'Scan current page' on
+the same page). Fix: content-script.js now wires a persistent EU_RESCAN
+listener on first injection and guards re-entry; runContentScan messages
+first and injects the file only when no listener answers (fresh document).
+Verified live: second scan 60 s hang → 1 s; full workflow session on
+zerodha.com: 2 pages, 2 steps, 93 unique issues, report + evidence bundle.
+
 DevTools panel — `devtools/` registers an "EnableUser" panel
 (chrome.devtools.panels.create, inspected tabId passed via query string, the
 BrowserStack pattern) with a live workflow surface: Start/Stop, recording

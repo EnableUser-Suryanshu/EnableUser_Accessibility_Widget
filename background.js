@@ -3747,11 +3747,24 @@ function runContentScan(tabId) {
           args: [{ axeTags: ACTIVE_AXE_TAGS, checks: ACTIVE_CHECKS, dismissOverlays: ACTIVE_DISMISS, auditBoth: ACTIVE_AUDIT_BOTH }]
         });
       } catch (e) { /* fall back to content-script default */ }
-      await chrome.scripting.executeScript({
-        target: { tabId, allFrames: false },
-        files: ["content-script.js"],
-        world: "ISOLATED"
-      });
+      // Message-first: if this document was scanned before, a persistent
+      // EU_RESCAN listener re-runs the scan. Re-injecting the same file is a
+      // silent no-op (Chrome dedupes file+world+document — the second scan
+      // used to hang on that until timeout). First scan of a document has no
+      // listener yet: sendMessage rejects and we inject the file, which runs
+      // immediately on load.
+      let retriggered = false;
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: "EU_RESCAN" });
+        retriggered = true;
+      } catch { /* no listener in this document yet — inject below */ }
+      if (!retriggered) {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: false },
+          files: ["content-script.js"],
+          world: "ISOLATED"
+        });
+      }
     } catch (err) {
       clearTimeout(timeoutId);
       pending.delete(tabId);
