@@ -787,6 +787,21 @@ function captureWfEvidence() {
 const workflowSessions = new Map();   // tabId → session (lib/workflow.js shape)
 const _wfRuntime = new Map();         // tabId → { timer, scanning, retrigger }
 
+// MV3 keep-alive during workflow sessions (BrowserStack's 250 s port
+// pattern). The debounce timer and the _wfRuntime flags live in worker
+// memory: if Chrome evicts the idle worker mid-debounce, a pending scan is
+// silently lost until the next mutation signal. The injected observer (top
+// frame only) holds a long-lived port for the session's lifetime and
+// reconnects whenever it drops — each connect resets the worker's idle
+// timer, so the worker stays alive exactly as long as a recording is
+// running. Merely holding the reference is the whole job.
+const wfKeepalivePorts = new Set();
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "eu-wf-keepalive") return;
+  wfKeepalivePorts.add(port);
+  port.onDisconnect.addListener(() => wfKeepalivePorts.delete(port));
+});
+
 async function wfPersist(session) {
   try { await chrome.storage.local.set({ [WF_KEY(session.tabId)]: session }); }
   catch (err) { console.warn("[EU] workflow persist failed", err?.message || err); }
