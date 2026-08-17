@@ -1086,7 +1086,20 @@ async function wfScan(tabId, action, href, title) {
       try {
         const [inj] = await chrome.scripting.executeScript({ target: { tabId }, func: captureWfEvidence });
         if (inj?.result) {
-          await chrome.storage.local.set({ [`wfev:${session.testId}:${step.stepId}`]: { stepId: step.stepId, action, ...inj.result } });
+          // Pixel evidence (BrowserStack NRV pattern, debugger-free): the
+          // workflow tab is the tab the operator is actively browsing, so
+          // captureVisibleTab works. Needs-review items like contrast over
+          // background images can only be judged from pixels — DOM+CSS
+          // evidence cannot settle them. Best-effort: fails benignly when
+          // the tab lost focus mid-capture, and the absence is visible in
+          // the bundle (viewportShot: null).
+          let viewportShot = null;
+          try {
+            viewportShot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+          } catch (err) {
+            console.warn("[EU] workflow viewport shot skipped:", err?.message || err);
+          }
+          await chrome.storage.local.set({ [`wfev:${session.testId}:${step.stepId}`]: { stepId: step.stepId, action, viewportShot, ...inj.result } });
           session.evidenceSteps = [...(session.evidenceSteps || []), step.stepId];
           await wfPersist(session);
         }

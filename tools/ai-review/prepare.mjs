@@ -27,6 +27,20 @@ function domExcerpt(dom, nodeHtml, radius = 4000) {
   return { excerpt: dom.slice(start, at + probe.length + radius), note: `bytes ${start}–${at + probe.length + radius} of snapshot` };
 }
 
+// Pixel evidence: one viewport PNG per step (captured at scan time in the
+// operator's live tab). Written once per step; every case from that step
+// references it so the judge sees actual pixels — required for contrast-
+// over-image reviews that DOM+CSS cannot settle.
+const shotForStep = new Map();
+for (const e of bundle.evidence || []) {
+  if (e.viewportShot && e.viewportShot.startsWith("data:image/")) {
+    const png = Buffer.from(e.viewportShot.split(",")[1], "base64");
+    const name = `step-${e.stepId}.png`;
+    writeFileSync(join(outdir, name), png);
+    shotForStep.set(e.stepId, name);
+  }
+}
+
 const index = [];
 let n = 0;
 for (const item of bundle.reviewItems || []) {
@@ -46,6 +60,9 @@ for (const item of bundle.reviewItems || []) {
 ${node.html || "(none)"}
 \`\`\`
 Selector: \`${JSON.stringify(node.target || [])}\`
+
+## Pixel evidence
+${shotForStep.get(item.step) ? `Viewport screenshot at scan time: **${shotForStep.get(item.step)}** (same folder). Read it before judging anything colour/contrast/visual.` : "No viewport screenshot was captured for this step — if the judgment needs pixels, verdict must be needs-human."}
 
 ## Evidence (rendered DOM excerpt — ${note})
 \`\`\`html
