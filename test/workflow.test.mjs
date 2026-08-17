@@ -15,7 +15,8 @@
 
 import {
   normalizePageUrl, issueHash, newSession, recordPage, openScanStep,
-  recordClick, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS, MAX_STEPS
+  recordClick, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS, MAX_STEPS,
+  activitySignature
 } from "../lib/workflow.js";
 
 let failures = 0;
@@ -83,6 +84,17 @@ const pg = recordPage(s2, "https://y.com/", "Y");
 for (let i = 0; i < 500; i++) recordClick(s2, pg, { tag: "a", text: String(i) });
 check("500 steps recorded without a limit trip", s2.steps.length === 500 && s2.limitReached === false);
 check("scan steps still open past any former cap", openScanStep(s2, STEP_ACTIONS.STATE_CHANGE, pg) !== null);
+
+// ── 5. Activity-mode snapshot signature (scanOnUserActivity) ─────────────
+// The injected observer's inline copy must detect exactly what this pure
+// twin detects: a structural change OR a serialized-length change flips the
+// signature; identical snapshots compare equal (no false re-scans).
+const sigA = activitySignature(["DIV", "P", "SPAN"], 1234);
+check("signature stable for identical snapshot", sigA === activitySignature(["DIV", "P", "SPAN"], 1234));
+check("signature changes when tag structure changes", sigA !== activitySignature(["DIV", "P", "A"], 1234));
+check("signature changes when an element is added", sigA !== activitySignature(["DIV", "P", "SPAN", "SPAN"], 1234));
+check("signature changes when content length changes", sigA !== activitySignature(["DIV", "P", "SPAN"], 1235));
+check("empty page yields a signature too", typeof activitySignature([], 0) === "string" && activitySignature([], 0).length > 0);
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log("\nall workflow invariants hold");

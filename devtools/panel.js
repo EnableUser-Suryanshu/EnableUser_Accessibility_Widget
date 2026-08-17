@@ -26,7 +26,7 @@ const CHECK_IDS = {
 };
 async function loadSettings() {
   try {
-    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks"]);
+    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "wfScanOnActivity"]);
     if (Number.isFinite(s.maxUrls)) $("opt-max-urls").value = s.maxUrls;
     if (Number.isFinite(s.crawlDepth)) $("opt-depth").value = s.crawlDepth;
     if (s.profile) $("opt-profile").value = s.profile;
@@ -42,6 +42,7 @@ async function loadSettings() {
     $("opt-screenshots").checked = s.screenshots === true;
     $("opt-links-only").checked = s.linksOnly !== false;
     $("opt-linkcheck").checked = s.brokenLinks !== false;
+    $("opt-wf-activity").checked = s.wfScanOnActivity === true;  // default: DOM observer
   } catch {}
 }
 function readSettings() {
@@ -56,7 +57,8 @@ function readSettings() {
     auditBoth: $("opt-audit-both").checked,
     screenshots: $("opt-screenshots").checked,
     linksOnly: $("opt-links-only").checked,
-    brokenLinks: $("opt-linkcheck").checked
+    brokenLinks: $("opt-linkcheck").checked,
+    wfScanOnActivity: $("opt-wf-activity").checked
   };
   chrome.storage.local.set(opts).catch(() => {});
   return opts;

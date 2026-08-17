@@ -815,6 +815,19 @@ function wfRuntime(tabId) {
 // and freshly created iframes execute normally, which is exactly the re-arm
 // we want.
 async function wfInjectObserver(tabId) {
+  // Activity mode (wfScanOnActivity): the observer file reads
+  // window.__euWfMode ONCE at arm time, so the flag must land first.
+  // Function-form injection executes every time (unlike the file form —
+  // the 7a50bc9 dedup trap), so re-arms refresh it for new documents too.
+  const session = await wfSession(tabId);
+  if (session?.settings?.wfScanOnActivity) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => { window.__euWfMode = "activity"; }
+      });
+    } catch { /* fall through — observer file defaults to observer mode */ }
+  }
   try {
     await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["lib/workflow-observer.js"] });
     return true;
@@ -845,6 +858,15 @@ async function workflowStart(tabId, options) {
       options = { profile: saved.profile, checks: saved.checks, dismissOverlays: saved.dismissOverlays };
     } catch { options = {}; }
   }
+  // Trigger-mode setting (BrowserStack's scanOnUserActivity alternative):
+  // callers that don't carry the option (the popup) fall back to the saved
+  // panel setting so both entry points behave alike.
+  if (options.wfScanOnActivity === undefined) {
+    try {
+      const saved = await chrome.storage.local.get("wfScanOnActivity");
+      options.wfScanOnActivity = !!saved.wfScanOnActivity;
+    } catch { options.wfScanOnActivity = false; }
+  }
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const session = newSession({
     tabId,
@@ -855,7 +877,8 @@ async function workflowStart(tabId, options) {
     settings: {
       profile,
       checks: options?.checks || {},
-      dismissOverlays: !!options?.dismissOverlays
+      dismissOverlays: !!options?.dismissOverlays,
+      wfScanOnActivity: !!options?.wfScanOnActivity
     }
   });
   workflowSessions.set(tabId, session);
