@@ -1,12 +1,12 @@
-// DevTools bootstrap — creates the "EnableUser" panel. Mirrors both vendors'
-// approach: axe passes the panel page plainly; BrowserStack passes the
-// inspected tabId in the query string so the panel needs no devtools API of
-// its own. We do the BrowserStack thing — it keeps panel.js free to run in
-// any context (easier to test) — and, like axe, register nothing else here:
-// no sidebar panes, no devtools.network listeners (the background's
-// tabs.onUpdated listener is the navigation source of truth).
+// DevTools bootstrap — creates the "EnableUser" panel in the inspector.
+// CRITICAL path detail: chrome.devtools.panels.create resolves BOTH the icon
+// path and the page path relative to the EXTENSION ROOT, not this file's
+// directory. "panel.html" here would point at a nonexistent root file and the
+// panel renders blank — the exact bug shipped in the first cut of this file.
+// tabId rides the query string (BrowserStack's pattern) so panel.js never
+// needs chrome.devtools APIs.
 chrome.devtools.panels.create(
   "EnableUser",
-  "../icons/icon48.png",
-  `panel.html?tabId=${chrome.devtools.inspectedWindow.tabId}`
+  "icons/icon48.png",
+  `devtools/panel.html?tabId=${chrome.devtools.inspectedWindow.tabId}`
 );

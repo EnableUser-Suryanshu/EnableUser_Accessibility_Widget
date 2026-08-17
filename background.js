@@ -545,6 +545,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "WORKFLOW_STOP") sendResponse(await workflowStop(msg.tabId));
       else if (msg.type === "WORKFLOW_STATUS") sendResponse(await workflowStatus(msg.tabId));
       else if (msg.type === "WORKFLOW_DETAIL") sendResponse(await workflowDetail(msg.tabId));
+      else if (msg.type === "PANEL_SCAN_PAGE") sendResponse(await panelScanPage(msg.tabId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
       else sendResponse({ ok: false, error: "unknown message" });
@@ -958,9 +959,18 @@ async function workflowStatus(tabId) {
 
 // Full step/page detail for the DevTools panel's live timeline. resultsPages
 // (the heavy axe payloads) stay out — the panel renders counts, not nodes.
+// `activity` is what makes the panel feel alive: settling (change detected,
+// debounce running) and scanning (axe in flight) drive the status line —
+// the "Analyzing, please wait…" states both vendors show.
 async function workflowDetail(tabId) {
   const session = await wfSession(tabId);
-  if (!session) return { ok: true, active: false, steps: [] };
+  const rt = _wfRuntime.get(tabId);
+  const activity = {
+    settling: !!rt?.timer,
+    scanning: !!rt?.scanning,
+    pendingAction: rt?.pending?.action || null
+  };
+  if (!session) return { ok: true, active: false, steps: [], activity };
   return {
     ok: true,
     active: !session.endedAt,
@@ -968,8 +978,24 @@ async function workflowDetail(tabId) {
     pages: session.pages,
     steps: session.steps,
     counts: session.counts,
-    limitReached: session.limitReached
+    limitReached: session.limitReached,
+    activity
   };
+}
+
+// Panel-initiated single-page scan — the panel is a full surface, not a
+// popup companion. Reuses scanCurrent (which opens the report tab) with the
+// operator's saved popup preferences.
+async function panelScanPage(tabId) {
+  let options = {};
+  try {
+    const saved = await chrome.storage.local.get(["profile", "checks", "dismissOverlays", "auditBoth", "screenshots"]);
+    options = {
+      profile: saved.profile, checks: saved.checks,
+      dismissOverlays: saved.dismissOverlays, auditBoth: saved.auditBoth, screenshots: saved.screenshots
+    };
+  } catch {}
+  return withOperation("scan-current", () => scanCurrent(tabId, options));
 }
 
 async function workflowOnMutated(sender, msg) {

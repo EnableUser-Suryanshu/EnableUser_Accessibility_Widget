@@ -10,13 +10,19 @@
       <div class="brand">
         <span class="dot" id="rec-dot" hidden></span>
         <strong>EnableUser</strong>
-        <span class="muted">Workflow Analyzer</span>
+        <span class="muted">Accessibility Testing</span>
       </div>
       <div class="actions">
-        <button id="btn-record" class="primary">Start recording</button>
+        <button id="btn-scan" class="primary">Scan this page</button>
+        <button id="btn-record">Record workflow</button>
         <button id="btn-report" hidden>Open report</button>
       </div>
     </header>
+
+    <div class="activity" id="activity" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="activity-text">Working…</span>
+    </div>
 
     <section class="stats" id="stats" hidden>
       <div class="stat"><span id="st-pages">0</span><label>pages</label></div>
@@ -28,10 +34,11 @@
 
     <main>
       <p id="empty" class="empty">
-        Start recording, then browse the journey in the inspected tab — log in,
-        fill the form, check out. Every page load and page change is scanned
-        automatically; repeated issues are counted once. Stop for the timeline
-        report and the AI evidence bundle.
+        <strong>Scan this page</strong> audits the inspected page and opens the
+        report. <strong>Record workflow</strong> watches while you browse —
+        log in, fill the form, check out — scanning every page load and page
+        change automatically, counting repeated issues once. Stop for the
+        timeline report and the AI evidence bundle.
       </p>
       <ol id="timeline" class="timeline" reversed></ol>
     </main>
