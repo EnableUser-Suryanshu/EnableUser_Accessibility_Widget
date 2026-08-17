@@ -10,7 +10,6 @@ if (!dir || !outPath) {
 }
 const THRESHOLD = Number.isFinite(parseFloat(thresholdArg)) ? parseFloat(thresholdArg) : 0.7;
 const indexed = JSON.parse(readFileSync(join(dir, "INDEX.json"), "utf8"));
-const byId = new Map(indexed.cases.map(c => [c.caseId, c]));
 
 const confirmed = [], dismissed = [], reviewQueue = [], missing = [];
 for (const c of indexed.cases) {

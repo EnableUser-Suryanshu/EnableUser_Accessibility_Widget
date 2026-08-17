@@ -803,7 +803,7 @@ async function wfSession(tabId) {
 
 function wfRuntime(tabId) {
   let r = _wfRuntime.get(tabId);
-  if (!r) { r = { timer: null, scanning: false, retrigger: false }; _wfRuntime.set(tabId, r); }
+  if (!r) { r = { timer: null, scanning: false, retrigger: false, pending: null }; _wfRuntime.set(tabId, r); }
   return r;
 }
 
@@ -867,7 +867,11 @@ async function workflowStop(tabId) {
   } catch {}
   await chrome.storage.local.remove(WF_KEY(tabId)).catch(() => {});
 
-  if (!session.resultsPages.length) return { ok: false, error: "Session recorded no scans — nothing to report." };
+  if (!session.resultsPages.length) {
+    // The session IS ended and cleaned up at this point — say so accurately
+    // instead of implying the stop failed.
+    return { ok: false, error: "Session ended. No scans completed (the page may not have finished loading, or another scan was running), so there is no report." };
+  }
   const report = buildReport(session.resultsPages, {
     mode: "workflow",
     seedUrl: session.seedUrl,
@@ -992,13 +996,25 @@ async function workflowOnClick(sender, msg) {
 // during a scan set `retrigger` so a change that landed mid-scan still gets
 // scanned once afterwards (axe drops these entirely; the trailing pass closes
 // that small gap without allowing storms).
+//
+// A pending trigger is UPGRADED, not dropped, when a stronger one arrives:
+// navigation completing while a mutation timer is pending must relabel the
+// pending scan "Full page scan" and refresh its URL — otherwise the post-
+// navigation scan is recorded as a state change of the previous page.
 function wfTrigger(tabId, action, href, title) {
   const rt = wfRuntime(tabId);
   if (rt.scanning) { rt.retrigger = true; return; }
-  if (rt.timer) return;
+  if (rt.timer) {
+    if (action === STEP_ACTIONS.FULL_SCAN) rt.pending = { action, href, title };
+    else if (href && rt.pending) rt.pending = { ...rt.pending, href, title };
+    return;
+  }
+  rt.pending = { action, href, title };
   rt.timer = setTimeout(async () => {
     rt.timer = null;
-    await wfScan(tabId, action, href, title);
+    const p = rt.pending || { action };
+    rt.pending = null;
+    await wfScan(tabId, p.action, p.href, p.title);
   }, WF_DEBOUNCE_MS);
 }
 
@@ -1012,14 +1028,10 @@ async function wfScan(tabId, action, href, title) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || !/^https?:/.test(tab.url || "")) return;
     const pageUrl = href || tab.url;
-    const page = recordPage(session, pageUrl, title || tab.title || "");
-    const step = openScanStep(session, action, page);
-    if (!step) { await wfPersist(session); return; }  // step limit hit
 
-    // Same shared-config discipline as every other scan path: claim the
-    // operation so a concurrent crawl can't have its ACTIVE_* flipped under
-    // it. If something else is running, skip this cycle — the next trigger
-    // retries.
+    // Scan FIRST, record after: if the operation guard is busy (a crawl is
+    // running) or the scan throws, no step is created — the timeline never
+    // shows a "State change detected" row with zero scans behind it.
     const res = await withOperation("workflow-scan", async () => {
       ACTIVE_AXE_TAGS = tagsForProfile(session.profile);
       ACTIVE_CHECKS = checksFromOptions(session.settings);
@@ -1029,6 +1041,10 @@ async function wfScan(tabId, action, href, title) {
       return scanInExistingTab(tabId);
     });
     if (!res || res.ok === false) { console.warn("[EU] workflow scan skipped:", res?.error || "no result"); return; }
+
+    const page = recordPage(session, pageUrl, title || tab.title || "");
+    const step = openScanStep(session, action, page);
+    if (!step) { await wfPersist(session); return; }  // step limit hit
 
     const seen = seenSetFrom(session);
     const { newIssues, suppressed } = ingestScan(session, step, res, page.url, seen);
