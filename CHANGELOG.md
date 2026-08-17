@@ -40,6 +40,13 @@ race a crawl's ACTIVE_* config.
 
 Also on this branch:
 
+DevTools panel is now the FULL extension surface (light, card-based layout):
+Page Scan (scan + highlight/clear + open report), Workflow Analyzer (record
+user flow with live stats + timeline), Site Crawl with max-URLs/depth and
+crawl-progress display, Template Check (paste list), crash recovery, and a
+Settings card persisted to the same storage keys as the popup so both
+surfaces always agree. Live-verified 17/17 by the puppeteer harness.
+
 Cap removal pass, honouring the v0.5.1 no-silent-caps rule across the new
 workflow/AI code: MAX_STEPS 200 → Infinity (sessions unbounded; the
 mutation-fingerprint dedup, not a ceiling, is what protects against

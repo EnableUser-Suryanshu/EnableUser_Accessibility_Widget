@@ -5,17 +5,15 @@
     <title>EnableUser</title>
     <link rel="stylesheet" href="panel.css" />
   </head>
-  <body class="theme-dark">
-    <header class="bar">
+  <body>
+    <header class="topbar">
       <div class="brand">
-        <span class="dot" id="rec-dot" hidden></span>
         <strong>EnableUser</strong>
-        <span class="muted">Accessibility Testing</span>
+        <span class="engine">axe-core 4.12.1 + EU suites</span>
       </div>
-      <div class="actions">
-        <button id="btn-scan" class="primary">Scan this page</button>
-        <button id="btn-record">Record workflow</button>
-        <button id="btn-report" hidden>Open report</button>
+      <div class="right">
+        <span class="dot" id="rec-dot" hidden></span>
+        <span id="status" class="muted"></span>
       </div>
     </header>
 
@@ -24,28 +22,88 @@
       <span id="activity-text">Working…</span>
     </div>
 
-    <section class="stats" id="stats" hidden>
-      <div class="stat"><span id="st-pages">0</span><label>pages</label></div>
-      <div class="stat"><span id="st-steps">0</span><label>steps</label></div>
-      <div class="stat"><span id="st-scans">0</span><label>scans</label></div>
-      <div class="stat accent"><span id="st-issues">0</span><label>unique issues</label></div>
-      <div class="stat muted"><span id="st-dupes">0</span><label>repeats suppressed</label></div>
-    </section>
-
     <main>
-      <p id="empty" class="empty">
-        <strong>Scan this page</strong> audits the inspected page and opens the
-        report. <strong>Record workflow</strong> watches while you browse —
-        log in, fill the form, check out — scanning every page load and page
-        change automatically, counting repeated issues once. Stop for the
-        timeline report and the AI evidence bundle.
-      </p>
-      <ol id="timeline" class="timeline" reversed></ol>
-    </main>
+      <section class="card">
+        <h2>Page Scan</h2>
+        <p class="sub">Audit the inspected page with the current settings</p>
+        <hr />
+        <div class="btnrow">
+          <button id="btn-scan" class="primary">Scan this page</button>
+          <button id="btn-highlight">Highlight issues on page</button>
+          <button id="btn-clear-highlight">Clear highlights</button>
+          <button id="btn-report" hidden>Open report</button>
+        </div>
+      </section>
 
-    <footer class="bar foot">
-      <span id="status" class="muted"></span>
-    </footer>
+      <section class="card">
+        <h2>Workflow Analyzer</h2>
+        <p class="sub">Test an entire user journey — record, then browse (log in, fill the form, check out). Every page load and page change is scanned; repeated issues count once. Stop for the timeline report + AI evidence bundle.</p>
+        <hr />
+        <div class="btnrow">
+          <button id="btn-record" class="primary">Scan user flow</button>
+        </div>
+        <div class="stats" id="stats" hidden>
+          <div class="stat"><span id="st-pages">0</span><label>pages</label></div>
+          <div class="stat"><span id="st-steps">0</span><label>steps</label></div>
+          <div class="stat"><span id="st-scans">0</span><label>scans</label></div>
+          <div class="stat accent"><span id="st-issues">0</span><label>unique issues</label></div>
+          <div class="stat muted"><span id="st-dupes">0</span><label>repeats suppressed</label></div>
+        </div>
+        <ol id="timeline" class="timeline" reversed></ol>
+      </section>
+
+      <section class="card">
+        <h2>Site Crawl (Scope)</h2>
+        <p class="sub">Crawl same-site pages from the inspected tab — full audit, component inventory, scope.docx + inventory.xlsx</p>
+        <hr />
+        <div class="btnrow">
+          <label class="inline">Max URLs <input id="opt-max-urls" type="number" min="1" step="1" value="500" /></label>
+          <label class="inline">Depth (0 = unbounded) <input id="opt-depth" type="number" min="0" step="1" value="0" /></label>
+          <button id="btn-crawl" class="primary">Crawl site</button>
+          <button id="btn-recover" hidden>Recover interrupted crawl</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Template Check (paste URL list)</h2>
+        <p class="sub">Visit each pasted URL, audit it, and cluster by template — every URL its own row</p>
+        <hr />
+        <textarea id="opt-url-list" rows="4" placeholder="https://example.com/team/alice&#10;https://example.com/about"></textarea>
+        <div class="btnrow" style="margin-top:10px">
+          <button id="btn-list" class="primary">Check list</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Settings</h2>
+        <p class="sub">Shared with the toolbar popup — changes here apply everywhere</p>
+        <hr />
+        <label class="inline">Standard
+          <select id="opt-profile">
+            <option value="wcag21aa" selected>WCAG 2.1 AA</option>
+            <option value="wcag22aa">WCAG 2.2 AA</option>
+            <option value="is17802">IS 17802 (India)</option>
+            <option value="combined_in">WCAG 2.1 AA + IS 17802</option>
+            <option value="en301549">EN 301 549 (EU)</option>
+            <option value="section508">Section 508 (US)</option>
+            <option value="ada">ADA Title III (US)</option>
+          </select>
+        </label>
+        <div class="checks">
+          <label><input type="checkbox" id="opt-check-axe" checked /> axe-core</label>
+          <label><input type="checkbox" id="opt-check-india" /> India checks</label>
+          <label><input type="checkbox" id="opt-check-is17802" /> IS 17802 governance</label>
+          <label><input type="checkbox" id="opt-check-media" /> Media checks</label>
+          <label><input type="checkbox" id="opt-check-pdfoffice" /> PDF / Office audit</label>
+          <label><input type="checkbox" id="opt-check-visual" /> Visual-state checks</label>
+          <label><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss overlays</label>
+          <label><input type="checkbox" id="opt-audit-both" /> Audit both (2 passes)</label>
+          <label><input type="checkbox" id="opt-screenshots" /> Screenshots</label>
+          <label><input type="checkbox" id="opt-links-only" checked /> Real pages only</label>
+          <label><input type="checkbox" id="opt-linkcheck" checked /> Broken-link detector</label>
+        </div>
+      </section>
+    </main>
 
     <script src="panel.js"></script>
   </body>
