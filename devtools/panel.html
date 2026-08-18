@@ -53,6 +53,17 @@
         <ol id="timeline" class="timeline" reversed></ol>
       </section>
 
+      <section class="card" id="issues-card" hidden>
+        <h2>Issues <span class="muted" id="issues-meta"></span></h2>
+        <p class="sub">Findings from the last panel scan or workflow session, grouped by rule. Expand a rule for the affected elements; Highlight re-runs the scan and marks every confirmed violation on the page.</p>
+        <hr />
+        <div class="btnrow">
+          <button id="btn-issues-highlight">Highlight on page</button>
+          <button id="btn-issues-open">Open full report</button>
+        </div>
+        <div id="issue-list" class="issue-list"></div>
+      </section>
+
       <section class="card">
         <h2>Guided Tests</h2>
         <p class="sub">CDP-driven checks on the inspected page: trusted-key tab-stop walk with keyboard-trap detection, focus-indicator ground truth (forced :focus / :focus-visible computed-style diff), and the WCAG 1.4.10 reflow test at 320 px. Chrome shows its "is debugging this browser" banner while a test runs — it disappears when the test finishes.</p>
@@ -91,6 +102,12 @@
         <h2>Settings</h2>
         <p class="sub">Shared with the toolbar popup — changes here apply everywhere</p>
         <hr />
+        <label class="inline">Engine version
+          <select id="opt-engine">
+            <option value="latest" selected>latest (4.12.1)</option>
+            <option value="4.11.3">4.11.3 (pinned)</option>
+          </select>
+        </label>
         <label class="inline">Standard
           <select id="opt-profile">
             <option value="wcag21aa" selected>WCAG 2.1 AA</option>

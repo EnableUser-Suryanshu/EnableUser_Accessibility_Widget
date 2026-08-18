@@ -284,6 +284,12 @@ function settingsEcho(mode, { profile, maxUrls, crawlDepth } = {}) {
   return {
     "Mode": mode,
     "Extension version": version,
+    // Which axe-core build ran (Phase D engine pinning). The per-page truth
+    // is in the Scan Environment sheet's axe Version column; this echoes the
+    // operator's SELECTION so a filed audit records the intent too.
+    "axe engine selection": ACTIVE_ENGINE_VERSION === "latest"
+      ? "latest (package pin)"
+      : `pinned ${ACTIVE_ENGINE_VERSION} (filed-audit reproducibility)`,
     "Standard profile": profile || "",
     "axe tags": ACTIVE_AXE_TAGS.join(", "),
     "Max URLs": String(maxUrls ?? ""),
@@ -4035,6 +4041,27 @@ async function seedDiscovery({ tabId, startUrl, seedOrigin, queue, depth, discov
 // with scanMulti. All crawl modes now use inventoryInNewTab, which runs the
 // same audit stack plus template fingerprint / content signals / screenshots.
 
+// ── Engine pinning (Phase D — axe's window.axeVersions mechanism, digest
+// II.1, done as vendored files). Regulated clients file audits against a
+// SPECIFIC engine version; re-running a filed audit on a newer axe changes
+// rule behaviour and breaks reproducibility, so the operator can pin the
+// engine per engagement. Keys must match build.js's PINNED_VERSIONS (which
+// vendors each pin into lib/axe-versions/). Unknown/missing setting falls
+// back to the package pin ("latest") — a stale stored value can never
+// silently scan with a file that isn't shipped.
+const ENGINE_VERSIONS = {
+  latest: "lib/axe.min.js",
+  "4.11.3": "lib/axe-versions/4.11.3/axe.min.js"
+};
+let ACTIVE_ENGINE_VERSION = "latest";  // last engine actually injected — echoed into Scan Settings
+async function engineFile() {
+  try {
+    const got = await chrome.storage.local.get("engineVersion");
+    ACTIVE_ENGINE_VERSION = ENGINE_VERSIONS[got?.engineVersion] ? got.engineVersion : "latest";
+  } catch { ACTIVE_ENGINE_VERSION = "latest"; }
+  return ENGINE_VERSIONS[ACTIVE_ENGINE_VERSION];
+}
+
 async function injectAxe(tabId) {
   // Inject axe-core + our custom check bundles together. They attach to
   // window.EU_IndiaChecks / window.EU_MediaChecks / window.EU_Is17802Checks
@@ -4051,7 +4078,7 @@ async function injectAxe(tabId) {
   // always clears with a short pause and a retry. Final failure is re-thrown
   // so the caller can record an error row rather than silently losing the
   // page.
-  const files = ["lib/axe.min.js", "lib/india-checks.js", "lib/media-checks.js", "lib/is17802-checks.js", "lib/visual-checks.js"];
+  const files = [await engineFile(), "lib/india-checks.js", "lib/media-checks.js", "lib/is17802-checks.js", "lib/visual-checks.js"];
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {

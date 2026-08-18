@@ -63,6 +63,27 @@ observer for the session's lifetime, so pending debounce timers survive
 worker eviction; torn down on stop. 14 new invariants in the workflow
 suite; live-verified 17/17 by the puppeteer harness.
 
+Phase D — engine pinning + in-panel triage. (a) Engine pinning (axe's
+window.axeVersions mechanism, digest II.1, done as vendored files):
+build.js vendors pinned axe-core versions into lib/axe-versions/<v>/
+(fetched with `npm i --no-save --prefix` into a throwaway dir; the
+package.json pin is untouched; the vendored file is committed so the
+extension needs no npm at runtime). Settings gains an "Engine version"
+dropdown (latest = package pin, currently 4.12.1; pinned 4.11.3);
+injectAxe injects the selected build, settingsEcho records the selection.
+Justification: regulated clients file audits against a specific engine —
+re-running a filed audit on a newer axe changes rule behaviour and breaks
+reproducibility. Unknown stored values fall back to latest (a stale
+setting can never scan with a file that isn't shipped). Live-verified 6/6:
+pinned 4.11.3 actually scans (envRows axe_version), selection echoed,
+round-trips back to latest. (b) In-panel issue list: after a panel scan or
+workflow stop the panel fetches the report and renders a collapsible
+by-rule digest (impact-sorted, every rule, every node — no caps) with
+Highlight-on-page and Open-report actions. (c) Workflow sheet polish:
+click rows now carry coordinates alongside value and href in the Detail
+column; the timeline sheet stays first among the workflow additions and
+rows are chronological by construction.
+
 Phase C — guided CDP tests (`lib/cdp-tests.js`, mechanism: axe DevTools'
 BackgroundRecorder, digest Part II.4). A "Guided Tests" panel card runs
 three checks the scan engines cannot:

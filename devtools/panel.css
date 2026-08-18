@@ -96,6 +96,21 @@ button:disabled { opacity: 0.8; }
 }
 .tile.locked { color: var(--muted); }
 
+/* in-panel issue list (Phase D) */
+.issue-list { margin-top: 12px; }
+.issue-list details { border-bottom: 1px solid var(--line); padding: 6px 2px; }
+.issue-list summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; }
+.issue-list summary .rule { font-weight: 600; }
+.issue-list summary .impact { font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+.issue-list summary .impact.critical { color: #b30000; }
+.issue-list summary .impact.serious { color: #d61f2c; }
+.issue-list summary .impact.moderate { color: #b36b00; }
+.issue-list summary .impact.minor { color: var(--muted); }
+.issue-list summary .count { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.issue-list .nodes { margin: 6px 0 4px 18px; }
+.issue-list .nodes li { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); padding: 2px 0; list-style: none; overflow-wrap: anywhere; }
+.issue-list .desc { color: var(--muted); font-size: 12px; margin: 4px 0 0 18px; }
+
 /* full-surface controls */
 .inline { display: inline-flex; align-items: center; gap: 8px; color: var(--fg); }
 .inline input[type=number] { width: 84px; }

@@ -26,7 +26,8 @@ const CHECK_IDS = {
 };
 async function loadSettings() {
   try {
-    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "wfScanOnActivity", "wfElementShots"]);
+    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "wfScanOnActivity", "wfElementShots", "engineVersion"]);
+    if (s.engineVersion) $("opt-engine").value = s.engineVersion;
     if (Number.isFinite(s.maxUrls)) $("opt-max-urls").value = s.maxUrls;
     if (Number.isFinite(s.crawlDepth)) $("opt-depth").value = s.crawlDepth;
     if (s.profile) $("opt-profile").value = s.profile;
@@ -60,7 +61,8 @@ function readSettings() {
     linksOnly: $("opt-links-only").checked,
     brokenLinks: $("opt-linkcheck").checked,
     wfScanOnActivity: $("opt-wf-activity").checked,
-    wfElementShots: $("opt-wf-elementshots").checked
+    wfElementShots: $("opt-wf-elementshots").checked,
+    engineVersion: $("opt-engine").value
   };
   chrome.storage.local.set(opts).catch(() => {});
   return opts;
@@ -197,6 +199,7 @@ btnScan.addEventListener("click", () => runOp("scan", async () => {
   lastReportId = res.reportId;
   btnReport.hidden = false;
   setStatus("Scan complete — report opened in a new tab.");
+  renderIssueList(res.reportId);
 }));
 
 btnCrawl.addEventListener("click", () => runOp("crawl", async () => {
@@ -226,6 +229,7 @@ btnRecord.addEventListener("click", async () => {
       lastReportId = res.reportId;
       btnReport.hidden = false;
       setStatus(`Done — ${res.pages} page(s), ${res.steps} step(s), ${res.newIssues} unique issue(s).`);
+      renderIssueList(res.reportId);
     } else {
       setActivity("Starting — running the first full page scan…");
       const res = await send({ type: "WORKFLOW_START", tabId, options: readSettings() });
@@ -236,6 +240,57 @@ btnRecord.addEventListener("click", async () => {
   } finally {
     btnRecord.disabled = false;
   }
+});
+
+// ── In-panel issue list (Phase D) — fetch the freshly built report and
+// render a collapsible by-rule digest so the operator triages without
+// leaving the inspector. No caps: every rule, every node. ────────────────
+async function renderIssueList(reportId) {
+  try {
+    const res = await send({ type: "GET_REPORT", reportId });
+    const report = res?.report;
+    if (!report) return;
+    // Group violation rows by rule; issueRows carry one row per node×criterion,
+    // so dedupe nodes within a rule by selector for the count.
+    const byRule = new Map();
+    for (const r of report.issueRows || []) {
+      let g = byRule.get(r.rule_id);
+      if (!g) { g = { impact: r.impact || r.rule_impact || "", description: r.rule_description || "", selectors: new Set() }; byRule.set(r.rule_id, g); }
+      g.selectors.add(r.selector || "(no selector)");
+    }
+    const list = $("issue-list");
+    list.replaceChildren();
+    const impactRank = { critical: 0, serious: 1, moderate: 2, minor: 3 };
+    const rules = [...byRule.entries()].sort((a, b) =>
+      (impactRank[a[1].impact] ?? 9) - (impactRank[b[1].impact] ?? 9) || b[1].selectors.size - a[1].selectors.size);
+    for (const [ruleId, g] of rules) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      const rule = document.createElement("span"); rule.className = "rule"; rule.textContent = ruleId;
+      const impact = document.createElement("span"); impact.className = `impact ${g.impact}`; impact.textContent = g.impact;
+      const count = document.createElement("span"); count.className = "count"; count.textContent = `${g.selectors.size} element(s)`;
+      summary.append(rule, impact, count);
+      const desc = document.createElement("div"); desc.className = "desc"; desc.textContent = g.description;
+      const ul = document.createElement("ul"); ul.className = "nodes";
+      for (const sel of g.selectors) { const li = document.createElement("li"); li.textContent = sel; ul.appendChild(li); }
+      details.append(summary, desc, ul);
+      list.appendChild(details);
+    }
+    $("issues-meta").textContent = rules.length
+      ? `— ${rules.length} rule(s), ${(report.issueRows || []).length} finding row(s)`
+      : "— no violations in the last run";
+    $("issues-card").hidden = false;
+  } catch { /* the full report tab still has everything */ }
+}
+$("btn-issues-highlight").addEventListener("click", async () => {
+  // HIGHLIGHT_ISSUES re-runs the scan and marks every confirmed violation —
+  // the existing handler has no per-selector scoping, so this is all-issues
+  // by design (a re-run also guarantees markers match the page as it is NOW).
+  const res = await send({ type: "HIGHLIGHT_ISSUES", tabId, options: readSettings() });
+  setStatus(res?.ok ? `Highlighted ${res.issues} issue(s) on the page.` : (res?.error || "Highlight failed."));
+});
+$("btn-issues-open").addEventListener("click", () => {
+  if (lastReportId) chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${lastReportId}`) });
 });
 
 // ── Guided tests (Phase C — CDP layer) ───────────────────────────────────
