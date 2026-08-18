@@ -940,6 +940,7 @@ async function workflowStop(tabId) {
     pages: session.pages,
     steps: session.steps,
     counts: session.counts,
+    suppressedLog: session.suppressedLog || [],
     limitReached: session.limitReached
   };
   report.settings = settingsEcho("workflow session", {
@@ -969,6 +970,7 @@ async function workflowStop(tabId) {
       pages: session.pages,
       steps: session.steps,
       counts: session.counts,
+      suppressedLog: session.suppressedLog || [],
       // Judgment queue: everything the engines could not decide — the exact
       // category the vendors ship to their servers. Violations are settled
       // facts and stay in the report; AI review targets `incomplete`.

@@ -64,6 +64,12 @@ check("first find counts", r1.newIssues === 1 && r1.suppressed === 0);
 check("identical re-find suppressed", r2.newIssues === 0 && r2.suppressed === 1);
 check("new node still counts", r3.newIssues === 1);
 check("counters aggregate", s.counts.newIssues === 2 && s.counts.suppressedDuplicates === 1);
+// Auditability: suppression leaves a joinable record, never a silent drop.
+check("suppressed occurrence logged", (s.suppressedLog || []).length === 1);
+const kept = s.resultsPages.flatMap(p => p.violations || []).flatMap(r => r.nodes || []);
+check("kept nodes carry euHash", kept.length > 0 && kept.every(n => typeof n.euHash === "string" && n.euHash.length > 0));
+check("suppressed hash joins back to a kept finding", kept.some(n => n.euHash === s.suppressedLog[0].hash));
+check("suppressed record names rule, page and step", s.suppressedLog[0].ruleId === "color-contrast" && s.suppressedLog[0].pageUrl === p3.url && s.suppressedLog[0].stepId === sc4.stepId);
 check("hash set round-trips", seenSetFrom(s).size === 2);
 check("passes kept only on first scan of page",
   s.resultsPages.filter(p => p.url === p3.url && (p.passes || []).length).length === 1);
