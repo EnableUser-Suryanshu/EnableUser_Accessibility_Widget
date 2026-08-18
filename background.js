@@ -933,6 +933,19 @@ async function workflowStop(tabId) {
     profile: session.profile,
     stopReason: session.limitReached ? `step limit reached (${session.steps.length})` : "stopped by operator"
   });
+  // Raw (undeduped) view — every occurrence through the SAME buildReport
+  // machinery, so the raw sheets carry the identical column format as the
+  // unique ones by construction.
+  try {
+    if ((session.rawPages || []).length) {
+      const rawReport = buildReport(session.rawPages, {
+        mode: "workflow-raw", seedUrl: session.seedUrl, profile: session.profile,
+        stopReason: "raw occurrence mirror"
+      });
+      report.workflowRaw = { issueRows: rawReport.issueRows || [], incompleteRows: rawReport.incompleteRows || [] };
+    }
+  } catch (err) { console.warn("[EU] raw view build failed (unique report unaffected):", err?.message || err); }
+
   report.workflow = {
     testId: session.testId,
     startedAt: session.startedAt,
