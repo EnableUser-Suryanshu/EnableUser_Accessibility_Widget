@@ -63,6 +63,17 @@ observer for the session's lifetime, so pending debounce timers survive
 worker eviction; torn down on stop. 14 new invariants in the workflow
 suite; live-verified 17/17 by the puppeteer harness.
 
+Session regression diffing — `tools/regression-diff.mjs` compares two
+report JSON exports (the report page's Download JSON button — already
+present, exporting the full persisted report payload) by issue identity
+(the live dedup's own hash recipe): fixed / still present / new, per rule
+and per page, written as a markdown summary + machine findings JSON.
+Criterion-duplicate rows collapse to one issue per side; changed markup
+reads as fixed+new (the filed finding no longer reproduces); tracking
+params are stripped before hashing. Pure `diffReports` export pinned by
+test/regression-diff.test.mjs (9 checks). Both offline tools documented
+in tools/README.md.
+
 Crawler + workflow fusion — MERGE_ENGAGEMENT {inventoryId, reportId}
 merges a completed crawl inventory with a workflow session into ONE
 deduplicated union report. Identity = the same
