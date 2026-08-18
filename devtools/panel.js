@@ -230,6 +230,7 @@ btnRecord.addEventListener("click", async () => {
       btnReport.hidden = false;
       setStatus(`Done — ${res.pages} page(s), ${res.steps} step(s), ${res.newIssues} unique issue(s).`);
       renderIssueList(res.reportId);
+      offerMerge();
     } else {
       setActivity("Starting — running the first full page scan…");
       const res = await send({ type: "WORKFLOW_START", tabId, options: readSettings() });
@@ -240,6 +241,38 @@ btnRecord.addEventListener("click", async () => {
   } finally {
     btnRecord.disabled = false;
   }
+});
+
+// ── Crawler + workflow fusion — after a workflow stop, offer to merge the
+// session's report with a completed crawl inventory into one deduplicated
+// union report (source-tagged issues + Coverage sheet). ─────────────────
+async function offerMerge() {
+  try {
+    const res = await send({ type: "LIST_INVENTORIES" });
+    const invs = res?.ok ? (res.inventories || []) : [];
+    if (!invs.length) { $("merge-row").hidden = true; return; }
+    const sel = $("merge-inventory");
+    sel.replaceChildren(...invs.map(v => {
+      const o = document.createElement("option");
+      o.value = v.inventoryId;
+      const when = v.generatedAt ? new Date(v.generatedAt).toLocaleString() : v.inventoryId;
+      o.textContent = `${v.seedUrl || v.inventoryId} — ${v.pages} page(s), ${when}`;
+      return o;
+    }));
+    $("merge-row").hidden = false;
+  } catch { /* merge stays hidden — the workflow report is unaffected */ }
+}
+$("btn-merge").addEventListener("click", async () => {
+  if (!lastReportId) { setStatus("Stop a workflow session first."); return; }
+  const inventoryId = $("merge-inventory").value;
+  if (!inventoryId) return;
+  const btn = $("btn-merge");
+  btn.disabled = true;
+  const res = await send({ type: "MERGE_ENGAGEMENT", inventoryId, reportId: lastReportId });
+  btn.disabled = false;
+  if (!res?.ok) { setStatus(res?.error || "Merge failed."); return; }
+  const c = res.counts || {};
+  setStatus(`Merged — ${c.combined} unique issue(s): ${c.both} seen by both, ${c.crawl} crawl-only, ${c.workflow} workflow-only. Combined report opened.`);
 });
 
 // ── In-panel issue list (Phase D) — fetch the freshly built report and

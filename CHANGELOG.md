@@ -63,6 +63,22 @@ observer for the session's lifetime, so pending debounce timers survive
 worker eviction; torn down on stop. 14 new invariants in the workflow
 suite; live-verified 17/17 by the puppeteer harness.
 
+Crawler + workflow fusion — MERGE_ENGAGEMENT {inventoryId, reportId}
+merges a completed crawl inventory with a workflow session into ONE
+deduplicated union report. Identity = the same
+hash(html + target + ruleId + normalizedPageUrl) both layers already use,
+computed by the pure `mergeEngagementPages` (lib/engagement-merge.js,
+15-check unit suite): collided issues tagged source "both" (the crawl copy
+represents them), layer-unique issues tagged "crawl"/"workflow" — identity
+dedup, never a cap. The combined report flows through the standard
+buildReport, adds a "Seen By" column on Violations (merged reports only —
+single-layer workbooks keep their exact shape), a Coverage sheet (pages by
+layer + union counts), keeps the workflow timeline, and persists/opens like
+any report. Panel affordance: after a workflow stop, a "Merge with crawl"
+row lists stored inventories (LIST_INVENTORIES, newest 10). Live-verified:
+crawl + session + merge over the fixture pages — overlap tagged both,
+mutation-revealed issues tagged workflow, workbook builds.
+
 Phase D — engine pinning + in-panel triage. (a) Engine pinning (axe's
 window.axeVersions mechanism, digest II.1, done as vendored files):
 build.js vendors pinned axe-core versions into lib/axe-versions/<v>/

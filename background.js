@@ -24,6 +24,7 @@ import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
 import { newSession, recordPage, openScanStep, recordClick, renameStep, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS } from "./lib/workflow.js";
 import { keyboardWalk, focusDiffVisible, guidedResultsToPage, FOCUS_STYLE_PROPS } from "./lib/cdp-tests.js";
+import { mergeEngagementPages } from "./lib/engagement-merge.js";
 
 // Must match popup.js's DEFAULT_MAX_URLS and the value="" on #opt-max-urls in
 // popup.html. This was 50 while both of those said 500, so the effective default
@@ -560,6 +561,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "GUIDED_KEYBOARD_TEST") sendResponse(await withOperation("guided", () => guidedKeyboardTest(msg.tabId)));
       else if (msg.type === "GUIDED_REFLOW_TEST") sendResponse(await withOperation("guided", () => guidedReflowTest(msg.tabId)));
       else if (msg.type === "GUIDED_REPORT") sendResponse(await guidedOpenReport(msg.tabId));
+      // Crawler + workflow fusion (lib/engagement-merge.js).
+      else if (msg.type === "LIST_INVENTORIES") sendResponse(await listInventories());
+      else if (msg.type === "MERGE_ENGAGEMENT") sendResponse(await mergeEngagement(msg.inventoryId, msg.reportId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
       else sendResponse({ ok: false, error: "unknown message" });
@@ -1672,6 +1676,78 @@ async function openClassicReport(inventoryId) {
   await persistReport(reportId, report);
   await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
   return { ok: true, reportId };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Crawler + workflow fusion (MERGE_ENGAGEMENT). The crawler reaches breadth
+// (every linked page), the workflow recorder reaches depth (logged-in /
+// gated journeys) — an engagement that ran both gets ONE deduplicated
+// union report: every issue tagged with the layer(s) that saw it, plus a
+// page-coverage map. Merge logic is pure (lib/engagement-merge.js,
+// unit-tested); identity = the same issueHash both layers already use.
+// ─────────────────────────────────────────────────────────────────────────
+
+// List stored inventories for the panel's "Merge with last crawl"
+// affordance. Ids come from the small inventory-ids index; each payload is
+// read only to extract its meta line. Listing shows the most recent 10 —
+// a UI listing bound, not a findings cap (the merge itself takes any id).
+async function listInventories() {
+  try {
+    const got = await chrome.storage.local.get("inventory-ids");
+    const ids = (Array.isArray(got?.["inventory-ids"]) ? got["inventory-ids"] : []).slice(-10).reverse();
+    const out = [];
+    for (const id of ids) {
+      const stored = await chrome.storage.local.get(`inv:${id}`);
+      const inv = stored?.[`inv:${id}`];
+      if (!inv) continue;
+      out.push({
+        inventoryId: id,
+        seedUrl: inv.meta?.seedUrl || "",
+        pages: (inv.pages || []).length,
+        generatedAt: inv.meta?.generatedAt || ""
+      });
+    }
+    return { ok: true, inventories: out };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function mergeEngagement(inventoryId, reportId) {
+  const { inventory } = await getInventory(inventoryId);
+  if (!inventory) return { ok: false, error: "Inventory not found — it may have been cleared from storage." };
+  const wfReport = await getReport(reportId);
+  if (!wfReport) return { ok: false, error: "Workflow report not found — only the last 25 reports are kept." };
+
+  const crawlPages = inventoryPagesToReportPages(inventory);
+  // buildReport keeps the original page entries on report.pages — the
+  // workflow's are the per-scan deduped entries (session-unique already).
+  const workflowPages = wfReport.pages || [];
+  const merged = mergeEngagementPages(crawlPages, workflowPages);
+
+  const report = buildReport(merged.pages, {
+    mode: "merged",
+    seedUrl: inventory.meta?.seedUrl || wfReport.meta?.seedUrl || "",
+    profile: wfReport.meta?.profile || inventory.meta?.profile,
+    stopReason: `merged: crawl ${inventoryId} + workflow ${reportId}`
+  });
+  report.coverage = merged.coverage;
+  report.mergeCounts = merged.counts;
+  report.mergeSources = { inventoryId, reportId };
+  // Workflow context rides along so the combined workbook keeps the timeline.
+  if (wfReport.workflow) report.workflow = wfReport.workflow;
+  report.settings = settingsEcho("merged engagement (crawl + workflow union)", {
+    profile: wfReport.meta?.profile, maxUrls: merged.pages.length
+  });
+  const newReportId = `r-${Date.now()}`;
+  reports.set(newReportId, report);
+  await persistReport(newReportId, report);
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${newReportId}`) });
+  return {
+    ok: true, reportId: newReportId,
+    counts: merged.counts,
+    coverage: { both: merged.coverage.both.length, crawlOnly: merged.coverage.crawlOnly.length, workflowOnly: merged.coverage.workflowOnly.length }
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -4417,6 +4493,8 @@ function buildReport(pages, meta) {
           node_target_joined: n.targetJoined || (n.target || []).join(" "),
           node_ancestry: (n.ancestry || []).join(" "),
           node_xpath: (n.xpath || []).join(" "),
+          // Merge-source tag (crawl | workflow | both) — empty outside merges.
+          node_source_layer: n.euSource || "",
           checks_any: n.any || [],
           checks_all: n.all || [],
           checks_none: n.none || []
@@ -4523,6 +4601,9 @@ function buildReport(pages, meta) {
             // lazily via shot:<id> in storage; empty string when screenshots
             // were off or capture failed for this selector.
             elementShotId: n.elementShotId || "",
+            // Which capture layer saw this issue (crawl | workflow | both) —
+            // set by the MERGE_ENGAGEMENT fusion; empty on single-layer runs.
+            source_layer: n.euSource || "",
             help_url: v.helpUrl || "",
             checks_any: n.any || [],
             checks_all: n.all || [],
