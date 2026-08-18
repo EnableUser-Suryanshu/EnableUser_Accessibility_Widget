@@ -1210,9 +1210,22 @@ async function wfScan(tabId, action, href, title) {
           // evidence cannot settle them. Best-effort: fails benignly when
           // the tab lost focus mid-capture, and the absence is visible in
           // the bundle (viewportShot: null).
+          // captureVisibleTab captures whatever tab is VISIBLE in the window,
+          // not the tab we scanned — requires the literal `<all_urls>` host
+          // permission (http://*/* + https://*/* are not accepted; found live
+          // on the groww.in messy-site run, where every shot silently nulled).
+          // Guard on tab.active: if the operator has another tab (or the
+          // panel-as-a-tab harness) in front, the capture would attach the
+          // WRONG page's pixels as evidence — worse than none, because the
+          // AI judge would ground contrast verdicts in a different page.
           let viewportShot = null;
           try {
-            viewportShot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+            const live = await chrome.tabs.get(tabId).catch(() => null);
+            if (live?.active) {
+              viewportShot = await chrome.tabs.captureVisibleTab(live.windowId, { format: "png" });
+            } else {
+              console.warn("[EU] workflow viewport shot skipped: scanned tab is not the visible tab — capturing would attach the wrong page's pixels");
+            }
           } catch (err) {
             console.warn("[EU] workflow viewport shot skipped:", err?.message || err);
           }

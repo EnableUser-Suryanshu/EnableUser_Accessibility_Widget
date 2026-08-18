@@ -32,8 +32,7 @@
     "debugger"
   ],
   "host_permissions": [
-    "http://*/*",
-    "https://*/*"
+    "<all_urls>"
   ],
   "devtools_page": "devtools/devtools.html"
 }

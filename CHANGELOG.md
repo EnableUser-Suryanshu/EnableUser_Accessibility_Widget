@@ -63,6 +63,20 @@ observer for the session's lifetime, so pending debounce timers survive
 worker eviction; torn down on stop. 14 new invariants in the workflow
 suite; live-verified 17/17 by the puppeteer harness.
 
+Viewport-shot evidence actually captures (found by the messy-site live run,
+groww.in, 2026-08-18): `chrome.tabs.captureVisibleTab` requires the literal
+`<all_urls>` host-permission pattern — `http://*/*` + `https://*/*` are not
+accepted by that API — so every workflow viewport shot had silently nulled
+since the layer landed. host_permissions is now `<all_urls>` (a superset of
+what we held; both competitor extensions request the same). Also guarded:
+the shot is only taken when the scanned tab IS the window's active tab,
+because captureVisibleTab captures whatever is visible — attaching another
+tab's pixels as evidence would mislead the AI judge into grounding contrast
+verdicts in the wrong page. Live-verified on groww.in: evidence carries
+viewportShot data URLs, prepare.mjs writes step-*.png, and the persisted
+report's workflowRaw mirror rides along (157 raw = 157 unique on a
+two-page, 277-issue session).
+
 DevTools panel is now the FULL extension surface (light, card-based layout):
 Page Scan (scan + highlight/clear + open report), Workflow Analyzer (record
 user flow with live stats + timeline), Site Crawl with max-URLs/depth and
