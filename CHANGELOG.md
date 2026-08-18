@@ -63,6 +63,50 @@ observer for the session's lifetime, so pending debounce timers survive
 worker eviction; torn down on stop. 14 new invariants in the workflow
 suite; live-verified 17/17 by the puppeteer harness.
 
+Phase C — guided CDP tests (`lib/cdp-tests.js`, mechanism: axe DevTools'
+BackgroundRecorder, digest Part II.4). A "Guided Tests" panel card runs
+three checks the scan engines cannot:
+(1) **Keyboard test** (checklist K-05/K-06): `Input.dispatchKeyEvent`
+injects trusted Tab presses at axe's 200 ms spacing and walks the page's
+real focus order. No arbitrary stop cap — the walk ends by cycle detection
+(bounded by the page's own focusables, an algorithmic bound, not a findings
+cap). Focus stuck for 3 consecutive Tabs → `eu-keyboard-trap` finding
+(serious, review-tagged: a designed modal needs a human), automatic Escape
+attempt, and if still stuck the walk stops and says so.
+(2) **Focus ground truth** (upgrades K-02/C-09 from CSSOM guessing): for
+every tab stop, `CSS.forcePseudoState([:focus, :focus-visible])` +
+computed-style diffing of the paint-relevant properties, with axe's
+invisible-change filter (an outline-color change under 0 width cannot be
+seen). Forcing `:focus-visible` too is what makes the browser's DEFAULT
+ring count as visible — only elements whose authors removed the indicator
+and added nothing fail. Zero visible change → `eu-focus-not-visible`
+(serious, a VIOLATION not a review item — forcePseudoState is the
+browser's actual rendering, so this is provable). Stops CDP cannot resolve
+(shadow DOM/iframes) are recorded "unverified", never failed.
+(3) **Reflow test** (Z-04/Z-05): `Emulation.setDeviceMetricsOverride`
+320×900 with `mobile:false` — found live: `mobile:true` triggers Chrome's
+legacy 980 px layout-viewport fallback on pages without `<meta viewport>`,
+so the normative test never fires; desktop emulation enforces a true
+320 CSS px viewport on every page — 1 s settle, horizontal-scroll check +
+outermost overflowing elements (containment dedup — one finding per
+overflow chain, nothing dropped). Horizontal scroll at WCAG 1.4.10's normative 320 px →
+`eu-reflow-horizontal-scroll` (serious, provable). The zoom variant is
+deliberately not run; 320 px is the SC's normative measure.
+Results flow through the standard buildReport (mode "guided") — provable
+findings land in Violations, judgment in Incomplete — plus a stop-by-stop
+"Guided Tests" report section and Excel sheet. The debugger is always
+detached in finally; the panel card warns about Chrome's debugging banner.
+Walk/diff/assembly logic is transport-injected and unit-tested
+(test/cdp-tests.test.mjs, 23 checks); live-verified against fixtures
+(guided.mjs harness: sequence, trap, no-focus flag, reflow, no debugger
+leaks).
+
+Also: opt-in `wfElementShots` setting (default OFF — attaching the
+debugger mid-browse shows Chrome's infobar): when ON, a workflow scan that
+adds new needs-review nodes captures a cropped, highlighted element shot
+per node via the existing element-screenshot machinery and embeds them in
+the step's AI-evidence record.
+
 Viewport-shot evidence actually captures (found by the messy-site live run,
 groww.in, 2026-08-18): `chrome.tabs.captureVisibleTab` requires the literal
 `<all_urls>` host-permission pattern — `http://*/*` + `https://*/*` are not

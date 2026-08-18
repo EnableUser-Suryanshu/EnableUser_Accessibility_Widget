@@ -54,6 +54,18 @@
       </section>
 
       <section class="card">
+        <h2>Guided Tests</h2>
+        <p class="sub">CDP-driven checks on the inspected page: trusted-key tab-stop walk with keyboard-trap detection, focus-indicator ground truth (forced :focus / :focus-visible computed-style diff), and the WCAG 1.4.10 reflow test at 320 px. Chrome shows its "is debugging this browser" banner while a test runs — it disappears when the test finishes.</p>
+        <hr />
+        <div class="btnrow">
+          <button id="btn-gt-keyboard" class="primary">Keyboard test</button>
+          <button id="btn-gt-reflow" class="primary">Reflow test (320 px)</button>
+          <button id="btn-gt-report" hidden>Open guided report</button>
+        </div>
+        <ol id="gt-results" class="timeline"></ol>
+      </section>
+
+      <section class="card">
         <h2>Site Crawl (Scope)</h2>
         <p class="sub">Crawl same-site pages from the inspected tab — full audit, component inventory, scope.docx + inventory.xlsx</p>
         <hr />
@@ -103,6 +115,7 @@
           <label><input type="checkbox" id="opt-links-only" checked /> Real pages only</label>
           <label><input type="checkbox" id="opt-linkcheck" checked /> Broken-link detector</label>
           <label><input type="checkbox" id="opt-wf-activity" /> Workflow: scan on user activity instead of DOM observer</label>
+          <label><input type="checkbox" id="opt-wf-elementshots" /> Workflow: element screenshots for needs-review findings (shows the debugger banner mid-browse)</label>
         </div>
       </section>
     </main>

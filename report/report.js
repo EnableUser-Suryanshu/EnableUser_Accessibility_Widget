@@ -292,6 +292,33 @@ function renderNodeDetails(i) {
   const _summaryHeading = document.getElementById("summary-heading");
   if (_summaryHeading && report.meta.profileLabel) _summaryHeading.textContent = `${report.meta.profileLabel} — Criterion Status`;
 
+  // ── Guided Tests (Phase C) — stop-by-stop evidence behind the guided
+  // findings. Only present on mode "guided" reports. ──
+  if (report.guidedTests) {
+    const gt = report.guidedTests;
+    const gtBody = document.querySelector("#guided-table tbody");
+    const gtRow = (cells, cls) => gtBody.appendChild(el("tr", cls ? { class: cls } : {}, cells.map(c => el("td", {}, [String(c ?? "")]))));
+    if (gt.keyboard) {
+      for (const s of gt.keyboard.stops || []) {
+        const fc = s.focusCheck || {};
+        const result = !fc.checked ? "unverified" : fc.visible ? "visible focus" : "NO VISIBLE FOCUS";
+        const detail = !fc.checked
+          ? (fc.reason || "")
+          : (fc.changes || []).map(c => `${c.prop}: ${c.from} → ${c.to}`).join(" | ") || "no visible computed-style change";
+        gtRow([s.index, "Tab stop", s.tag || "", s.selector || "", result, detail], (fc.checked && !fc.visible) ? "status-fail" : "");
+      }
+      for (const f of gt.keyboard.findings || []) {
+        gtRow(["", "Keyboard trap", "", f.selector || "", f.escaped ? "Escape freed focus" : "Escape did NOT free focus", "Focus stopped advancing for 3 consecutive Tabs"], "status-fail");
+      }
+      gtRow(["", "Walk end", "", "", gt.keyboard.cycled ? "focus order cycled" : gt.keyboard.trapped ? "STOPPED at trap" : "ended", `${(gt.keyboard.stops || []).length} tab stop(s)`]);
+    }
+    if (gt.reflow) {
+      gtRow(["", "Reflow @320px", "document", "", gt.reflow.horizontalScroll ? "HORIZONTAL SCROLL" : "reflows cleanly", `scrollWidth ${gt.reflow.scrollWidth}px vs clientWidth ${gt.reflow.clientWidth}px`], gt.reflow.horizontalScroll ? "status-fail" : "");
+      for (const o of gt.reflow.offenders || []) gtRow(["", "Overflow element", "", o.selector || "", `${Math.round(o.width)}px wide`, o.html || ""]);
+    }
+    document.getElementById("guided-section").hidden = false;
+  }
+
   // ── Stats tiles ──
   const totalViolations = report.issueRows.length;
   const byImpact = { critical: 0, serious: 0, moderate: 0, minor: 0 };

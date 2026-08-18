@@ -23,6 +23,7 @@ import { auditPdfUrls, pdfAuditToIssues } from "./lib/pdf-audit.js";
 import { auditOfficeUrls, officeAuditToIssues } from "./lib/office-audit.js";
 import { detectBrokenLinks, collectRendered404Signals, rendered404Verdict } from "./lib/link-check.js";
 import { newSession, recordPage, openScanStep, recordClick, renameStep, ingestScan, seenSetFrom, storeSeenSet, STEP_ACTIONS } from "./lib/workflow.js";
+import { keyboardWalk, focusDiffVisible, guidedResultsToPage, FOCUS_STYLE_PROPS } from "./lib/cdp-tests.js";
 
 // Must match popup.js's DEFAULT_MAX_URLS and the value="" on #opt-max-urls in
 // popup.html. This was 50 while both of those said 500, so the effective default
@@ -155,7 +156,8 @@ function operationLabel(kind) {
     "scan-current": "a single-page scan",
     "scan-inventory": "a crawl",
     "scan-list": "a URL-list check",
-    "highlight": "an annotation pass"
+    "highlight": "an annotation pass",
+    "guided": "a guided CDP test"
   }[kind] || kind;
 }
 // Claim exclusive ownership of the ACTIVE_* configuration. Returns null when
@@ -548,6 +550,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       else if (msg.type === "WORKFLOW_RENAME_STEP") sendResponse(await workflowRenameStep(msg.tabId, msg.stepId, msg.name));
       else if (msg.type === "WORKFLOW_FORCE_STOP") sendResponse(workflowForceStop(msg.tabId));
       else if (msg.type === "PANEL_SCAN_PAGE") sendResponse(await panelScanPage(msg.tabId));
+      // Guided tests — the CDP layer (lib/cdp-tests.js; digest Part II.4).
+      else if (msg.type === "GUIDED_KEYBOARD_TEST") sendResponse(await withOperation("guided", () => guidedKeyboardTest(msg.tabId)));
+      else if (msg.type === "GUIDED_REFLOW_TEST") sendResponse(await withOperation("guided", () => guidedReflowTest(msg.tabId)));
+      else if (msg.type === "GUIDED_REPORT") sendResponse(await guidedOpenReport(msg.tabId));
       else if (msg.type === "WF_MUTATED") sendResponse(await workflowOnMutated(sender, msg));
       else if (msg.type === "WF_CLICK") sendResponse(await workflowOnClick(sender, msg));
       else sendResponse({ ok: false, error: "unknown message" });
@@ -733,6 +739,269 @@ async function scanCurrent(tabId, options) {
 // buildReport's page shape.
 
 // ─────────────────────────────────────────────────────────────────────────
+// Guided tests — Phase C, the CDP layer (mechanism: axe's BackgroundRecorder,
+// digest Part II.4). Trusted-key tab-stop walk + trap detection, focus-
+// indicator ground truth via CSS.forcePseudoState, and the 320 px reflow
+// check. Walk/diff/assembly logic lives in lib/cdp-tests.js (transport-
+// injected, unit-tested); this section provides the chrome.debugger /
+// chrome.scripting adapters. The debugger is ALWAYS detached in finally.
+// ─────────────────────────────────────────────────────────────────────────
+const FOCUS_STYLE_PROP_SET = new Set(FOCUS_STYLE_PROPS);
+// Latest guided-test results per tab, so [Keyboard test] and [Reflow test]
+// accumulate into one report. In-memory only: results are seconds old when
+// the report is built, and the report itself persists.
+const guidedResults = new Map();  // tabId → { url, title, keyboard, reflow }
+
+function cdpSend(target, method, params) {
+  return withTimeout(chrome.debugger.sendCommand(target, method, params || {}), DEBUGGER_CMD_TIMEOUT_MS, method);
+}
+
+// In-page reader for the current focus stop. Identity continuity is tracked
+// in the page itself (window.__EU_GT_LAST) so "same element as before" is an
+// object-identity fact, not a selector-string comparison. The html slice is
+// an evidence excerpt (like click text), not a findings cap.
+function readActiveElementFn(tabId) {
+  return async () => {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const el = document.activeElement || document.body;
+          const same = window.__EU_GT_LAST === el;
+          window.__EU_GT_LAST = el;
+          const pathOf = (node) => {
+            if (!node || node.nodeType !== 1) return "body";
+            const parts = [];
+            let cur = node;
+            while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+              if (cur.id) { parts.unshift(`#${CSS.escape(cur.id)}`); break; }
+              let seg = cur.tagName.toLowerCase();
+              const parent = cur.parentElement;
+              if (parent) {
+                const sibs = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                if (sibs.length > 1) seg += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+              }
+              parts.unshift(seg);
+              cur = parent;
+            }
+            return parts.join(" > ") || "body";
+          };
+          return {
+            tag: (el.tagName || "").toLowerCase(),
+            selector: pathOf(el),
+            html: (el.outerHTML || "").slice(0, 400),
+            isBody: el === document.body || el === document.documentElement,
+            same
+          };
+        }
+      });
+      return result || null;
+    } catch { return null; }
+  };
+}
+
+// 3a + 3b in one debugger session: walk the tab order with trusted keys,
+// then ground-truth every stop's focus indicator with forced pseudo-states.
+async function guidedKeyboardTest(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!/^https?:/.test(tab.url || "")) return { ok: false, error: "Open an http(s) page first." };
+  if (await wfSession(tabId)) return { ok: false, error: "Stop the workflow recording first — guided tests drive the page's focus themselves." };
+  const target = { tabId };
+  let attached = false;
+  try {
+    await withTimeout(chrome.debugger.attach(target, "1.3"), DEBUGGER_ATTACH_TIMEOUT_MS, "debugger.attach");
+    attached = true;
+    // :focus styles must render even while DevTools/the panel holds real
+    // focus (axe does exactly this before its tab-stop recorder runs).
+    await cdpSend(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    // Fresh start: clear the identity tracker, blur, top of page.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        window.__EU_GT_LAST = null;
+        try { document.activeElement && document.activeElement.blur(); } catch {}
+        window.scrollTo(0, 0);
+      }
+    });
+    const pressKey = async (key) => {
+      const vk = key === "Tab" ? 9 : 27;
+      const base = { windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, key, code: key };
+      await cdpSend(target, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
+      await cdpSend(target, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    };
+    const walk = await keyboardWalk({ pressKey, readActiveElement: readActiveElementFn(tabId), wait: sleep });
+
+    // 3b — focus ground truth per stop. Blur first so the "unfocused"
+    // computed style really is unfocused, then force :focus AND
+    // :focus-visible (Chrome's UA default ring is a :focus-visible rule —
+    // forcing :focus alone would miss the browser default indicator and
+    // wrongly flag unstyled elements). Forced state is cleared per element
+    // in a finally.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => { try { document.activeElement && document.activeElement.blur(); } catch {} }
+    }).catch(() => {});
+    await cdpSend(target, "DOM.enable");
+    await cdpSend(target, "CSS.enable");
+    const doc = await cdpSend(target, "DOM.getDocument", { depth: 1 });
+    const styleMap = (r) => {
+      const m = {};
+      for (const p of (r?.computedStyle || [])) if (FOCUS_STYLE_PROP_SET.has(p.name)) m[p.name] = p.value;
+      return m;
+    };
+    for (const stop of walk.stops) {
+      let nodeId = null;
+      try {
+        const q = await cdpSend(target, "DOM.querySelector", { nodeId: doc.root.nodeId, selector: stop.selector });
+        nodeId = q?.nodeId || null;
+      } catch { /* selector unresolvable via CDP (shadow/iframe) */ }
+      if (!nodeId) {
+        // Honesty: can't prove anything about a node CDP can't resolve —
+        // recorded as unchecked, never as a failure.
+        stop.focusCheck = { checked: false, reason: "selector did not resolve via CDP (shadow DOM / iframe)" };
+        continue;
+      }
+      try {
+        const before = styleMap(await cdpSend(target, "CSS.getComputedStyleForNode", { nodeId }));
+        await cdpSend(target, "CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["focus", "focus-visible"] });
+        let after;
+        try {
+          after = styleMap(await cdpSend(target, "CSS.getComputedStyleForNode", { nodeId }));
+        } finally {
+          await cdpSend(target, "CSS.forcePseudoState", { nodeId, forcedPseudoClasses: [] }).catch(() => {});
+        }
+        const diff = focusDiffVisible(before, after);
+        stop.focusCheck = { checked: true, visible: diff.visible, changes: diff.changes };
+      } catch (err) {
+        stop.focusCheck = { checked: false, reason: String(err?.message || err) };
+      }
+    }
+
+    const entry = guidedResults.get(tabId) || {};
+    guidedResults.set(tabId, { ...entry, url: tab.url, title: tab.title || "", keyboard: walk });
+    const noFocus = walk.stops.filter(s => s.focusCheck?.checked && !s.focusCheck.visible).length;
+    console.log(`[EU] guided keyboard test — ${walk.stops.length} stop(s), ${noFocus} without visible focus, ${walk.findings.length} trap finding(s), ${walk.cycled ? "cycled" : walk.trapped ? "TRAPPED" : "ended"}`);
+    return { ok: true, stops: walk.stops, findings: walk.findings, trapped: walk.trapped, cycled: walk.cycled };
+  } finally {
+    if (attached) { try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {} }
+  }
+}
+
+// 3c — WCAG 1.4.10's normative test: emulate a 320 CSS px viewport, wait for
+// reflow, and check for a horizontal scrollbar + which elements overflow.
+// The zoom-equivalent variant (1280 px at 400%) is deliberately not run —
+// 320 px IS the SC's normative measure and the emulation round-trip is the
+// fragile part worth doing exactly once.
+async function guidedReflowTest(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!/^https?:/.test(tab.url || "")) return { ok: false, error: "Open an http(s) page first." };
+  if (await wfSession(tabId)) return { ok: false, error: "Stop the workflow recording first — the viewport override would trigger scan storms." };
+  const target = { tabId };
+  let attached = false;
+  try {
+    await withTimeout(chrome.debugger.attach(target, "1.3"), DEBUGGER_ATTACH_TIMEOUT_MS, "debugger.attach");
+    attached = true;
+    // mobile:false, deliberately. With mobile:true Chrome applies the legacy
+    // mobile-viewport fallback: a page WITHOUT <meta name=viewport> gets a
+    // 980 px layout viewport scaled down, so clientWidth reads 980 and the
+    // normative test never fires (found live against the fixture). WCAG
+    // 1.4.10's measure is a 320 CSS px viewport — desktop emulation at
+    // width 320 enforces exactly that on every page, responsive or not.
+    await cdpSend(target, "Emulation.setDeviceMetricsOverride", { width: 320, height: 900, deviceScaleFactor: 1, mobile: false });
+    await sleep(1_000);  // let the page relayout / media queries fire
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const se = document.scrollingElement || document.documentElement;
+        const clientWidth = se.clientWidth;
+        const scrollWidth = se.scrollWidth;
+        const horizontalScroll = scrollWidth > clientWidth;
+        const offenders = [];
+        if (horizontalScroll) {
+          const vw = Math.max(clientWidth, 320);
+          const pathOf = (node) => {
+            if (!node || node.nodeType !== 1) return "";
+            const parts = [];
+            let cur = node;
+            while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+              if (cur.id) { parts.unshift(`#${CSS.escape(cur.id)}`); break; }
+              let seg = cur.tagName.toLowerCase();
+              const parent = cur.parentElement;
+              if (parent) {
+                const sibs = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                if (sibs.length > 1) seg += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+              }
+              parts.unshift(seg);
+              cur = parent;
+            }
+            return parts.join(" > ") || "html";
+          };
+          const wide = (el) => {
+            const r = el.getBoundingClientRect();
+            return (r.width > vw + 1 || r.right > vw + 1) ? r : null;
+          };
+          // Every OUTERMOST overflowing element is reported. Skipping children
+          // whose parent already overflows is containment dedup (one finding
+          // per overflow chain), not a cap — nothing is dropped, the chain's
+          // root represents it.
+          for (const el of document.querySelectorAll("body *")) {
+            const r = wide(el);
+            if (!r) continue;
+            const p = el.parentElement;
+            if (p && p !== document.body && wide(p)) continue;
+            offenders.push({
+              selector: pathOf(el),
+              width: r.width,
+              html: (el.outerHTML || "").slice(0, 300)
+            });
+          }
+        }
+        return { horizontalScroll, scrollWidth, clientWidth, offenders };
+      }
+    });
+    await cdpSend(target, "Emulation.clearDeviceMetricsOverride");
+    await sleep(200);  // let the restore relayout before the operator (or a harness) looks
+    const entry = guidedResults.get(tabId) || {};
+    guidedResults.set(tabId, { ...entry, url: tab.url, title: tab.title || "", reflow: result });
+    console.log(`[EU] guided reflow test — ${result.horizontalScroll ? `HORIZONTAL SCROLL at 320px (${result.scrollWidth} > ${result.clientWidth}), ${result.offenders.length} offender(s)` : "no horizontal scroll at 320px"}`);
+    return { ok: true, ...result };
+  } finally {
+    if (attached) {
+      // Belt and braces: clear the override even when the happy path already
+      // did — a throw between override and clear must not leave the
+      // operator's tab stuck at 320 px.
+      try { await cdpSend(target, "Emulation.clearDeviceMetricsOverride"); } catch {}
+      try { await withTimeout(chrome.debugger.detach(target), 5_000, "debugger.detach"); } catch {}
+    }
+  }
+}
+
+// 3d — build + open the guided-tests report from whatever tests have run on
+// this tab. Findings flow through the SAME buildReport machinery (mode
+// "guided", one page entry): provable results land in Violations,
+// judgment-dependent ones in Incomplete, and the full stop-by-stop record
+// rides on report.guidedTests for the report section + Excel sheet.
+async function guidedOpenReport(tabId) {
+  const g = guidedResults.get(tabId);
+  if (!g || (!g.keyboard && !g.reflow)) return { ok: false, error: "Run a guided test first." };
+  const pageEntry = guidedResultsToPage(g);
+  const report = buildReport([pageEntry], { mode: "guided", seedUrl: g.url, profile: "wcag21aa" });
+  report.guidedTests = {
+    url: g.url,
+    title: g.title,
+    generatedAt: new Date().toISOString(),
+    keyboard: g.keyboard ? { stops: g.keyboard.stops, findings: g.keyboard.findings, trapped: g.keyboard.trapped, cycled: g.keyboard.cycled } : null,
+    reflow: g.reflow || null
+  };
+  report.settings = settingsEcho("guided tests (CDP: trusted keys + forced pseudo-states + viewport emulation)", { profile: "wcag21aa" });
+  const reportId = `r-${Date.now()}`;
+  reports.set(reportId, report);
+  await persistReport(reportId, report);
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`report/report.html?id=${reportId}`) });
+  return { ok: true, reportId };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Workflow mode — scan as the operator browses. Mechanism mirrored from the
 // axe DevTools UFA skeleton + BrowserStack Workflow Analyzer dedup layers
 // (forensic digest: _Workroom/2026-08-17_extension-mechanism-digest).
@@ -884,6 +1153,16 @@ async function workflowStart(tabId, options) {
       options.wfScanOnActivity = !!saved.wfScanOnActivity;
     } catch { options.wfScanOnActivity = false; }
   }
+  // Element screenshots during workflow scans (opt-in, default OFF): each
+  // capture attaches the debugger to the tab the operator is actively
+  // browsing — Chrome's "started debugging" infobar mid-journey is invasive,
+  // so the operator must ask for it.
+  if (options.wfElementShots === undefined) {
+    try {
+      const saved = await chrome.storage.local.get("wfElementShots");
+      options.wfElementShots = !!saved.wfElementShots;
+    } catch { options.wfElementShots = false; }
+  }
   const profile = (options?.profile && PROFILES[options.profile]) ? options.profile : "wcag21aa";
   const session = newSession({
     tabId,
@@ -895,7 +1174,8 @@ async function workflowStart(tabId, options) {
       profile,
       checks: options?.checks || {},
       dismissOverlays: !!options?.dismissOverlays,
-      wfScanOnActivity: !!options?.wfScanOnActivity
+      wfScanOnActivity: !!options?.wfScanOnActivity,
+      wfElementShots: !!options?.wfElementShots
     }
   });
   workflowSessions.set(tabId, session);
@@ -1235,6 +1515,49 @@ async function wfScan(tabId, action, href, title) {
         }
       } catch (err) {
         console.warn("[EU] workflow evidence capture failed:", err?.message || err);
+      }
+    }
+
+    // Opt-in element screenshots (wfElementShots, default OFF — attaching
+    // the debugger mid-browse shows Chrome's infobar): when this scan added
+    // NEW incomplete (needs-review) nodes, capture a cropped, highlighted
+    // shot of each via the existing captureFullPageScreenshot/element
+    // machinery and embed them in the step's evidence record, so the AI
+    // judge gets per-element pixels, not just the viewport. The shots are
+    // embedded as data URLs and then dropped from the in-memory shot store —
+    // they belong to the evidence bundle, not to a report/inventory.
+    if (session.settings.wfElementShots) {
+      const lastEntry = session.resultsPages[session.resultsPages.length - 1];
+      const newIncomplete = (lastEntry && lastEntry.workflowStep === step.stepId) ? (lastEntry.incomplete || []) : [];
+      if (newIncomplete.some(r => (r.nodes || []).length)) {
+        try {
+          const pageShot = await captureFullPageScreenshot(tabId, newIncomplete);
+          const shots = [];
+          for (const r of newIncomplete) {
+            for (const n of r.nodes || []) {
+              if (!n.elementShotId) continue;
+              const e = inventoryScreenshots.get(n.elementShotId);
+              if (e) shots.push({ ruleId: r.ruleId || r.id || "", selector: elementSelectorOf(n) || "", euHash: n.euHash || "", dataUrl: e.dataUrl });
+              inventoryScreenshots.delete(n.elementShotId);
+              delete n.elementShotId;  // embedded above; a dangling store id would render "unavailable"
+            }
+          }
+          if (pageShot?.id) inventoryScreenshots.delete(pageShot.id);
+          if (shots.length) {
+            const key = `wfev:${session.testId}:${step.stepId}`;
+            const got = await chrome.storage.local.get(key);
+            const rec = got?.[key] || { stepId: step.stepId, action, url: page.url, title: step.title || "" };
+            rec.elementShots = [...(rec.elementShots || []), ...shots];
+            await chrome.storage.local.set({ [key]: rec });
+            if (!(session.evidenceSteps || []).includes(step.stepId)) {
+              session.evidenceSteps = [...(session.evidenceSteps || []), step.stepId];
+              await wfPersist(session);
+            }
+            console.log(`[EU] workflow element shots — ${shots.length} incomplete-node crop(s) attached to ${step.stepId}`);
+          }
+        } catch (err) {
+          console.warn("[EU] workflow element shots failed (evidence otherwise unaffected):", err?.message || err);
+        }
       }
     }
   } catch (err) {

@@ -103,6 +103,19 @@
         <div class="screenshots-grid" id="screenshots-grid"></div>
       </section>
 
+      <section id="guided-section" hidden>
+        <h2>Guided Tests</h2>
+        <p class="hint">CDP-driven ground truth: trusted-key tab-stop walk (keyboard traps), forced <code>:focus</code>/<code>:focus-visible</code> computed-style diffing (focus visibility — what the browser actually renders, not CSSOM guessing), and the WCAG 1.4.10 reflow check at 320 px. Provable failures appear in Violations below; judgment-dependent results in Incomplete.</p>
+        <table id="guided-table">
+          <thead>
+            <tr>
+              <th>#</th><th>Record</th><th>Element</th><th>Selector</th><th>Result</th><th>Detail</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
       <section>
         <h2>Violations</h2>
         <p class="hint">Click any row to expand the full node detail — every target selector, ancestry, xpath, HTML, and the complete any/all/none check results with messages and related nodes. The <strong>Screenshot</strong> column shows the offending element highlighted in place; click a thumbnail to enlarge it.</p>

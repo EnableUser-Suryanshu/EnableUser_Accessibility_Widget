@@ -26,7 +26,7 @@ const CHECK_IDS = {
 };
 async function loadSettings() {
   try {
-    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "wfScanOnActivity"]);
+    const s = await chrome.storage.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "wfScanOnActivity", "wfElementShots"]);
     if (Number.isFinite(s.maxUrls)) $("opt-max-urls").value = s.maxUrls;
     if (Number.isFinite(s.crawlDepth)) $("opt-depth").value = s.crawlDepth;
     if (s.profile) $("opt-profile").value = s.profile;
@@ -43,6 +43,7 @@ async function loadSettings() {
     $("opt-links-only").checked = s.linksOnly !== false;
     $("opt-linkcheck").checked = s.brokenLinks !== false;
     $("opt-wf-activity").checked = s.wfScanOnActivity === true;  // default: DOM observer
+    $("opt-wf-elementshots").checked = s.wfElementShots === true; // default: OFF (debugger infobar mid-browse)
   } catch {}
 }
 function readSettings() {
@@ -58,7 +59,8 @@ function readSettings() {
     screenshots: $("opt-screenshots").checked,
     linksOnly: $("opt-links-only").checked,
     brokenLinks: $("opt-linkcheck").checked,
-    wfScanOnActivity: $("opt-wf-activity").checked
+    wfScanOnActivity: $("opt-wf-activity").checked,
+    wfElementShots: $("opt-wf-elementshots").checked
   };
   chrome.storage.local.set(opts).catch(() => {});
   return opts;
@@ -79,6 +81,7 @@ async function ensureHostPermission(url) {
 // ── Activity: workflow runtime + crawl progress + local ops ──────────────
 function activityText(detail, progress) {
   if (localBusy === "scan") return "Scanning this page — axe + custom checks running…";
+  if (localBusy === "guided") return "Guided test running — Chrome's debugging banner is expected while it works…";
   if (localBusy === "list") return "Template check running — auditing each pasted URL…";
   if (localBusy === "crawl" || progress?.active) {
     const p = progress || {};
@@ -101,6 +104,10 @@ function render(detail, progress) {
   btnScan.disabled = active || !!localBusy;
   btnCrawl.disabled = active || !!localBusy;
   btnList.disabled = active || !!localBusy;
+  // Guided tests drive the page (trusted keys, viewport override) — they
+  // must not run while a recording would treat their churn as user activity.
+  $("btn-gt-keyboard").disabled = active || !!localBusy;
+  $("btn-gt-reflow").disabled = active || !!localBusy;
   setActivity(activityText(detail, progress));
 
   // A workflow scan continuously in flight for > 8 s (BrowserStack's
@@ -229,6 +236,60 @@ btnRecord.addEventListener("click", async () => {
   } finally {
     btnRecord.disabled = false;
   }
+});
+
+// ── Guided tests (Phase C — CDP layer) ───────────────────────────────────
+function gtRow(label, detail, isFinding) {
+  const li = document.createElement("li");
+  const glyph = document.createElement("span");
+  glyph.className = "glyph";
+  glyph.textContent = isFinding ? "⚑" : "✓";
+  const mid = document.createElement("div");
+  const a = document.createElement("div");
+  a.className = "action" + (isFinding ? "" : " scan");
+  a.textContent = label;
+  const u = document.createElement("div");
+  u.className = "url";
+  u.textContent = detail || "";
+  mid.append(a, u);
+  li.append(glyph, mid, document.createElement("span"));
+  $("gt-results").prepend(li);
+  $("btn-gt-report").hidden = false;
+}
+
+$("btn-gt-keyboard").addEventListener("click", () => runOp("guided", async () => {
+  setActivity("Keyboard test — injecting trusted Tab presses and diffing forced focus styles…");
+  const res = await send({ type: "GUIDED_KEYBOARD_TEST", tabId });
+  if (!res?.ok) { setStatus(res?.error || "Keyboard test failed."); return; }
+  const stops = res.stops || [];
+  const noFocus = stops.filter(s => s.focusCheck?.checked && !s.focusCheck.visible);
+  const unchecked = stops.filter(s => !s.focusCheck?.checked);
+  const traps = res.findings || [];
+  gtRow(
+    `Keyboard: ${stops.length} tab stop(s) — ${noFocus.length} without visible focus, ${traps.length} trap(s)`,
+    `${res.cycled ? "focus order cycled cleanly" : res.trapped ? "walk STOPPED at a trap Escape could not free" : "walk ended"}${unchecked.length ? `; ${unchecked.length} stop(s) unverifiable via CDP` : ""}`,
+    noFocus.length > 0 || traps.length > 0
+  );
+  setStatus("Keyboard test done.");
+}));
+
+$("btn-gt-reflow").addEventListener("click", () => runOp("guided", async () => {
+  setActivity("Reflow test — emulating a 320 px viewport…");
+  const res = await send({ type: "GUIDED_REFLOW_TEST", tabId });
+  if (!res?.ok) { setStatus(res?.error || "Reflow test failed."); return; }
+  gtRow(
+    res.horizontalScroll
+      ? `Reflow: horizontal scroll at 320 px (${res.scrollWidth}px > ${res.clientWidth}px)`
+      : "Reflow: no horizontal scroll at 320 px",
+    res.horizontalScroll ? `${(res.offenders || []).length} overflowing element chain(s)` : "page reflows cleanly",
+    !!res.horizontalScroll
+  );
+  setStatus("Reflow test done.");
+}));
+
+$("btn-gt-report").addEventListener("click", async () => {
+  const res = await send({ type: "GUIDED_REPORT", tabId });
+  setStatus(res?.ok ? "Guided report opened in a new tab." : (res?.error || "Report failed."));
 });
 
 $("btn-highlight").addEventListener("click", async () => {
