@@ -1,6 +1,6 @@
 {
   "name": "enableuser-accessibility-widget",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Chrome extension that audits sites against WCAG 2.1 AA, IS 17802, EN 301 549 and Section 508 using axe-core. Version of record is manifest.json.",
   "license": "MIT",
   "private": true,
