@@ -12,7 +12,7 @@ see [DIVERGENCE.md](DIVERGENCE.md).
 
 Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA, IS 17802 (Ch 7 / 9 / 10 / 12 / 13), EN 301 549, Section 508, and ADA Title III using axe-core plus India-specific and IS 17802 site-governance checks. Audits linked PDF and Office (docx/xlsx/pptx) documents for structural accessibility. Classifies crawled pages by URL-template shape and DOM simhash (Hamming-distance clustering). Produces a CSV report, scope docx, component inventory, and one-click copy/download of the auditable-URL list.
 
-## Unreleased (workflow-mode branch)
+## v0.6.0 (merged to main 2026-08-18)
 
 Workflow Analyzer — record-as-you-browse scanning, mechanism mirrored from the
 forensic digest of axe DevTools 4.131.2 (User Flow Analysis) and BrowserStack

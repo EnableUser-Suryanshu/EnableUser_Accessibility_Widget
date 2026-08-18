@@ -36,11 +36,7 @@ Re-run `npm ci && node build.js` only when told an engine bump landed
 
 ## Which branch
 
-Track whatever branch the team lead announces as current
-(`main` after PR #1 merges; `workflow-mode` until then):
-```bash
-git checkout <branch> && git pull
-```
+Always `main` — PR #1 is merged; `git pull` on main is the whole ritual.
 
 ## Reporting problems
 

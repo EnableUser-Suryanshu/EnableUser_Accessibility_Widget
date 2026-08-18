@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EnableUser Accessibility Widget",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Audits sites against WCAG 2.1 AA, IS 17802, EN 301 549 and Section 508 using axe-core. Crawls, screenshots, exports to Excel.",
   "action": {
     "default_popup": "popup/popup.html",
