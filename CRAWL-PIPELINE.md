@@ -1,4 +1,4 @@
-# EnableUser Crawl Pipeline — what actually runs (v0.4.6)
+# EnableUser Crawl Pipeline — what actually runs (v0.5.0)
 
 A plain-language walkthrough of a Multi Page / Inventory scan, in execution
 order, with the real constants. Cross-check any report against its
@@ -9,8 +9,8 @@ at scan time, so it is always the truth for that specific run.
 
 The popup reads the checkboxes, saves them as your new defaults, and sends the
 scan message to the background service worker. Default recipe (first run):
-axe ✓ · media ✓ · PDF/Office ✓ · visual-states ✓ · dismiss overlays ✓ ·
-audit both ✓ · real pages only ✓ · broken-link detector ✓ · screenshots ✗.
+axe ✓ · media ✗ · PDF/Office ✗ · visual-states ✗ · dismiss overlays ✗ ·
+audit both ✗ · real pages only ✓ · broken-link detector ✓ · screenshots ✗.
 
 ## 1. Seed scan (your current tab)
 
@@ -48,9 +48,11 @@ link to it + anchor text) for the broken-link check in step 7.
 
 ## 4. The worker pool
 
-- Up to **200 tabs globally**, max **8 per origin** (rate limiter also backs
+- Up to **10 tabs globally**, max **8 per origin** (rate limiter also backs
   off on 429/503 and honours Retry-After).
-- Worker tabs open in a **dedicated minimized window** — not your tab strip.
+- Worker tabs open in a **dedicated off-screen window** (not minimized — Chrome
+  halts page composition for minimized windows, which makes screenshots blank
+  or time out) — not your tab strip.
 - Per tab: load (60 s timeout) → **adaptive settle**: minimum 1 s, proceeds
   after 2 s of DOM quiet, hard cap 10 s → late-redirect poll → dedup check.
 - A worker that exceeds 150 s total is force-abandoned so the pool moves on.
@@ -62,10 +64,11 @@ link to it + anchor text) for the broken-link check in step 7.
 ## 5. Per-page audit (inside each tab)
 
 In order:
-1. Overlay dismissal (cookie/consent/modal) if enabled.
+1. Overlay dismissal (cookie/consent/modal) if enabled (default OFF).
 2. **axe-core 4.12.1** with the profile's WCAG tag set (2.0/2.1/2.2 A/AA).
-3. **Audit both** (default ON): a second axe pass so both the overlay-present
-   and overlay-dismissed states are covered. This doubles per-page audit time.
+3. **Audit both** (default OFF): a second axe pass so both the overlay-present
+   and overlay-dismissed states are covered. The extra pass only runs on pages
+   where an overlay was actually dismissed — plain pages get a single pass.
 4. Custom suites, all merged into the same violations/incomplete stream:
    - **india-checks** (if enabled): script/lang mismatches, RTL, per-passage lang.
    - **media-checks**: video captions/autoplay, audio transcripts, embed titles,
@@ -80,7 +83,21 @@ In order:
    inventory and the Manual Checklist "Applies To" scoping.
 6. Rendered-DOM soft-404 check against the step-2 baseline.
 7. Template fingerprint (URL cluster + DOM simhash) for clustering.
-8. Screenshot — only if the screenshots checkbox is ON.
+8. Screenshot — only if the screenshots checkbox is ON. Three steps:
+   a. The page is walked top to bottom in viewport-sized steps (80% overlap,
+      120ms per step, bounded by a 6s budget), then returned to where it
+      started. This is what triggers lazy-loaded content — scrolling fires both
+      IntersectionObserver loaders and older scroll-listener ones. Skipped when
+      the page already fits in the viewport.
+   b. Wait until every `<img>` reports `complete`, capped at 4 s — otherwise the
+      capture freezes lazy images mid-fetch as blank placeholders.
+   c. One full-page PNG (height-clamped to 20 000px — beyond that the
+      compositor surface can kill the renderer and lose the page's whole
+      audit), then one cropped + highlighted PNG per distinct
+      violating element (every distinct one, bounded by a 45s per-page budget
+      rather than a count — anything skipped is logged; 400×300 minimum crop so
+      small targets keep context). Each element crop scrolls to its target and the original
+      scroll position is restored when the pass finishes.
 9. Links harvested for the queue (and the link graph), tab closed.
 
 ## 6. PDF / Office audits (after the crawl)
@@ -119,7 +136,12 @@ Scan Environment. Plus scope.docx.
 - Hover/focus findings from CSSOM are advisory: styles applied by JavaScript
   event handlers are invisible to the scan, so those land in Incomplete for
   human confirmation, never as hard violations.
-- Cross-origin stylesheets can't be read; visual-checks silently skips them.
+- Cross-origin stylesheets can't be read; visual-checks skips those rules
+  rather than guessing (a "cue not found" verdict would be unfounded).
+- No finding caps. visual-checks analyses every link and control and reports
+  every failing node; the Excel embeds every captured preview. Element
+  screenshots are the one exception, bounded by a 45s per-page budget because
+  each costs a debugger round trip — exhausting it is logged, never silent.
 - The link-status fetch layer uses your cookies but is not a rendered
   browser; sites that hard-block non-navigation requests may show
   `access-blocked` rows — the rendered-DOM layer still covers crawled pages.

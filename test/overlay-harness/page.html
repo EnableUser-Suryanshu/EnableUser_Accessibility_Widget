@@ -1,0 +1,196 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>issue-overlay harness</title>
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  .band { padding: 40px; border-bottom: 1px solid #e5e7eb; }
+  .hero { background: #14532d; color: #fff; padding: 60px 40px; }
+  /* An ancestor that clips overflow — the overlay must still be visible, since
+     markers are appended to <body> rather than nested inside the target. */
+  .clipper { overflow: hidden; height: 90px; background: #fef3c7; padding: 12px; }
+  img.hero-img { width: 260px; height: 120px; background: #94a3b8; display: block; }
+  .lowcontrast { color: #b9c2cc; background: #fff; }
+</style>
+</head>
+<body>
+  <div class="hero">
+    <h1>Overlay harness</h1>
+    <img class="hero-img" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  </div>
+
+  <div class="band">
+    <p class="lowcontrast" id="lc">Low contrast paragraph</p>
+    <a class="icon-link" href="#" id="il"></a>
+  </div>
+
+  <div class="clipper">
+    <button id="clipped">Clipped ancestor button</button>
+  </div>
+
+  <div class="band" style="height:1200px">Tall filler so the target below starts off-screen</div>
+  <div class="band"><input id="deep" type="text"></div>
+
+  <script src="../../lib/issue-overlay.js"></script>
+  <script>
+    // Shaped exactly like background.js passes it: normRules() output, violations
+    // only. Includes a frame-scoped target (length 2) and a selector that matches
+    // nothing, since both occur on real pages and must not break rendering.
+    const violations = [
+      {
+        ruleId: "image-alt", impact: "critical",
+        tags: ["cat.text-alternatives", "wcag2a", "wcag111"],
+        description: "Images must have alternate text",
+        help: "Images must have an alt attribute",
+        helpUrl: "https://dequeuniversity.com/rules/axe/4.12/image-alt",
+        nodes: [{
+          html: '<img class="hero-img" src="data:image/gif;base64,R0lGODlh">',
+          target: ["img.hero-img"], targetJoined: "img.hero-img",
+          impact: "critical",
+          failureSummary: "Fix any of the following:\n  Element does not have an alt attribute\n  aria-label attribute does not exist or is empty"
+        }]
+      },
+      {
+        ruleId: "color-contrast", impact: "serious",
+        tags: ["cat.color", "wcag2aa", "wcag143"],
+        description: "Elements must meet minimum contrast ratio thresholds",
+        help: "Elements must have sufficient colour contrast",
+        helpUrl: "https://dequeuniversity.com/rules/axe/4.12/color-contrast",
+        nodes: [
+          {
+            html: '<p class="lowcontrast" id="lc">Low contrast paragraph</p>',
+            target: ["#lc"], targetJoined: "#lc", impact: "serious",
+            failureSummary: "Fix any of the following:\n  Element has insufficient colour contrast of 1.94 (foreground #b9c2cc, background #ffffff, expected 4.5:1)"
+          },
+          {
+            html: "<button id=\"clipped\">Clipped ancestor button</button>",
+            target: ["#clipped"], targetJoined: "#clipped", impact: "moderate",
+            failureSummary: "Fix any of the following:\n  Element sits inside an overflow:hidden ancestor"
+          }
+        ]
+      },
+      {
+        ruleId: "link-name", impact: "serious",
+        tags: ["cat.name-role-value", "wcag2a", "wcag412", "wcag244"],
+        description: "Links must have discernible text",
+        help: "Links must have discernible text",
+        helpUrl: "https://dequeuniversity.com/rules/axe/4.12/link-name",
+        nodes: [
+          { html: '<a class="icon-link" href="#" id="il"></a>', target: ["#il"], targetJoined: "#il", impact: "serious", failureSummary: "Fix all of the following:\n  Element is in tab order and does not have accessible text" },
+          // Nested-frame target: listed in the panel, not markable on the page.
+          { html: "<a href='#'></a>", target: ["iframe#f", "a"], targetJoined: "iframe#f a", impact: "minor", failureSummary: "Fix any of the following:\n  Element has no accessible name" },
+          // Selector that matches nothing — must be counted as unresolved, not throw.
+          { html: "<a id='gone'></a>", target: ["#does-not-exist"], targetJoined: "#does-not-exist", impact: "minor", failureSummary: "" }
+        ]
+      },
+      {
+        ruleId: "label", impact: "critical",
+        tags: ["cat.forms", "wcag2a", "wcag412", "wcag332"],
+        description: "Form elements must have labels",
+        help: "Form elements must have labels",
+        helpUrl: "https://dequeuniversity.com/rules/axe/4.12/label",
+        nodes: [{ html: '<input id="deep" type="text">', target: ["#deep"], targetJoined: "#deep", impact: "critical", failureSummary: "Fix any of the following:\n  Form element does not have an implicit (wrapped) <label>" }]
+      }
+    ];
+
+    const out = [];
+    const t = (name, cond, detail) => out.push(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
+
+    const stats = window.EU_IssueOverlay.render(violations);
+    const root = document.getElementById("__eu_issue_overlay__");
+
+    t("overlay root created", !!root);
+    t("render() reports totals (7 nodes: 1+2+3+1)", stats && stats.total === 7, JSON.stringify(stats));
+    t("5 resolvable nodes marked on page", stats && stats.marked === 5, `marked=${stats && stats.marked}`);
+    t("2 unresolvable nodes counted, not dropped", stats && stats.unresolved === 2, `unresolved=${stats && stats.unresolved}`);
+
+    const rows = root.querySelectorAll('[id^="__eu_issue_overlay___row_"]');
+    t("panel lists every node including unmarkable ones", rows.length === 7, `rows=${rows.length}`);
+
+    // Worst-first ordering: criticals must lead.
+    const firstRowText = rows[0] ? rows[0].textContent : "";
+    t("sorted worst-first (a critical is first)", /image-alt|label/.test(firstRowText), firstRowText.slice(0, 40));
+
+    // axe's failureSummary must be split into bullets, not dumped as one blob.
+    t("axe fix guidance rendered as list items", root.querySelectorAll("li").length >= 5,
+      String(root.querySelectorAll("li").length));
+    t("offending code rendered in a <pre>", root.querySelectorAll("pre").length === 7,
+      String(root.querySelectorAll("pre").length));
+    t("axe rule reference links present on every row", root.querySelectorAll('a[href*="dequeuniversity"]').length === 7,
+      String(root.querySelectorAll('a[href*="dequeuniversity"]').length));
+
+    t("axe any/all heading is not rendered as a bullet",
+      ![...root.querySelectorAll("li")].some(li => /^Fix (any|all) of the following:$/.test(li.textContent.trim())),
+      [...root.querySelectorAll("li")].map(li=>li.textContent.trim()).filter(x=>/^Fix /.test(x)).join(" | ") || "none");
+    t("axe any/all heading IS shown as text", /Fix any of the following:/.test(root.textContent));
+
+    // Duplicate element ids are invalid HTML and axe flags them — an accessibility
+    // tool must not emit them. Unmarkable entries used to all get _row_0.
+    const rowIds = [...rows].map(r => r.id);
+    t("every panel row has a unique element id",
+      new Set(rowIds).size === rowIds.length,
+      rowIds.filter((v,i)=>rowIds.indexOf(v)!==i).join(", ") || "all unique");
+
+    // Markers must be body-level, not nested in the target — that is what keeps
+    // an overflow:hidden ancestor from clipping them and what avoids layout shift.
+    const clipped = document.getElementById("clipped");
+    t("no marker nested inside a target element", clipped.querySelector("div") === null);
+    t("markers are children of the overlay root", root.children.length >= 5, `children=${root.children.length}`);
+
+    // Page content must be untouched.
+    t("target elements not wrapped or altered",
+      clipped.parentElement.classList.contains("clipper"));
+    t("no page element gained inline styles from the overlay",
+      !document.getElementById("lc").getAttribute("style"));
+
+    // clear() must leave no trace.
+    window.EU_IssueOverlay.clear();
+    t("clear() removes the overlay entirely", !document.getElementById("__eu_issue_overlay__"));
+    t("isActive() false after clear", window.EU_IssueOverlay.isActive() === false);
+
+    // Re-render must not duplicate.
+    window.EU_IssueOverlay.render(violations);
+    window.EU_IssueOverlay.render(violations);
+    t("re-render replaces rather than stacks",
+      document.querySelectorAll('[id="__eu_issue_overlay__"]').length === 1,
+      String(document.querySelectorAll('[id="__eu_issue_overlay__"]').length));
+
+    // Empty input must be safe.
+    window.EU_IssueOverlay.clear();
+    const empty = window.EU_IssueOverlay.render([]);
+    t("empty violations renders without throwing", empty && empty.total === 0, JSON.stringify(empty));
+
+    // ── Regression: a positioned / transformed <body> must not offset markers ──
+    // An absolutely-positioned root resolved against body's own origin, so
+    // position:relative, a transform, or a margin on body shifted every marker
+    // away from the element it was supposed to be pointing at.
+    window.EU_IssueOverlay.clear();
+    document.body.style.position = "relative";
+    document.body.style.transform = "translateY(40px)";
+    document.body.style.marginTop = "25px";
+    window.EU_IssueOverlay.render(violations);
+    {
+      const el = document.getElementById("lc");
+      const box = [...document.querySelectorAll("#__eu_issue_overlay__ > div")]
+        .find(d => d.style.width === (el.getBoundingClientRect().width + 4) + "px");
+      const er = el.getBoundingClientRect();
+      const br = box ? box.getBoundingClientRect() : null;
+      const dx = br ? Math.abs(br.left - (er.left - 2)) : 999;
+      const dy = br ? Math.abs(br.top - (er.top - 2)) : 999;
+      t("marker aligns to its element with a positioned+transformed body",
+        br && dx <= 1 && dy <= 1, br ? `off by ${dx.toFixed(1)},${dy.toFixed(1)}px` : "marker not found");
+    }
+    document.body.style.position = "";
+    document.body.style.transform = "";
+    document.body.style.marginTop = "";
+
+    const failed = out.filter(l => l.startsWith("FAIL")).length;
+    const pre = document.createElement("pre");
+    pre.id = "harness-out";
+    pre.textContent = "===OVERLAY-START===\n" + out.join("\n") +
+      `\n---\n${out.length - failed}/${out.length} passed\n===OVERLAY-END===`;
+    document.documentElement.appendChild(pre);
+  </script>
+</body>
+</html>

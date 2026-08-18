@@ -1,0 +1,255 @@
+# Changelog
+
+Moved here from the `manifest.json` `description` field, which had grown to
+~6300 characters. Chrome documents a 132-character limit on that field and
+enforces it at Web Store submission, so it cannot carry release notes.
+
+For the reasoning behind the v0.5.0 unification — including what was taken
+from each of the two v0.4.9 builds and what was deliberately left behind —
+see [DIVERGENCE.md](DIVERGENCE.md).
+
+## What the extension does
+
+Scan a single page or crawl same-site links (configurable max URLs and crawl depth) against WCAG 2.1 AA, IS 17802 (Ch 7 / 9 / 10 / 12 / 13), EN 301 549, Section 508, and ADA Title III using axe-core plus India-specific and IS 17802 site-governance checks. Audits linked PDF and Office (docx/xlsx/pptx) documents for structural accessibility. Classifies crawled pages by URL-template shape and DOM simhash (Hamming-distance clustering). Produces a CSV report, scope docx, component inventory, and one-click copy/download of the auditable-URL list.
+
+## Unreleased (workflow-mode branch)
+
+Workflow Analyzer — record-as-you-browse scanning, mechanism mirrored from the
+forensic digest of axe DevTools 4.131.2 (User Flow Analysis) and BrowserStack
+Accessibility Toolkit 8.25 (see `_Workroom/2026-08-17_extension-mechanism-digest`
+for the evidence). Start recording from the popup, browse the journey (login,
+forms, checkout), stop for a timeline report. Hard navigations are caught by
+`tabs.onUpdated status:"complete"` (no webNavigation — both vendors proved it
+unnecessary); SPA/state changes by a body MutationObserver with BrowserStack's
+`attributeFilter:["class"]` config, self-overlay filtering, and hierarchical
+mutation fingerprints so repeated churn (carousels, tickers) never re-triggers.
+Scans are paced by a suppressing 1 s debounce with an in-flight lock plus one
+trailing re-check. The session model is pages[] (normalized-URL identity,
+query/hash stripped) + steps[] ("Full page scan" / "State change detected" /
+"Clicked") with the step-reuse rule — a continuous burst of DOM changes
+collapses into one step. Issues are deduplicated session-wide by
+hash(node html + selector + rule id + page URL), so a violation re-found on a
+later scan counts once; repeats are reported as suppressed-duplicate counts.
+Sessions checkpoint to chrome.storage per step (service-worker-eviction safe),
+cap at 200 steps, and produce the standard report plus a new "Workflow" Excel
+sheet (per-step timeline with new-issue counts). New files: lib/workflow.js
+(session model, 19-invariant test in test/workflow.test.mjs),
+lib/workflow-observer.js (injected observer). Scan execution reuses
+scanInExistingTab under the shared-operation guard, so workflow scans cannot
+race a crawl's ACTIVE_* config.
+
+Also on this branch:
+
+Gap-closure pass (2026-08-18) — the six mechanisms the digest-vs-
+implementation audit left open, scoped-subtree re-scans deliberately
+excluded. (1) The workflow observer is now armed in ALL frames (both
+vendors do; iframe DOM changes — chat widgets, embedded checkouts — were
+previously invisible), re-armed after every scan as well as on navigation;
+subframe signals omit href/title so a frame's URL never becomes page
+identity. (2) scanOnUserActivity mode (BrowserStack's alternative
+trigger, Settings toggle `wfScanOnActivity`): no MutationObserver —
+click/keydown/wheel/scroll debounced 300 + 300 ms, then a DOM snapshot
+signature (tag-structure rolling hash + body length; pure twin
+`activitySignature` in lib/workflow.js) compared to the last, only a
+change signals. (3) Richer click metadata: coordinates, form-control
+value (truncated 80, passwords excluded), anchor href — stored on the
+step and surfaced in the Workflow sheet's Detail column. (4) Step rename:
+double-click a timeline row in the panel; the operator's name persists to
+report, workbook and AI bundle (`renamed` flag protects it). (5) Force-
+stop CTA after 8 s of continuous scanning (BrowserStack's threshold):
+discards the stuck scan's result, releases the lock, keeps recording.
+(6) MV3 keep-alive port (`eu-wf-keepalive`) held by the top-frame
+observer for the session's lifetime, so pending debounce timers survive
+worker eviction; torn down on stop. 14 new invariants in the workflow
+suite; live-verified 17/17 by the puppeteer harness.
+
+Session regression diffing — `tools/regression-diff.mjs` compares two
+report JSON exports (the report page's Download JSON button — already
+present, exporting the full persisted report payload) by issue identity
+(the live dedup's own hash recipe): fixed / still present / new, per rule
+and per page, written as a markdown summary + machine findings JSON.
+Criterion-duplicate rows collapse to one issue per side; changed markup
+reads as fixed+new (the filed finding no longer reproduces); tracking
+params are stripped before hashing. Pure `diffReports` export pinned by
+test/regression-diff.test.mjs (9 checks). Both offline tools documented
+in tools/README.md.
+
+Crawler + workflow fusion — MERGE_ENGAGEMENT {inventoryId, reportId}
+merges a completed crawl inventory with a workflow session into ONE
+deduplicated union report. Identity = the same
+hash(html + target + ruleId + normalizedPageUrl) both layers already use,
+computed by the pure `mergeEngagementPages` (lib/engagement-merge.js,
+15-check unit suite): collided issues tagged source "both" (the crawl copy
+represents them), layer-unique issues tagged "crawl"/"workflow" — identity
+dedup, never a cap. The combined report flows through the standard
+buildReport, adds a "Seen By" column on Violations (merged reports only —
+single-layer workbooks keep their exact shape), a Coverage sheet (pages by
+layer + union counts), keeps the workflow timeline, and persists/opens like
+any report. Panel affordance: after a workflow stop, a "Merge with crawl"
+row lists stored inventories (LIST_INVENTORIES, newest 10). Live-verified:
+crawl + session + merge over the fixture pages — overlap tagged both,
+mutation-revealed issues tagged workflow, workbook builds.
+
+Phase D — engine pinning + in-panel triage. (a) Engine pinning (axe's
+window.axeVersions mechanism, digest II.1, done as vendored files):
+build.js vendors pinned axe-core versions into lib/axe-versions/<v>/
+(fetched with `npm i --no-save --prefix` into a throwaway dir; the
+package.json pin is untouched; the vendored file is committed so the
+extension needs no npm at runtime). Settings gains an "Engine version"
+dropdown (latest = package pin, currently 4.12.1; pinned 4.11.3);
+injectAxe injects the selected build, settingsEcho records the selection.
+Justification: regulated clients file audits against a specific engine —
+re-running a filed audit on a newer axe changes rule behaviour and breaks
+reproducibility. Unknown stored values fall back to latest (a stale
+setting can never scan with a file that isn't shipped). Live-verified 6/6:
+pinned 4.11.3 actually scans (envRows axe_version), selection echoed,
+round-trips back to latest. (b) In-panel issue list: after a panel scan or
+workflow stop the panel fetches the report and renders a collapsible
+by-rule digest (impact-sorted, every rule, every node — no caps) with
+Highlight-on-page and Open-report actions. (c) Workflow sheet polish:
+click rows now carry coordinates alongside value and href in the Detail
+column; the timeline sheet stays first among the workflow additions and
+rows are chronological by construction.
+
+Phase C — guided CDP tests (`lib/cdp-tests.js`, mechanism: axe DevTools'
+BackgroundRecorder, digest Part II.4). A "Guided Tests" panel card runs
+three checks the scan engines cannot:
+(1) **Keyboard test** (checklist K-05/K-06): `Input.dispatchKeyEvent`
+injects trusted Tab presses at axe's 200 ms spacing and walks the page's
+real focus order. No arbitrary stop cap — the walk ends by cycle detection
+(bounded by the page's own focusables, an algorithmic bound, not a findings
+cap). Focus stuck for 3 consecutive Tabs → `eu-keyboard-trap` finding
+(serious, review-tagged: a designed modal needs a human), automatic Escape
+attempt, and if still stuck the walk stops and says so.
+(2) **Focus ground truth** (upgrades K-02/C-09 from CSSOM guessing): for
+every tab stop, `CSS.forcePseudoState([:focus, :focus-visible])` +
+computed-style diffing of the paint-relevant properties, with axe's
+invisible-change filter (an outline-color change under 0 width cannot be
+seen). Forcing `:focus-visible` too is what makes the browser's DEFAULT
+ring count as visible — only elements whose authors removed the indicator
+and added nothing fail. Zero visible change → `eu-focus-not-visible`
+(serious, a VIOLATION not a review item — forcePseudoState is the
+browser's actual rendering, so this is provable). Stops CDP cannot resolve
+(shadow DOM/iframes) are recorded "unverified", never failed.
+(3) **Reflow test** (Z-04/Z-05): `Emulation.setDeviceMetricsOverride`
+320×900 with `mobile:false` — found live: `mobile:true` triggers Chrome's
+legacy 980 px layout-viewport fallback on pages without `<meta viewport>`,
+so the normative test never fires; desktop emulation enforces a true
+320 CSS px viewport on every page — 1 s settle, horizontal-scroll check +
+outermost overflowing elements (containment dedup — one finding per
+overflow chain, nothing dropped). Horizontal scroll at WCAG 1.4.10's normative 320 px →
+`eu-reflow-horizontal-scroll` (serious, provable). The zoom variant is
+deliberately not run; 320 px is the SC's normative measure.
+Results flow through the standard buildReport (mode "guided") — provable
+findings land in Violations, judgment in Incomplete — plus a stop-by-stop
+"Guided Tests" report section and Excel sheet. The debugger is always
+detached in finally; the panel card warns about Chrome's debugging banner.
+Walk/diff/assembly logic is transport-injected and unit-tested
+(test/cdp-tests.test.mjs, 23 checks); live-verified against fixtures
+(guided.mjs harness: sequence, trap, no-focus flag, reflow, no debugger
+leaks).
+
+Also: opt-in `wfElementShots` setting (default OFF — attaching the
+debugger mid-browse shows Chrome's infobar): when ON, a workflow scan that
+adds new needs-review nodes captures a cropped, highlighted element shot
+per node via the existing element-screenshot machinery and embeds them in
+the step's AI-evidence record.
+
+Viewport-shot evidence actually captures (found by the messy-site live run,
+groww.in, 2026-08-18): `chrome.tabs.captureVisibleTab` requires the literal
+`<all_urls>` host-permission pattern — `http://*/*` + `https://*/*` are not
+accepted by that API — so every workflow viewport shot had silently nulled
+since the layer landed. host_permissions is now `<all_urls>` (a superset of
+what we held; both competitor extensions request the same). Also guarded:
+the shot is only taken when the scanned tab IS the window's active tab,
+because captureVisibleTab captures whatever is visible — attaching another
+tab's pixels as evidence would mislead the AI judge into grounding contrast
+verdicts in the wrong page. Live-verified on groww.in: evidence carries
+viewportShot data URLs, prepare.mjs writes step-*.png, and the persisted
+report's workflowRaw mirror rides along (157 raw = 157 unique on a
+two-page, 277-issue session).
+
+DevTools panel is now the FULL extension surface (light, card-based layout):
+Page Scan (scan + highlight/clear + open report), Workflow Analyzer (record
+user flow with live stats + timeline), Site Crawl with max-URLs/depth and
+crawl-progress display, Template Check (paste list), crash recovery, and a
+Settings card persisted to the same storage keys as the popup so both
+surfaces always agree. Live-verified 17/17 by the puppeteer harness.
+
+Cap removal pass, honouring the v0.5.1 no-silent-caps rule across the new
+workflow/AI code: MAX_STEPS 200 → Infinity (sessions unbounded; the
+mutation-fingerprint dedup, not a ceiling, is what protects against
+auto-refreshing pages), evidence snapshots uncapped (was 40/session) and
+untruncated (was 1.5 MB DOM / 300 KB CSS clips — now full DOM + full
+readable CSS, cross-origin skips still counted), AI-bundle review items
+carry every node (was 20/rule), broken-link 'Found On' lists every linking
+page (was 25), link-check default target cap removed (was 8,000; explicit
+caller bounds still report truncation), report retention raised 5 → 25.
+Kept, with reasons: the observer's 5,000-fingerprint FIFO (bounds memory,
+not findings — eviction can only cause an EXTRA scan, never a missed one)
+and selector-walk depth limits (algorithmic, not result caps).
+
+Critical fix, found by live end-to-end testing: Chrome silently no-ops a
+second chrome.scripting.executeScript({files}) of the same file into the
+same document+world — verified on Chrome 152 (the call resolves in 0 ms,
+the script never runs). Any SECOND scan of the same document therefore hung
+until the 60 s timeout — latent since v0.4.x (the crawler opens a fresh tab
+per URL so it never re-scans a document; workflow mode re-scans constantly
+and exposed it, and it also broke a repeated popup 'Scan current page' on
+the same page). Fix: content-script.js now wires a persistent EU_RESCAN
+listener on first injection and guards re-entry; runContentScan messages
+first and injects the file only when no listener answers (fresh document).
+Verified live: second scan 60 s hang → 1 s; full workflow session on
+zerodha.com: 2 pages, 2 steps, 93 unique issues, report + evidence bundle.
+
+DevTools panel — `devtools/` registers an "EnableUser" panel
+(chrome.devtools.panels.create, inspected tabId passed via query string, the
+BrowserStack pattern) with a live workflow surface: Start/Stop, recording
+pulse, stat tiles (pages / steps / scans / unique issues / repeats
+suppressed), and a reverse-chronological step timeline polling
+WORKFLOW_DETAIL every 1.5 s. Dark theme, no chrome.devtools APIs beyond
+panel creation — the background stays the single source of truth.
+
+AI evidence capture + local Claude review (the vendors' server-AI layer,
+done locally) — once per step the rendered DOM (≤1.5 MB) and accessible CSS
+(≤300 KB) are serialized and stored (≤40 snapshots/session); on Stop an
+`enableuser-workflow-ai-bundle-<testId>.json` downloads next to the report:
+timeline + every needs-review (incomplete) finding + evidence.
+`tools/ai-review/prepare.mjs` splits it into per-case prompts with the DOM
+excerpt around each flagged node; Claude writes strict JSON verdicts;
+`tools/ai-review/merge.mjs` buckets them — confirmed (tagged EU-ai, only at
+or above the 0.7 confidence threshold), dismissed, human review queue.
+Verdicts never override engine results; they settle only what the engines
+marked incomplete. Pipeline contract pinned by test/ai-review.test.mjs.
+
+## v0.5.0
+
+unifies two independently-developed v0.4.9 builds. Screenshots are now end-to-end: full-page captures plus one highlighted, cropped shot per violating element, embedded in the Excel (inline Preview column on the Violations sheet, on the Pages sheet, and a dedicated Issue Screenshots sheet) and rendered lazily in the report viewer (gallery section plus a Screenshot column, IntersectionObserver-backed so a 200-page crawl does not push hundreds of MB of base64 into the tab up front). Before capturing, the layout viewport is expanded to the full document height so lazy-loaded content below the fold actually renders: captureBeyondViewport reaches that content but never fires its IntersectionObservers, so long pages previously captured blank hero images. Width is left exactly as the tab had it, so evidence never crosses a responsive breakpoint the user was not at. Element captures highlight via an overlay box (an outline alone is clipped by any ancestor with overflow:hidden), crop to a 400x300 minimum so small targets carry legible context, and restore the original scroll position. Single-page scans capture screenshots too, and they run against your own visible tab. Paste-a-list no longer opens every pasted URL at once: the global concurrency cap was 200, harmless on single-origin crawls (the 8-per-origin cap bound them) but on a multi-domain paste list nothing held total tabs down, so ~200 URLs opened ~200 background tabs, collapsed the Chrome renderer pool, and made reachable links fail as unreachable. Global cap is now 10; single-origin behaviour is unchanged. Cookie/consent dismissal pierces open shadow roots (Usercentrics-style CMPs render entirely inside one) and recognises Hindi accept/close labels. WCAG 1.4.1 link analysis now skips nav/header/footer/breadcrumb chrome and stays silent when no stylesheet is readable, instead of flagging every navigation link on every page. Reports and the inventory carry a per-page outcome (Clean / Issues / Unreachable) with a summary tile row, and a completed crawl inventory can be reprojected into the classic criterion-table report with no rescan. Default recipe is axe-core only; media, PDF/Office, visual-state checks, overlay dismissal and audit-both are opt-in.
+
+## v0.4.8
+
+reports no longer expire — multi-page and single-page reports are persisted to chrome.storage.local (last 5 kept, pruned automatically), so the report tab and Excel/CSV downloads survive service-worker eviction and browser restarts; viewer, Excel, and CSV are all generated from the same persisted report object, so the run result and every export always match.
+
+## v0.4.7
+
+visual-checks tranche 2 — control/button boundary contrast (1.4.11), declared focus-ring colours vs page background (1.4.11), provable ::placeholder contrast (1.4.3), aria-invalid-on-load (3.3.1), positive tabindex (2.4.3), focus-stolen-on-load (3.2.1), adjacent duplicate image+text links (2.4.4), text-spacing survival with injected 1.4.12 overrides, and a 2.5s motion-sampling pass that flags auto-moving regions with no pause control (2.2.2) plus missing prefers-reduced-motion CSS. Manual Checklist 'Machine assist' column now marks 17 assisted cases and 14 cases already covered by axe-core/media-checks — 31 of 129 with automated coverage.
+
+## v0.4.6
+
+visual-state check suite automates the machine-detectable subset of the manual checklist — colour-only links in text blocks (WCAG 1.4.1 Route A/B classification with computed 3:1 link-vs-text contrast), focus-outline suppression detection (2.4.7 — the *:focus{outline:none} reset), CSSOM scan for hover/focus cue rules on Route B links, and a no-hover-feedback UX advisory; provable failures land in Violations, pseudo-state findings in Incomplete tagged 'review' (never over-claimed). Manual Checklist sheet gains a 'Machine assist' column linking assisted cases (K-02, C-02, C-03, C-04) to their new eu-* rule ids. Ships CRAWL-PIPELINE.md — a plain-language walkthrough of exactly what runs at each crawl stage.
+
+## v0.4.5
+
+embedded Manual Test Checklist v1.2 (129 cases across 9 passes covering the SCs scanners can't automate — keyboard traps, focus indicators, form errors, hover/focus/visited link states, moving content, modal traps) emitted as a 'Manual Checklist' Excel sheet scoped per-page by the components the crawler found; new 'Scan Settings' sheet echoes the exact configuration that produced each report; default recipe preset (axe + media + PDF + dismiss overlays + audit-both + real-pages discovery + broken-link detector); settle minimum lowered to 1s (adaptive 1–10s, 2s DOM-quiet floor).
+
+## v0.4.4
+
+internal broken-link detector — status-checks every internal link target found during the crawl (hard 404/410, 5xx, unreachable), fingerprints the site's real not-found behaviour with nonexistent-URL probes to catch soft 404s (200-status 'page not found' pages, matched by title wording and body similarity), flags links that silently redirect to the homepage, adds an SPA-safe rendered-DOM layer (a worker tab renders a nonexistent URL to fingerprint the site's JavaScript-rendered not-found page, then every crawled page's rendered DOM is compared against it), and reports each broken URL with the pages that link to it and the anchor text used (new 'Broken Links' Excel sheet).
+
+## v0.4.3
+
+screenshots now opt-in (findings + Excel fast path by default), worker tabs open in a dedicated minimized window, circuit breaker stops dead-site crawls after 20 consecutive failures, mid-crawl checkpoints every 20 pages with one-click crash recovery, and a 'real pages only' discovery mode (follow visible links only — skip sitemap/feeds/CMS probes).
+
+## v0.4.2
+
+adaptive page-settle wait (5s min, ends after 2s of DOM quiet, 10s cap) before axe-core runs — replaces the fixed 15s sleep.

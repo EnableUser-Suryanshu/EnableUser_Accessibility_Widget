@@ -23,15 +23,21 @@ function escape(s) {
   return String(s ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 }
 
-function stringifyData(d) {
-  if (d === null || d === undefined) return "";
-  if (typeof d === "string") return d;
-  try { return JSON.stringify(d, null, 2); } catch { return String(d); }
-}
+// ── Screenshots ───────────────────────────────────────────────────────────
+// Screenshots are full-page PNG data URLs — routinely 1–3 MB each. A crawl of
+// 200 pages would be ~400 MB of base64 if every <img> got a real src up front,
+// which locks the report tab for tens of seconds and can OOM it outright. So
+// every thumbnail starts as a 1x1 transparent placeholder and only fetches its
+// real bytes when it scrolls near the viewport.
 
 const BLANK_IMG =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
+// Read straight from storage first. The service worker may have been evicted
+// since the scan finished, in which case its in-memory Map is empty but
+// storage.local still holds shot:<id> (written by persistReport /
+// persistInventory). Falling back to the message path second means an evicted
+// worker doesn't have to be woken just to serve an image.
 async function readScreenshotFromStorage(id) {
   try {
     const key = `shot:${id}`;
@@ -57,6 +63,8 @@ const screenshotObserver = ("IntersectionObserver" in window)
 async function loadScreenshot(img) {
   const id = img.getAttribute("data-shot-id");
   if (!id || img.getAttribute("data-loaded") === "1") return;
+  // Guard against a click and the observer both firing mid-fetch.
+  if (img.getAttribute("data-loaded") === "loading") return;
   img.setAttribute("data-loaded", "loading");
   try {
     let entry = await readScreenshotFromStorage(id);
@@ -67,10 +75,18 @@ async function loadScreenshot(img) {
     if (entry?.dataUrl) {
       img.src = entry.dataUrl;
       img.setAttribute("data-loaded", "1");
+      img.alt = img.getAttribute("data-alt-loaded") || "screenshot";
     } else {
       img.setAttribute("data-loaded", "error");
       img.alt = "screenshot unavailable";
       img.classList.add("screenshot-missing");
+      // The placeholder src loads successfully, so the browser never falls back
+      // to showing alt text — a sighted reader would just see an empty box. Add
+      // a visible note alongside it (guarded so a re-run can't duplicate it).
+      const host = img.parentElement;
+      if (host && !host.querySelector(".screenshot-unavailable")) {
+        host.appendChild(el("span", { class: "screenshot-unavailable" }, ["Screenshot unavailable — not in local storage"]));
+      }
     }
   } catch (err) {
     console.warn("[EU] screenshot fetch failed", err);
@@ -78,34 +94,9 @@ async function loadScreenshot(img) {
   }
 }
 
-function renderScreenshot(shot, caption) {
-  if (!shot?.id) return null;
-  const wrap = el("div", { class: "screenshot-wrap" });
-  wrap.appendChild(el("div", { class: "check-group-label" }, [caption || "Full-page screenshot"]));
-  const img = el("img", {
-    class: "screenshot-thumb",
-    src: BLANK_IMG,
-    "data-shot-id": shot.id,
-    alt: "full-page screenshot (loading)"
-  });
-  img.addEventListener("click", () => {
-    img.classList.toggle("expanded");
-    if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
-  });
-  wrap.appendChild(img);
-  if (screenshotObserver) screenshotObserver.observe(img);
-  else loadScreenshot(img);
-  return wrap;
-}
-
-function renderElementShot(id) {
-  if (!id) return el("span", { class: "muted" }, ["—"]);
-  const img = el("img", {
-    class: "screenshot-thumb element-shot-thumb",
-    src: BLANK_IMG,
-    "data-shot-id": id,
-    alt: "issue element screenshot (loading)"
-  });
+// Shared wiring for a lazily-loaded thumbnail: click toggles full size, and a
+// click before the observer has fired forces the fetch immediately.
+function wireShotImg(img) {
   img.addEventListener("click", () => {
     img.classList.toggle("expanded");
     if (img.getAttribute("data-loaded") !== "1") loadScreenshot(img);
@@ -113,6 +104,65 @@ function renderElementShot(id) {
   if (screenshotObserver) screenshotObserver.observe(img);
   else loadScreenshot(img);
   return img;
+}
+
+function renderScreenshot(shot, caption) {
+  if (!shot?.id) return null;
+  const wrap = el("div", { class: "screenshot-wrap" });
+  wrap.appendChild(el("div", { class: "check-group-label" }, [caption || "Full-page screenshot"]));
+  wrap.appendChild(wireShotImg(el("img", {
+    class: "screenshot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": shot.id,
+    "data-alt-loaded": "full-page screenshot",
+    alt: "full-page screenshot (loading)"
+  })));
+  return wrap;
+}
+
+// Per-issue cropped, highlighted element shot for a findings-table row.
+function renderElementShot(id) {
+  if (!id) return el("span", { class: "muted" }, ["—"]);
+  return wireShotImg(el("img", {
+    class: "screenshot-thumb element-shot-thumb",
+    src: BLANK_IMG,
+    "data-shot-id": id,
+    "data-alt-loaded": "issue element screenshot",
+    alt: "issue element screenshot (loading)"
+  }));
+}
+
+// Page-level screenshot gallery. Returns the number of cards rendered so the
+// caller can leave the section hidden when a scan ran with screenshots off.
+function renderScreenshotGallery(pages) {
+  const section = document.getElementById("screenshots-section");
+  const grid = document.getElementById("screenshots-grid");
+  if (!section || !grid) return 0;
+  grid.innerHTML = "";
+  let count = 0;
+  for (const p of pages || []) {
+    if (!p.screenshot?.id) continue;
+    const imgWrap = renderScreenshot(p.screenshot);
+    if (!imgWrap) continue;
+    const card = el("div", { class: "screenshot-card" }, [
+      el("div", { class: "screenshot-caption" }, [
+        el("div", { class: "screenshot-title" }, [p.title || "Untitled"]),
+        el("a", { class: "screenshot-url", href: p.url, target: "_blank", rel: "noopener" }, [p.url])
+      ]),
+      imgWrap
+    ]);
+    grid.appendChild(card);
+    count++;
+  }
+  // Native attribute, not a class — report.css scopes `.hidden` to `table.hidden`.
+  if (count > 0) section.hidden = false;
+  return count;
+}
+
+function stringifyData(d) {
+  if (d === null || d === undefined) return "";
+  if (typeof d === "string") return d;
+  try { return JSON.stringify(d, null, 2); } catch { return String(d); }
 }
 
 // Render a check group (any/all/none) as a small table — every field
@@ -222,7 +272,7 @@ function renderNodeDetails(i) {
   const res = await send({ type: "GET_REPORT", reportId });
   const report = res?.report;
   if (!report) {
-    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>This report could not be found or is no longer stored in local storage. Run a new scan from the popup.</p></div>";
+    document.body.innerHTML = "<div class='wrap' style='padding:40px'><h1>Report not available</h1><p>This report is no longer stored — only the last 5 reports are kept. Run a new scan from the popup. (Since v0.4.8 reports survive browser restarts; if you see this on a fresh report, reload the extension and re-scan.)</p></div>";
     return;
   }
 
@@ -241,6 +291,33 @@ function renderNodeDetails(i) {
     `${modeLabel} · ${report.meta.totalPages} page(s) · generated ${new Date(report.meta.generatedAt).toLocaleString()} · seed: ${report.meta.seedUrl}`;
   const _summaryHeading = document.getElementById("summary-heading");
   if (_summaryHeading && report.meta.profileLabel) _summaryHeading.textContent = `${report.meta.profileLabel} — Criterion Status`;
+
+  // ── Guided Tests (Phase C) — stop-by-stop evidence behind the guided
+  // findings. Only present on mode "guided" reports. ──
+  if (report.guidedTests) {
+    const gt = report.guidedTests;
+    const gtBody = document.querySelector("#guided-table tbody");
+    const gtRow = (cells, cls) => gtBody.appendChild(el("tr", cls ? { class: cls } : {}, cells.map(c => el("td", {}, [String(c ?? "")]))));
+    if (gt.keyboard) {
+      for (const s of gt.keyboard.stops || []) {
+        const fc = s.focusCheck || {};
+        const result = !fc.checked ? "unverified" : fc.visible ? "visible focus" : "NO VISIBLE FOCUS";
+        const detail = !fc.checked
+          ? (fc.reason || "")
+          : (fc.changes || []).map(c => `${c.prop}: ${c.from} → ${c.to}`).join(" | ") || "no visible computed-style change";
+        gtRow([s.index, "Tab stop", s.tag || "", s.selector || "", result, detail], (fc.checked && !fc.visible) ? "status-fail" : "");
+      }
+      for (const f of gt.keyboard.findings || []) {
+        gtRow(["", "Keyboard trap", "", f.selector || "", f.escaped ? "Escape freed focus" : "Escape did NOT free focus", "Focus stopped advancing for 3 consecutive Tabs"], "status-fail");
+      }
+      gtRow(["", "Walk end", "", "", gt.keyboard.cycled ? "focus order cycled" : gt.keyboard.trapped ? "STOPPED at trap" : "ended", `${(gt.keyboard.stops || []).length} tab stop(s)`]);
+    }
+    if (gt.reflow) {
+      gtRow(["", "Reflow @320px", "document", "", gt.reflow.horizontalScroll ? "HORIZONTAL SCROLL" : "reflows cleanly", `scrollWidth ${gt.reflow.scrollWidth}px vs clientWidth ${gt.reflow.clientWidth}px`], gt.reflow.horizontalScroll ? "status-fail" : "");
+      for (const o of gt.reflow.offenders || []) gtRow(["", "Overflow element", "", o.selector || "", `${Math.round(o.width)}px wide`, o.html || ""]);
+    }
+    document.getElementById("guided-section").hidden = false;
+  }
 
   // ── Stats tiles ──
   const totalViolations = report.issueRows.length;
@@ -378,7 +455,14 @@ function renderNodeDetails(i) {
   // ── Media & Documents ──
   renderMediaSection(report);
 
+  // ── Screenshot gallery ──
+  // Driven off report.pages (the raw scanned page objects, which carry
+  // `screenshot`), not report.pagesRows (the flattened table rows, which don't).
+  // Stays hidden when the scan ran with screenshots off.
+  renderScreenshotGallery(report.pages);
+
   // ── Pages table (expand to show scan metadata) ──
+  renderPageStatusTiles(report.pagesRows);
   const pagesBody = document.querySelector("#pages-table tbody");
   for (const p of report.pagesRows) {
     const a = el("a", { href: p.url, target: "_blank", rel: "noopener" }, [p.url]);
@@ -390,7 +474,7 @@ function renderNodeDetails(i) {
       el("td", {}, [p.source || ""]),
       el("td", {}, [p.template_id || ""]),
       el("td", {}, [p.url_cluster || ""]),
-      el("td", {}, [p.status]),
+      statusCell(classifyPageStatus(p)),
       el("td", {}, [String(p.violations)]),
       el("td", {}, [String(p.passes)]),
       el("td", {}, [String(p.incomplete)]),
@@ -427,32 +511,6 @@ function renderNodeDetails(i) {
     pagesBody.appendChild(detailRow);
   }
 
-  // ── Screenshots ──
-  const screenshotsSection = document.getElementById("screenshots-section");
-  const screenshotsGrid = document.getElementById("screenshots-grid");
-  if (screenshotsSection && screenshotsGrid) {
-    let count = 0;
-    for (const p of report.pages || []) {
-      if (p.screenshot?.id) {
-        count++;
-        const card = el("div", { class: "screenshot-card" });
-        const caption = el("div", { class: "screenshot-caption" }, [
-          el("div", { class: "screenshot-title" }, [p.title || "Untitled"]),
-          el("a", { class: "screenshot-url", href: p.url, target: "_blank", rel: "noopener" }, [p.url])
-        ]);
-        card.appendChild(caption);
-        const imgWrap = renderScreenshot(p.screenshot);
-        if (imgWrap) {
-          card.appendChild(imgWrap);
-          screenshotsGrid.appendChild(card);
-        }
-      }
-    }
-    if (count > 0) {
-      screenshotsSection.classList.remove("hidden");
-    }
-  }
-
   // ── Violations / Issues ──
   const issuesBody = document.querySelector("#issues-table tbody");
   for (const i of report.issueRows) {
@@ -465,8 +523,12 @@ function renderNodeDetails(i) {
     mainRow.appendChild(el("td", {}, [i.wcag_level]));
     mainRow.appendChild(el("td", {}, [i.rule_id]));
     mainRow.appendChild(el("td", { class: `impact-${i.impact || "minor"}` }, [i.impact || ""]));
-    mainRow.appendChild(el("td", { class: "element-shot-cell" }, [renderElementShot(i.elementShotId)]));
     mainRow.appendChild(el("td", {}, [i.failure_summary || i.wcag_name || i.rule_description || ""]));
+    // Cropped, highlighted shot of the offending element. Clicking it expands
+    // rather than toggling the row, so stop the row's own click handler.
+    const shotCell = el("td", { class: "element-shot-cell" }, [renderElementShot(i.elementShotId)]);
+    shotCell.addEventListener("click", ev => ev.stopPropagation());
+    mainRow.appendChild(shotCell);
 
     const detailRow = el("tr", { class: "issue-detail-row" });
     const detailCell = el("td", { colspan: "7" });
@@ -591,6 +653,47 @@ function renderNodeDetails(i) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
 })();
+
+// Classify a scanned page by outcome — clean completion (0 violations),
+// completed with issues, or unreachable. pagesRows carry status ("scanned"
+// /"failed"), an optional error string, and a numeric violation count.
+function classifyPageStatus(p) {
+  if (p.error || p.status === "failed") {
+    return { key: "unreachable", label: "Unreachable", cls: "status-fail",
+             title: p.error ? `Not reachable — ${p.error}` : "Page could not be scanned" };
+  }
+  const violations = Number(p.violations) || 0;
+  if (violations > 0) {
+    return { key: "issues", label: "Issues", cls: "status-warn",
+             title: `Scan completed — ${violations} violation${violations === 1 ? "" : "s"} found` };
+  }
+  return { key: "clean", label: "Clean", cls: "status-ok",
+           title: "Scan completed successfully — 0 violations" };
+}
+
+function statusCell(s) {
+  return el("td", {}, [
+    el("span", { class: `status-pill ${s.cls}`, title: s.title }, [s.label])
+  ]);
+}
+
+// Roll-up tiles above the Pages table: how many pages completed, how many were
+// clean, how many still have issues, and how many were never reachable.
+function renderPageStatusTiles(pagesRows) {
+  const host = document.getElementById("pages-status-tiles");
+  if (!host) return;
+  let clean = 0, issues = 0, unreachable = 0;
+  for (const p of pagesRows || []) {
+    const k = classifyPageStatus(p).key;
+    if (k === "clean") clean++;
+    else if (k === "issues") issues++;
+    else unreachable++;
+  }
+  host.appendChild(makeStat("Completed", clean + issues, "ok"));
+  host.appendChild(makeStat("Clean (0 issues)", clean, "ok"));
+  host.appendChild(makeStat("With issues", issues, issues > 0 ? "warn" : ""));
+  host.appendChild(makeStat("Unreachable", unreachable, unreachable > 0 ? "fail" : ""));
+}
 
 function makeStat(label, value, cls = "") {
   const e = document.createElement("div");

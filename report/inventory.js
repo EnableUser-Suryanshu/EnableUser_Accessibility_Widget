@@ -528,11 +528,57 @@ function renderSample(inventory) {
   });
 }
 
+// Classify a crawled page by scan outcome so a page's status is visible at a
+// glance — a clean completion (0 violations) reads very differently from one
+// that was never reachable, and both should be distinguishable from a page
+// that completed but has issues to fix. Shared shape with the classic report.
+function classifyPageStatus(p) {
+  if (p.error) {
+    return { key: "unreachable", label: "Unreachable", cls: "status-fail",
+             title: `Not reachable — ${p.error}` };
+  }
+  const violations = (p.audit?.violations || []).length;
+  if (violations > 0) {
+    return { key: "issues", label: "Issues", cls: "status-warn",
+             title: `Scan completed — ${violations} violation${violations === 1 ? "" : "s"} found` };
+  }
+  return { key: "clean", label: "Clean", cls: "status-ok",
+           title: "Scan completed successfully — 0 violations" };
+}
+
+function statusTd(s) {
+  return el("td", {}, [
+    el("span", { class: `status-pill ${s.cls}`, title: s.title }, [s.label])
+  ]);
+}
+
+// Roll-up of page outcomes, shown as a tile row above the All Pages table so
+// the auditor sees "12 completed, 5 clean, 3 unreachable" without scanning
+// every row. Scoped to the rows actually in the table (auditable + error);
+// shell/soft-404 and content-hash duplicates have their own crawl-summary tiles.
+function renderPageStatusTiles(pages) {
+  const host = document.getElementById("pages-status-tiles");
+  if (!host) return;
+  host.innerHTML = "";
+  let clean = 0, issues = 0, unreachable = 0;
+  for (const p of pages) {
+    const k = classifyPageStatus(p).key;
+    if (k === "clean") clean++;
+    else if (k === "issues") issues++;
+    else unreachable++;
+  }
+  host.appendChild(stat("Completed", clean + issues, "ok"));
+  host.appendChild(stat("Clean (0 issues)", clean, "ok"));
+  host.appendChild(stat("With issues", issues, issues > 0 ? "warn" : ""));
+  host.appendChild(stat("Unreachable", unreachable, unreachable > 0 ? "fail" : ""));
+}
+
 function renderPages(inventory) {
   const tbody = document.querySelector("#pages-table tbody");
   tbody.innerHTML = "";
   const pages = inventory.pages || [];
-  const colspan = "14";
+  const colspan = "15";
+  renderPageStatusTiles(pages);
   if (!pages.length) {
     tbody.appendChild(el("tr", {}, [
       el("td", { colspan, class: "muted" }, ["No pages crawled."])
@@ -545,6 +591,7 @@ function renderPages(inventory) {
         el("td", {}, [
           el("a", { href: p.url, target: "_blank", rel: "noopener" }, [p.url])
         ]),
+        statusTd(classifyPageStatus(p)),
         el("td", { class: "muted" }, ["(error)"]),
         el("td", { class: "muted" }, ["—"]),
         el("td", {}, [String(p.depth ?? "")]),
@@ -572,6 +619,7 @@ function renderPages(inventory) {
       el("td", {}, [
         el("a", { href: p.url, target: "_blank", rel: "noopener" }, [p.url])
       ]),
+      statusTd(classifyPageStatus(p)),
       el("td", { class: "mono" }, [p.template_id || ""]),
       el("td", {}, [el("span", { class: "badge" }, [typeLabel])]),
       el("td", {}, [String(p.depth ?? "")]),
@@ -765,6 +813,7 @@ function wireDownloads(inventory) {
   const btnAudit = document.getElementById("btn-download-audit");
   const btnHtml = document.getElementById("btn-download-html");
   const btnShotsZip = document.getElementById("btn-download-shots-zip");
+  const btnClassic = document.getElementById("btn-open-classic");
 
   btnDocx?.addEventListener("click", () => download("DOWNLOAD_SCOPE_DOCX", btnDocx));
   btnXlsx?.addEventListener("click", () => download("DOWNLOAD_INVENTORY_XLSX", btnXlsx));
@@ -772,6 +821,11 @@ function wireDownloads(inventory) {
   btnAudit?.addEventListener("click", () => download("DOWNLOAD_AUDIT_XLSX", btnAudit));
   btnHtml?.addEventListener("click", () => exportStandaloneHtml(btnHtml, inventory));
   btnShotsZip?.addEventListener("click", () => exportScreenshotsZip(btnShotsZip, inventory));
+  // v0.4.8 — rebuilds the classic flat report (WCAG criterion status,
+  // conformance by standard, media & documents, passes / incomplete /
+  // inapplicable, scan environment, CSV / Excel / JSON exports) from this
+  // crawl's data and opens it in a new tab. Nothing is rescanned.
+  btnClassic?.addEventListener("click", () => download("OPEN_CLASSIC_REPORT", btnClassic));
 }
 
 // ─────────────────────────────────────────────────────────────────────

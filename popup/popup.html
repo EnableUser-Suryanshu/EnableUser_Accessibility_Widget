@@ -40,7 +40,7 @@
         </div>
         <div class="text">
           <div class="title">Multi Page Scan</div>
-          <div class="sub">Crawls same-site links + sitemap.xml / robots.txt</div>
+          <div class="sub">Crawls same-site links + sitemap.xml / robots.txt. Opens the tabbed audit report (findings, screenshots, templates); the classic table report is one click away from there.</div>
         </div>
         <button id="btn-scan-multi" class="scan">Scan</button>
       </section>
@@ -60,6 +60,22 @@
           <div class="sub">Full audit + component inventory + static/dynamic classification per page. Produces scope.docx + inventory.xlsx. Screenshots only if enabled below. Depth is unbounded by default (only Max URLs caps the crawl).</div>
         </div>
         <button id="btn-scan-inventory" class="scan">Scope</button>
+      </section>
+
+      <hr />
+
+      <section class="row">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"></circle>
+            <polygon points="10 8 16 12 10 16 10 8"></polygon>
+          </svg>
+        </div>
+        <div class="text">
+          <div class="title">Workflow Analyzer (record as you browse)</div>
+          <div class="sub">Start recording, then browse the journey — log in, fill the form, check out. Every page load and page change is scanned automatically; repeated issues are counted once. Stop to get the timeline report.</div>
+        </div>
+        <button id="btn-workflow" class="scan">Record</button>
       </section>
 
       <hr />
@@ -117,13 +133,31 @@
         <label class="chk"><input type="checkbox" id="opt-check-is17802" /> IS 17802 governance (statement, feedback, relay)</label>
         <label class="chk"><input type="checkbox" id="opt-check-media" /> Media checks (video / audio / document links)</label>
         <label class="chk"><input type="checkbox" id="opt-check-pdfoffice" /> PDF / Office document audit</label>
-        <label class="chk"><input type="checkbox" id="opt-check-visual" checked /> Visual-state checks (colour-only links, focus suppression, hover cues)</label>
-        <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" checked /> Dismiss cookie / consent / modal overlays before scanning</label>
-        <label class="chk"><input type="checkbox" id="opt-audit-both" checked /> Audit BOTH the overlay and the page (two passes — slower)</label>
+        <label class="chk"><input type="checkbox" id="opt-check-visual" /> Visual-state checks (colour-only links, focus suppression, hover cues)</label>
+        <label class="chk"><input type="checkbox" id="opt-dismiss-overlays" /> Dismiss cookie / consent / modal overlays before scanning</label>
+        <label class="chk"><input type="checkbox" id="opt-audit-both" /> Audit BOTH the overlay and the page (extra pass only when an overlay is found)</label>
         <label class="chk"><input type="checkbox" id="opt-screenshots" /> Capture screenshots (full-page + per-violation — much slower, bigger reports)</label>
         <label class="chk"><input type="checkbox" id="opt-links-only" checked /> Real pages only — follow visible links, skip sitemap / feeds / CMS probes</label>
         <label class="chk"><input type="checkbox" id="opt-linkcheck" checked /> Detect broken internal links (hard 404s, soft 404s, dead redirects)</label>
       </section>
+
+      <hr />
+
+      <section class="row">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 20h9"></path>
+            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path>
+          </svg>
+        </div>
+        <div class="text">
+          <div class="title">Annotate This Page</div>
+          <div class="sub">Marks every <strong>confirmed</strong> violation on the page in front of you — numbered, with the offending code and the fix axe recommends. Needs-review findings are excluded. Nothing is saved and no report is opened.</div>
+        </div>
+        <button id="btn-highlight" class="scan">Highlight</button>
+      </section>
+
+      <button id="btn-clear-highlight" class="scan subtle" hidden>Remove annotations</button>
 
       <button id="btn-recover" class="scan" hidden>Recover interrupted crawl</button>
 

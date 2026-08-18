@@ -20,6 +20,58 @@ const chkScreenshots = $("opt-screenshots");
 const chkLinksOnly = $("opt-links-only");
 const chkLinkCheck = $("opt-linkcheck");
 const btnRecover = $("btn-recover");
+const btnHighlight = $("btn-highlight");
+const btnClearHighlight = $("btn-clear-highlight");
+const btnWorkflow = $("btn-workflow");
+
+// ── Workflow mode ────────────────────────────────────────────────────────
+// One button, two states: Record (no session on the current tab) ↔ Stop
+// (session recording). Status is read from background on open so the button
+// reflects reality even after the popup was closed mid-session.
+async function refreshWorkflowButton() {
+  if (!btnWorkflow) return;
+  const tab = await getActiveTab();
+  if (!tab) return;
+  const st = await send({ type: "WORKFLOW_STATUS", tabId: tab.id });
+  if (st?.active) {
+    btnWorkflow.textContent = "Stop";
+    btnWorkflow.dataset.active = "1";
+    setStatus(`Recording — ${st.pages} page(s), ${st.steps} step(s), ${st.newIssues} unique issue(s)` +
+      (st.suppressedDuplicates ? ` (${st.suppressedDuplicates} duplicates suppressed)` : "") +
+      (st.limitReached ? " — step limit reached, stop to get the report" : ""));
+  } else {
+    btnWorkflow.textContent = "Record";
+    delete btnWorkflow.dataset.active;
+  }
+}
+
+btnWorkflow?.addEventListener("click", async () => {
+  const tab = await getActiveTab();
+  if (!tab || !/^https?:/.test(tab.url || "")) { setStatus("Open an http(s) page first.", true); return; }
+  if (btnWorkflow.dataset.active) {
+    setBusy(true);
+    setStatus("Stopping — building the workflow report…");
+    const res = await send({ type: "WORKFLOW_STOP", tabId: tab.id });
+    setBusy(false);
+    if (!res?.ok) { setStatus(res?.error || "Stop failed.", true); return; }
+    setStatus(`Report opening — ${res.pages} page(s), ${res.steps} step(s), ${res.newIssues} unique issue(s).`);
+    window.close();
+    return;
+  }
+  const granted = await ensureHostPermission(tab.url);
+  if (!granted) { setStatus("Permission denied.", true); return; }
+  const opts = readScanOptions();
+  setStatus("Starting workflow recording — first scan running…");
+  const res = await send({
+    type: "WORKFLOW_START", tabId: tab.id,
+    options: { profile: opts.profile, checks: opts.checks, dismissOverlays: opts.dismissOverlays }
+  });
+  if (!res?.ok) { setStatus(res?.error || "Start failed.", true); return; }
+  setStatus("Recording. Browse the journey in this tab — every page load and change is scanned. Reopen this popup and press Stop for the report.");
+  await refreshWorkflowButton();
+});
+
+refreshWorkflowButton().catch(() => {});
 
 // First-run defaults — what the operator sees the first time they open the
 // popup with no stored preferences yet. WCAG 2.1 AA is the global baseline
@@ -27,6 +79,9 @@ const btnRecover = $("btn-recover");
 // large site (raise it once the site's size is known). Both are freely
 // editable per-scan and overridden by whatever the operator last saved to
 // chrome.storage.local.
+// Keep in step with background.js's DEFAULT_MAX_URLS and the value="" on
+// #opt-max-urls in popup.html. All three must agree or the effective default
+// depends on which one supplied it.
 const DEFAULT_MAX_URLS = 500;
 const DEFAULT_DEPTH = 0; // 0 = unbounded (inventory mode treats it as such)
 const DEFAULT_PROFILE = "wcag21aa";
@@ -35,19 +90,46 @@ const DEFAULT_PROFILE = "wcag21aa";
 // minimum floor (1) so no one accidentally launches a zero-URL scan.
 const VALID_PROFILES = ["wcag21aa", "wcag22aa", "is17802", "combined_in", "en301549", "section508", "ada"];
 
-chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks"]).then(s => {
+chrome.storage?.local.get(["maxUrls", "crawlDepth", "profile", "checks", "dismissOverlays", "auditBoth", "screenshots", "linksOnly", "brokenLinks", "defaultsVer"]).then(s => {
   if (Number.isFinite(s?.maxUrls)) maxUrlsInput.value = s.maxUrls;
   if (Number.isFinite(s?.crawlDepth)) depthInput.value = s.crawlDepth;
   if (s?.profile && VALID_PROFILES.includes(s.profile)) profileSelect.value = s.profile;
   const c = s?.checks || {};
+  // v0.4.8 (rev 50) — one-time migration to the new default recipe: axe-core
+  // only. Media, PDF/Office, visual-state checks, overlay dismissal, and
+  // audit-both are all opt-in (default OFF). Preferences saved under the old
+  // defaults would otherwise pin the old recipe forever; after this runs
+  // once, whatever the operator ticks is saved and wins as usual.
+  //
+  // The migrated VALUES must be persisted alongside the version marker, not just
+  // the marker. Writing only `defaultsVer: 50` mutated `c` and `s` in memory —
+  // enough to render the checkboxes correctly — while storage kept the old
+  // `checks` / `dismissOverlays` / `auditBoth`. Closing the popup without
+  // scanning then left defaultsVer already at 50, so this block was skipped on
+  // reopen and the stale values loaded straight back. The migration appeared to
+  // work once and then silently undid itself, permanently.
+  if (s?.defaultsVer !== 50) {
+    c.media = false;
+    c.pdfOffice = false;
+    c.visual = false;
+    if (s) { s.dismissOverlays = false; s.auditBoth = false; }
+    chrome.storage?.local.set({
+      defaultsVer: 50,
+      checks: c,
+      dismissOverlays: false,
+      auditBoth: false
+    }).catch(() => {});
+  }
   if (chkAxe) chkAxe.checked = c.axe !== false;
   if (chkIndia) chkIndia.checked = c.india === true;
   if (chkIs17802) chkIs17802.checked = c.is17802 === true;
+  // v0.4.8 — media, PDF/Office, and visual-state checks plus overlay
+  // dismissal + audit-both are all opt-in (default OFF). Saved prefs win.
   if (chkMedia) chkMedia.checked = c.media === true;
   if (chkPdfOffice) chkPdfOffice.checked = c.pdfOffice === true;
-  if (chkVisual) chkVisual.checked = c.visual !== false;
-  if (chkDismiss && typeof s?.dismissOverlays === "boolean") chkDismiss.checked = s.dismissOverlays;
-  if (chkAuditBoth && typeof s?.auditBoth === "boolean") chkAuditBoth.checked = s.auditBoth;
+  if (chkVisual) chkVisual.checked = c.visual === true;
+  if (chkDismiss) chkDismiss.checked = s?.dismissOverlays === true;
+  if (chkAuditBoth) chkAuditBoth.checked = s?.auditBoth === true;
   // v0.4.5 — operator's default recipe: screenshots stay opt-in; real-pages
   // discovery is now the default (linked pages only, no sitemap/feed junk).
   if (chkScreenshots) chkScreenshots.checked = s?.screenshots === true;
@@ -80,9 +162,9 @@ function readScanOptions() {
     axe: chkAxe ? chkAxe.checked : true,
     india: chkIndia ? chkIndia.checked : true,
     is17802: chkIs17802 ? chkIs17802.checked : true,
-    media: chkMedia ? chkMedia.checked : true,
-    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : true,
-    visual: chkVisual ? chkVisual.checked : true
+    media: chkMedia ? chkMedia.checked : false,
+    pdfOffice: chkPdfOffice ? chkPdfOffice.checked : false,
+    visual: chkVisual ? chkVisual.checked : false
   };
   const dismissOverlays = chkDismiss ? chkDismiss.checked : false;
   const auditBoth = chkAuditBoth ? chkAuditBoth.checked : false;
@@ -146,6 +228,8 @@ function setBusy(busy) {
   if (btnInventory) btnInventory.disabled = busy;
   if (btnList) btnList.disabled = busy;
   if (btnRecover) btnRecover.disabled = busy;
+  if (btnHighlight) btnHighlight.disabled = busy;
+  if (btnClearHighlight) btnClearHighlight.disabled = busy;
 }
 
 // ── v0.4.3 — crash recovery ──────────────────────────────────────────────
@@ -206,6 +290,54 @@ btnCurrent.addEventListener("click", async () => {
   if (!res?.ok) { setStatus(res?.error || "Scan failed.", true); return; }
   setStatus("Opening report…");
   window.close();
+});
+
+// Annotate the current page in place. Unlike the scan buttons this deliberately
+// does NOT close the popup on success — the operator needs to read the result
+// line ("12 marked, 1 inside a nested frame") and may want the Remove button,
+// which only appears once something has been drawn.
+btnHighlight.addEventListener("click", async () => {
+  setStatus(null);
+  const tab = await getActiveTab();
+  if (!tab || !/^https?:/.test(tab.url || "")) {
+    setStatus("Open an http(s) page first.", true);
+    return;
+  }
+  const granted = await ensureHostPermission(tab.url);
+  if (!granted) { setStatus("Permission denied.", true); return; }
+
+  const opts = readScanOptions();
+  setBusy(true);
+  setStatus("Scanning this page for confirmed issues…");
+  const res = await send({ type: "HIGHLIGHT_ISSUES", tabId: tab.id, options: opts });
+  setBusy(false);
+  if (!res?.ok) { setStatus(res?.error || "Could not annotate this page.", true); return; }
+
+  if (!res.issues) {
+    // The overlay was still rendered — an empty panel saying "0 confirmed
+    // issues" — so hiding Remove here left the operator with a panel on their
+    // page and no button to dismiss it. Background clears it instead of
+    // rendering an empty one, so there is genuinely nothing to remove.
+    setStatus("No confirmed violations on this page. (Needs-review findings are not drawn — run a full scan to see those.)");
+    btnClearHighlight.hidden = true;
+    return;
+  }
+  const bits = [`${res.issues} confirmed issue${res.issues === 1 ? "" : "s"} across ${res.rules} rule${res.rules === 1 ? "" : "s"}`];
+  if (res.unresolved) bits.push(`${res.unresolved} inside nested frames, listed but not marked`);
+  setStatus(`${bits.join(" · ")}. Annotations are on the page.`);
+  btnClearHighlight.hidden = false;
+});
+
+btnClearHighlight.addEventListener("click", async () => {
+  const tab = await getActiveTab();
+  if (!tab) return;
+  const res = await send({ type: "CLEAR_HIGHLIGHTS", tabId: tab.id });
+  if (res?.ok) {
+    btnClearHighlight.hidden = true;
+    setStatus("Annotations removed.");
+  } else {
+    setStatus(res?.error || "Could not remove annotations.", true);
+  }
 });
 
 btnMulti.addEventListener("click", async () => {

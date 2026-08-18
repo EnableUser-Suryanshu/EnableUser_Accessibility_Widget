@@ -2,13 +2,114 @@
 
 A small Chrome (Manifest V3) extension that audits web pages against **WCAG 2.1 AA** using **axe-core**.
 
-## v0.4.9 — screenshots implemented that persist in excel
+## v0.5.0 — screenshots end to end (and one codebase again)
 
-Implemented Screenshots. Screenshots captured during audits are now embedded directly in the downloaded Excel sheets (inside a new "Preview" column on the "Violations" and "Pages" sheets), ensuring that they are saved and persist inside the spreadsheet itself.
+Two builds both called themselves v0.4.9: one added screenshot support, the other
+fixed paste-a-list concurrency and a batch of reporting work. Neither descended
+from the other. v0.5.0 is the unification — see [DIVERGENCE.md](DIVERGENCE.md)
+for the full inventory and what was deliberately left behind.
+
+**Screenshots now work from capture through to deliverable.**
+
+- **Report viewer** gains a Screenshots gallery and a Screenshot column in
+  Violations showing each offending element highlighted in place. Images load
+  lazily via `IntersectionObserver` — full-page PNGs run 1–3 MB, so a 200-page
+  crawl would otherwise push ~400 MB of base64 into the tab on open. Resolution
+  is storage-first, falling back to a message to the service worker.
+- **Excel** carries previews in three places: inline on each Violations row (the
+  sheet auditors actually work in), on the Pages sheet, and on the dedicated
+  Issue Screenshots sheet, which adds Impact / Success Criteria context. The
+  **classic-report** workbook now carries them too — it
+  previously embedded no images at all, so exporting via "Open Classic Report"
+  silently dropped every screenshot the crawl had captured.
+- **Lazy-loaded content is now captured.** Before each capture the page is
+  walked top to bottom in viewport-sized steps, then returned to where it
+  started; we then wait for images to settle (bounded at 4 s).
+  `captureBeyondViewport` reaches below-the-fold content but never triggers its
+  lazy loading, so long pages used to capture blank hero images. Layout is left
+  exactly as the page renders — an earlier attempt resized the viewport to the
+  document height instead, which redefined `vh` and stretched every
+  viewport-sized hero (a 3456px test page became 21328px).
+- **Element crops are legible.** The highlight is drawn as an overlay box rather
+  than only an inline outline, because an outline is clipped by any ancestor with
+  `overflow: hidden` — precisely the containers that cause layout bugs. Crops
+  centre on the element and expand to a 400×300 minimum so a checkbox arrives
+  with context, and the original scroll position is restored afterwards.
+- **Single-page scans capture screenshots too.** Previously only the inventory
+  crawl did, so "Scan this page" produced findings with nothing to show a
+  stakeholder. This runs against your own visible tab, hence the scroll restore.
+- Screenshots referenced but no longer in storage now say so, instead of
+  rendering as a blank grey rectangle.
+
+**No more silent truncation.** Every cap that quietly dropped findings is gone:
+per-rule node caps (was 25), links analysed for 1.4.1 (was 300), the hover-cue
+sample (100), boundary-contrast controls (150), the text-spacing sample (600),
+motion candidates (10), and Excel embedded previews (300). A truncated audit used
+to render identically to a complete one — the client fixed 25 issues, re-scanned,
+and 25 more appeared. Element screenshots keep a bound because each costs a real
+debugger round trip, but it is now a 45s per-page budget rather than a count of
+30, and exhausting it is logged instead of passing silently. `DEFAULT_MAX_URLS`
+also disagreed between `background.js` (50) and the popup (500); all three
+sources now say 500, pinned by `test/limits.test.mjs`.
+
+**Annotate This Page.** A new popup action that marks every **confirmed**
+violation on the page in front of you — numbered badges on the elements
+themselves, plus a panel giving each one's rule, impact, WCAG criteria, the
+offending markup, and the fix axe recommends (with axe's any/all distinction
+preserved, since "any" means one fix suffices and "all" means every line is
+required). Clicking a badge jumps to its panel entry and vice versa. Nothing is
+saved and no report opens.
+
+Only violations are drawn. Needs-review findings are excluded by design —
+painting an unproven finding on the page as a defect is the over-claiming this
+codebase avoids everywhere else. It re-runs axe rather than replaying selectors
+from a stored report, because a report can be days old and a stale selector would
+either mark the wrong element or vanish silently. Markers are body-level
+absolutely-positioned siblings, never wrappers, so an `overflow: hidden` ancestor
+cannot clip them and the page's layout is untouched.
+
+Also in v0.5.0:
+
+- **Paste-a-list concurrency fixed.** The global cap was 200 — harmless on
+  single-origin crawls, where the 8-per-origin cap bound them, but on a
+  multi-domain paste list nothing held total tabs down. Pasting ~200 URLs opened
+  ~200 background tabs, collapsed Chrome's renderer/network pool, and reported
+  perfectly reachable links as unreachable. Global cap is now **10**;
+  single-origin crawls are unchanged at 8.
+- **WCAG 1.4.1 over-reporting fixed.** Link-in-text-block analysis now skips
+  nav / header / footer / breadcrumb / pagination chrome, and stays silent when
+  no stylesheet is readable (cross-origin CSS) rather than flagging every
+  colour-only link on the page.
+- **Per-page outcome** (Clean / Issues / Unreachable) with a summary tile row, in
+  both the classic report and the inventory.
+- **Reproject a crawl into the classic report** with no rescan — the inventory
+  already holds the full axe payload.
+- **Release notes moved to [CHANGELOG.md](CHANGELOG.md).** They had been living
+  in the `manifest.json` `description` field, which had grown to ~6300
+  characters; Chrome documents a 132-character limit there and enforces it at
+  Web Store submission.
+- `test/viewer-harness/` — headless-Chrome harness for the report viewer, since
+  Chrome 137+ blocks `--load-extension` and the extension's own
+  `chrome.debugger` calls conflict with any external CDP driver.
+- `test/overlay-harness/page.html` — 19 assertions over the on-page overlay,
+  including that markers escape an `overflow: hidden` ancestor, that unmarkable
+  nodes (nested frames, stale selectors) are still listed rather than dropped,
+  and that `clear()` leaves no trace.
+- `test/limits.test.mjs` — pins the removed caps as removed and the deliberate
+  resource limits as present.
+- `test/xlsx-drawings.test.mjs` — builds real workbooks in Node and asserts the
+  OOXML image plumbing, where an off-by-one silently points a preview at the
+  wrong screenshot rather than failing loudly. Run with
+  `node test/xlsx-drawings.test.mjs`.
 
 ## v0.4.8 — reports persist (no more "Report expired")
 
 Multi-page and single-page reports were held only in the service worker's memory; Chrome evicts an idle MV3 worker after ~30 s, after which the report tab showed "expired" and downloads failed. Reports now persist to chrome.storage.local (last 5 kept, older pruned) and are re-warmed on demand — the report tab, Excel, and CSV work indefinitely, across browser restarts. Viewer, Excel, and CSV all read the same persisted object, so what you see in the run result is exactly what lands in the Excel.
+
+Also in v0.4.8:
+
+- **Default recipe slimmed to axe-core only**: media checks, PDF/Office audit, visual-state checks, overlay dismissal, and audit-both are now all **opt-in (default OFF)**. First-run defaults: axe ✓, real pages only ✓, broken-link detector ✓ — everything else unticked. Saved preferences migrate once to the new recipe, then whatever you tick wins as usual.
+- **Overlay dismissal upgraded** (when enabled): the dismisser now pierces open shadow roots, so shadow-DOM CMPs (Usercentrics-style) can be clicked instead of just hidden; Google Funding Choices selectors added; and accept/close button matching understands Hindi labels (स्वीकार करें, सहमत, ठीक है, बंद करें, …) for Indian-language sites.
 
 ## v0.4.6 — visual-state checks (automating part of the manual checklist)
 

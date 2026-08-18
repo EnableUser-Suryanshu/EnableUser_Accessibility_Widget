@@ -237,6 +237,26 @@ td.user-agent { max-width: 320px; overflow: hidden; text-overflow: ellipsis; whi
 .pill.impact-moderate { background: #fef3c7; color: #a16207; }
 .pill.impact-minor { background: #f1f5f9; color: #475569; }
 
+/* Per-page scan-outcome status. Used in the Pages / All Pages tables and the
+   status-breakdown tile row above them. Three buckets: a page either
+   completed cleanly (0 violations), completed with issues, or was never
+   reachable. Lets a summary table double as a "did this page complete?" view. */
+.status-pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.status-pill.status-ok   { background: #dcfce7; color: #166534; }
+.status-pill.status-warn { background: #fef3c7; color: #a16207; }
+.status-pill.status-fail { background: #fee2e2; color: #b91c1c; }
+.stats.page-status-tiles { margin-bottom: 16px; }
+.stat.warn .value { color: #a16207; }
+
 button {
   padding: 8px 16px;
   font: inherit;
@@ -421,11 +441,30 @@ button.primary:hover { background: #1e3a8a; }
   max-width: 168px;
   max-height: 64px;
   object-fit: contain;
-  object-position: center;
+  object-position: top left;
 }
 .element-shot-thumb.expanded {
   max-width: 520px;
   max-height: none;
+}
+
+/* A screenshot the report references but storage no longer has: the run predates
+   report-level persistence, browser storage was cleared, or capture failed for
+   that element. The placeholder src loads fine, so the alt text never surfaces —
+   without these rules the reader just sees a blank grey rectangle and reasonably
+   concludes the report is broken. Mark the gap explicitly instead. */
+.screenshot-thumb.screenshot-missing {
+  border: 1px dashed #cbd5e1;
+  background: #f8fafc;
+  min-width: 120px;
+  min-height: 56px;
+}
+.screenshot-unavailable {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  font-style: italic;
+  color: #94a3b8;
 }
 .components-detail { margin-top: 14px; }
 .components-detail strong { font-size: 12px; }

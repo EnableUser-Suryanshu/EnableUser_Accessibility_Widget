@@ -4,7 +4,8 @@
 // Also computes a SiteScope-style DOM fingerprint + URL cluster + text hash
 // so the background can cluster pages into templates in the report.
 
-(async () => {
+async function __euScan() {
+  window.__euScanRunning = true;
   try {
     // Operator's scan options (tag set, per-check toggles, overlay dismissal)
     // handed in by background.js via window.__EU_SCAN_OPTS in this ISOLATED world.
@@ -45,7 +46,6 @@
         setTimeout(tick, 150);
       })();
     });
-
     const started = performance.now();
     const startedAt = new Date().toISOString();
 
@@ -163,7 +163,7 @@
     // Provable failures merge as violations; judgment-dependent findings
     // carry the "review" tag and land in incomplete.
     try {
-      if (checks.visual !== false && window.EU_VisualChecks?.run) customRules.push(...(await window.EU_VisualChecks.run()));
+      if (checks.visual === true && window.EU_VisualChecks?.run) customRules.push(...(await window.EU_VisualChecks.run()));
     } catch (e) { console.warn("[EU] visual-checks failed", e); }
     // Split custom rules by impact + review tag — "review"-tagged rules go
     // to incomplete (auditor needs to confirm), others to violations. The
@@ -205,7 +205,7 @@
       passes: normRules(res.passes),
       incomplete: normRules(res.incomplete),
       inapplicable: normRules(res.inapplicable),
-      template: await computeTemplateSignals(),
+      template: (await computeTemplateSignals()),
       // Flat inventory of every video / audio / embedded player / document
       // link found on this page. Feeds the report's Media & Documents section.
       mediaInventory,
@@ -214,14 +214,33 @@
       // counts on every page. null if the check module didn't run.
       is17802Site
     };
-
     chrome.runtime.sendMessage({ type: "SCAN_RESULT", payload });
   } catch (err) {
     chrome.runtime.sendMessage({
       type: "SCAN_ERROR",
       payload: { reason: String(err?.message || err), stack: err?.stack || "" }
     });
+  } finally {
+    window.__euScanRunning = false;
   }
+}
+
+// Re-scan support. Chrome silently no-ops a second
+// chrome.scripting.executeScript({files:[...]}) of the same file into the
+// same document + world — verified empirically (Chrome 152): the call
+// resolves in 0 ms and the script body never executes. So the FIRST
+// injection wires a persistent EU_RESCAN listener and runs the scan; every
+// later scan of this document is triggered by message instead of
+// re-injection (see runContentScan). The latch stops overlapping runs —
+// axe.run throws if started while a run is in flight.
+(() => {
+  if (!window.__euScanWired) {
+    window.__euScanWired = true;
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === "EU_RESCAN" && !window.__euScanRunning) __euScan();
+    });
+  }
+  __euScan();
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,16 +261,23 @@
 //   3. Last resort: hide full-viewport fixed/sticky high-z-index overlays and
 //      release the scroll lock modals leave on <html>/<body>.
 // Runs a few passes because sites stack gates (cookie → newsletter → notice).
+// v0.4.8 — all click/hide passes now pierce open shadow roots (Usercentrics-
+// style CMPs render entirely inside one), and the accept/close text matcher
+// understands Hindi labels for Indian-language sites.
 // ─────────────────────────────────────────────────────────────────────────────
 const OVERLAY_HINT_RE = /(modal|popup|pop-up|overlay|consent|cookie|gdpr|ccpa|cmp|interstitial|backdrop|lightbox|dialog|notice|banner|announce|disclaimer|subscribe|newsletter|age-?gate|paywall|drawer)/i;
-const ACCEPT_TEXT_RE = /^(accept(\s+all)?(\s+cookies)?|i\s+accept|agree|i\s+agree|allow(\s+all)?|ok(ay)?|got\s+it!?|understood|i\s+understand|continue|proceed|close|dismiss|no,?\s*thanks|skip|maybe\s+later|not\s+now|✕|×|✖|x)$/i;
+const ACCEPT_TEXT_RE = /^(accept(\s+all)?(\s+cookies)?|i\s+accept|agree|i\s+agree|allow(\s+all)?|ok(ay)?|got\s+it!?|understood|i\s+understand|continue|proceed|close|dismiss|no,?\s*thanks|skip|maybe\s+later|not\s+now|✕|×|✖|x|(सभी\s+)?स्वीकार(\s+करें)?|स्वीकारें|सहमति\s+दें|(मैं\s+)?सहमत(\s+हूँ|\s+हूं)?|ठीक\s+है|समझ\s+(गया|गई)|बंद\s+करें|जारी\s+रखें|आगे\s+बढ़ें|अभी\s+नहीं|बाद\s+में)$/i;
 const EU_CMP_SELECTORS = [
   "#onetrust-accept-btn-handler", ".onetrust-close-btn-handler", "#accept-recommended-btn-handler",
   "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "#CybotCookiebotDialogBodyButtonAccept",
   "#didomi-notice-agree-button", ".qc-cmp2-summary-buttons button[mode='primary']",
   ".osano-cm-accept-all", ".cky-btn-accept", "#hs-eu-confirmation-button",
   ".cc-allow", ".cc-dismiss", ".cookie-accept", ".accept-cookies", "#accept-cookies",
-  "button[data-cookiebanner='accept_button']"
+  "button[data-cookiebanner='accept_button']",
+  // Usercentrics (lives in an open shadow root under #usercentrics-root).
+  "button[data-testid='uc-accept-all-button']",
+  // Google Funding Choices (very common on ad-funded news sites).
+  ".fc-cta-consent", "button.fc-cta-consent"
 ];
 
 function euOverlayVisible(el) {
@@ -272,21 +298,60 @@ function euInOverlay(el) {
       let cs; try { cs = getComputedStyle(cur); } catch { cs = null; }
       if (cs && (cs.position === "fixed" || cs.position === "sticky") && (parseInt(cs.zIndex, 10) || 0) >= 1000) return true;
     }
-    cur = cur.parentElement;
+    // Cross open-shadow boundaries: at a shadow root's top, hop to the host so
+    // overlay hints on the host element (e.g. #usercentrics-root) still count.
+    let next = cur.parentElement;
+    if (!next) { try { const rn = cur.getRootNode(); next = rn && rn.host ? rn.host : null; } catch { next = null; } }
+    cur = next;
     depth++;
   }
   return false;
 }
 function euClick(el) { try { el.click(); return true; } catch { return false; } }
 
+// One bounded walk collecting document + every reachable open shadow root, so
+// each dismissal pass queries every root once instead of re-walking the tree
+// per selector. Closed shadow roots stay opaque (spec). Own literal cap — do
+// NOT use TMPL_WALK_CAP here; its `const` may still be in TDZ when the first
+// dismissal pass runs during initial script evaluation.
+function euAllRoots() {
+  const roots = [document];
+  let visited = 0;
+  (function walk(node) {
+    if (!node || visited > 30000) return;
+    let all = []; try { all = node.querySelectorAll("*"); } catch { return; }
+    for (const el of all) {
+      if (++visited > 30000) return;
+      if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); }
+    }
+  })(document);
+  return roots;
+}
+
 function euClickDismissers() {
   let clicked = 0;
+  const roots = euAllRoots();
+  // Iterate rather than spread — see euHideBlockingOverlays. Spreading a NodeList
+  // into push() makes every node an argument, which throws RangeError past ~65k.
+  // Lower risk here than there (these selectors are specific, not "*"), but the
+  // broad-selector pass below queries "button, [role=button], a, …" which a large
+  // page can absolutely exceed.
+  const qAll = (sel) => {
+    const out = [];
+    for (const root of roots) {
+      try {
+        const found = root.querySelectorAll(sel);
+        for (let i = 0; i < found.length; i++) out.push(found[i]);
+      } catch {}
+    }
+    return out;
+  };
   for (const sel of EU_CMP_SELECTORS) {
-    let el = null; try { el = document.querySelector(sel); } catch {}
-    if (el && euOverlayVisible(el) && euClick(el)) clicked++;
+    for (const el of qAll(sel)) {
+      if (euOverlayVisible(el) && euClick(el)) { clicked++; break; }
+    }
   }
-  let nodes = [];
-  try { nodes = document.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit'], [data-dismiss], .close, [aria-label]"); } catch {}
+  const nodes = qAll("button, [role='button'], a, input[type='button'], input[type='submit'], [data-dismiss], .close, [aria-label]");
   let scanned = 0;
   for (const el of nodes) {
     if (scanned++ > 4000) break;
@@ -304,11 +369,35 @@ function euClickDismissers() {
 function euHideBlockingOverlays() {
   let hidden = 0;
   const vw = window.innerWidth, vh = window.innerHeight;
-  let nodes = [];
-  try { nodes = document.querySelectorAll("body *"); } catch {}
+  const nodes = [];
+  // Collect per root, iterating rather than spreading.
+  //
+  // `nodes.push(...nodeList)` passes every node as a separate argument, so a
+  // document with more than ~65k elements threw RangeError (Maximum call stack
+  // size exceeded). One shared try/catch around the whole loop meant that
+  // exception abandoned the entire collection — `nodes` came back empty and
+  // overlay dismissal silently did nothing, on exactly the large pages most
+  // likely to carry a consent wall. axe then audited the page with the overlay
+  // still covering it.
+  //
+  // Per-root try/catch so one unreadable shadow root cannot cost the others.
+  for (const root of euAllRoots()) {
+    try {
+      const found = root.querySelectorAll(root === document ? "body *" : "*");
+      for (let i = 0; i < found.length; i++) nodes.push(found[i]);
+    } catch (err) {
+      console.warn("[EU] overlay scan skipped a root:", err?.message || err);
+    }
+  }
   let scanned = 0;
   for (const el of nodes) {
-    if (scanned++ > 8000) break;
+    // getComputedStyle per element is the expensive part, so this bounds work
+    // rather than findings. It does affect results though — giving up early can
+    // leave a consent overlay in place for the audit — so say so.
+    if (scanned++ > 8000) {
+      console.warn(`[EU] overlay scan stopped after 8000 of ${nodes.length} elements — an overlay below that point would not have been dismissed`);
+      break;
+    }
     let cs; try { cs = getComputedStyle(el); } catch { continue; }
     if (cs.position !== "fixed" && cs.position !== "sticky") continue;
     if ((parseInt(cs.zIndex, 10) || 0) < 1000) continue;
